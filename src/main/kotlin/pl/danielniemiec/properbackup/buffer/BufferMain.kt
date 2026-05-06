@@ -12,6 +12,7 @@ import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.flush.BudgetGuard
 import pl.danielniemiec.properbackup.buffer.flush.ChunkSealer
 import pl.danielniemiec.properbackup.buffer.flush.FlushTrigger
+import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
 import pl.danielniemiec.properbackup.buffer.inbox.ChunkStorage
 import pl.danielniemiec.properbackup.buffer.inbox.DiskGuard
 import pl.danielniemiec.properbackup.buffer.inbox.InboxReceiver
@@ -83,14 +84,16 @@ fun main(args: Array<String>) {
     val chunkStorage = ChunkStorage(inboxDir)
     val diskGuard = DiskGuard(inboxDir)
 
+    val userStore = UserStore(db)
+
     val budgetGuard = BudgetGuard(db)
     val swiftRemote = swiftClientFromEnv(storageDir)
-    val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore)
+    val storageQuotaGuard = StorageQuotaGuard(db, userStore)
+    val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
     val flusher = FlushTrigger(chunkStorage, sealer, budgetGuard)
     val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken)
 
     val jwtSecret = System.getenv().getOrDefault("PROPERBACKUP_JWT_SECRET", "dev-jwt-secret-change-in-prod")
-    val userStore = UserStore(db)
     val serviceCodeStore = ServiceAdminCodeStore(db)
     serviceCodeStore.ensureSeedCode(System.getenv().getOrDefault("PROPERBACKUP_SERVICE_ADMIN_SEED_CODE", "dt5mkom8Serwer.13"))
     val jwtService = JwtService(jwtSecret)
@@ -115,7 +118,7 @@ fun main(args: Array<String>) {
         agentStatusStore,
     )
 
-    val subscriptionHandler = SubscriptionHandler(userStore)
+    val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard)
     val subscriptionGuard = SubscriptionGuard(userStore)
     val trialNotifier = TrialNotifier(userStore, logStore)
 
@@ -191,6 +194,21 @@ fun main(args: Array<String>) {
 
     app.before("/account/*", jwtFilter)
     app.get("/account/subscription", subscriptionHandler::getSubscription)
+    app.get("/account/storage") { ctx ->
+        val userId = ctx.attribute<String>("userId")!!
+        val q = storageQuotaGuard.checkQuota(userId)
+        ctx.contentType("application/json").result(
+            Gson().toJson(
+                mapOf(
+                    "usedBytes" to q.usedBytes,
+                    "limitBytes" to q.limitBytes,
+                    "remainingBytes" to q.remainingBytes,
+                    "usedPercent" to q.usedPercent,
+                    "exceeded" to q.exceeded,
+                ),
+            ),
+        )
+    }
 
     app.get("/health/inventory-summary") { ctx ->
         val auth = ctx.header("Authorization")

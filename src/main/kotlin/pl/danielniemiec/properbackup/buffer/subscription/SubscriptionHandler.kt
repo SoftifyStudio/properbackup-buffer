@@ -3,11 +3,13 @@ package pl.danielniemiec.properbackup.buffer.subscription
 import com.google.gson.Gson
 import io.javalin.http.Context
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
+import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
 import java.time.Duration
 import java.time.Instant
 
 class SubscriptionHandler(
     private val userStore: UserStore,
+    private val storageQuotaGuard: StorageQuotaGuard? = null,
 ) {
     private val gson = Gson()
 
@@ -61,6 +63,8 @@ class SubscriptionHandler(
             }
         }
 
+        val quotaStatus = storageQuotaGuard?.checkQuota(userId)
+
         ctx.contentType("application/json").result(
             gson.toJson(
                 mapOf(
@@ -72,6 +76,10 @@ class SubscriptionHandler(
                     "subscriptionExpiresAt" to user.subscriptionExpiresAt,
                     "storageLimitBytes" to user.storageLimitBytes,
                     "storageLimitLabel" to formatStorageLimit(user.storageLimitBytes),
+                    "storageUsedBytes" to (quotaStatus?.usedBytes ?: 0L),
+                    "storageUsedLabel" to formatStorageLimit(quotaStatus?.usedBytes ?: 0L),
+                    "storageUsedPercent" to (quotaStatus?.usedPercent ?: 0.0),
+                    "storageExceeded" to (quotaStatus?.exceeded ?: false),
                     "plans" to listOf(
                         mapOf(
                             "id" to PLAN_HOBBY,

@@ -20,6 +20,7 @@ class ChunkSealer(
     private val db: Database,
     private val swiftRemote: SwiftClient? = null,
     private val archiveSnapshotStore: ArchiveSnapshotStore? = null,
+    private val storageQuotaGuard: StorageQuotaGuard? = null,
 ) {
 
     private val tsFmt = DateTimeFormatter.ofPattern("yyMMddHHmm").withZone(ZoneOffset.UTC)
@@ -40,6 +41,13 @@ class ChunkSealer(
             combined.write(Files.readAllBytes(part))
         }
         val data = combined.toByteArray()
+
+        if (storageQuotaGuard != null && !storageQuotaGuard.canUpload(userId, data.size.toLong())) {
+            val q = storageQuotaGuard.checkQuota(userId)
+            println("[seal] BLOCKED by StorageQuotaGuard for $userId/$pathId — used ${q.usedBytes}/${q.limitBytes} bytes (${String.format("%.1f", q.usedPercent)}%)")
+            for (part in parts) Files.deleteIfExists(part)
+            return
+        }
 
         val timestamp = tsFmt.format(ZonedDateTime.now(ZoneOffset.UTC))
         val shortHash = Integer.toHexString(java.util.Arrays.hashCode(data) and 0xFFFF)
