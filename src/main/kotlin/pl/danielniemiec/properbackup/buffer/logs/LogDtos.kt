@@ -39,4 +39,7 @@ data class AgentStatusReq(
     val machineId: String? = null,
     val phase: String? = null,
     val detail: String? = null,
+    val totalFiles: Int? = null,
+    val scannedFiles: Int? = null,
+    val currentFile: String? = null,
 )

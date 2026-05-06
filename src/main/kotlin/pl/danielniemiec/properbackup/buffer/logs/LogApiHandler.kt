@@ -102,7 +102,10 @@ class LogApiHandler(
             ctx.status(400).result("machineId and phase required")
             return
         }
-        agentStatusStore.upsert(mid, phase, req.detail?.trim()?.ifBlank { null })
+        agentStatusStore.upsert(
+            mid, phase, req.detail?.trim()?.ifBlank { null },
+            req.totalFiles, req.scannedFiles, req.currentFile?.trim()?.ifBlank { null },
+        )
         ctx.status(202).result("ok")
     }
 

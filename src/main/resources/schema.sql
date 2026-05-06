@@ -123,8 +123,15 @@ CREATE TABLE IF NOT EXISTS machine_agent_status (
   machine_id   VARCHAR(128) PRIMARY KEY,
   phase        VARCHAR(32)  NOT NULL,
   detail       TEXT,
+  total_files   INT,
+  scanned_files INT,
+  current_file  TEXT,
   updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS total_files   INT;
+ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS scanned_files INT;
+ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS current_file  TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_mas_updated ON machine_agent_status(updated_at DESC);
 
