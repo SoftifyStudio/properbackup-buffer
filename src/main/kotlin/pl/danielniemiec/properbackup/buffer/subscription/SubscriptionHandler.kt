@@ -16,8 +16,8 @@ class SubscriptionHandler(
     companion object {
         const val PLAN_HOBBY = "hobby"
         const val PLAN_PRO = "pro"
-        const val HOBBY_PRICE_PLN = 179
-        const val PRO_PRICE_PLN = 399
+        const val HOBBY_PRICE_USD = 49
+        const val PRO_PRICE_USD = 129
         const val HOBBY_STORAGE_BYTES = 2199023255552L   // 2 TB
         const val PRO_STORAGE_BYTES = 5497558138880L     // 5 TB
         const val TRIAL_DAYS = 30
@@ -84,14 +84,14 @@ class SubscriptionHandler(
                         mapOf(
                             "id" to PLAN_HOBBY,
                             "name" to "Hobby",
-                            "pricePln" to HOBBY_PRICE_PLN,
+                            "priceUsd" to HOBBY_PRICE_USD,
                             "storageLimitBytes" to HOBBY_STORAGE_BYTES,
                             "storageLimitLabel" to "2 TB",
                         ),
                         mapOf(
                             "id" to PLAN_PRO,
                             "name" to "Pro",
-                            "pricePln" to PRO_PRICE_PLN,
+                            "priceUsd" to PRO_PRICE_USD,
                             "storageLimitBytes" to PRO_STORAGE_BYTES,
                             "storageLimitLabel" to "5 TB",
                         ),
