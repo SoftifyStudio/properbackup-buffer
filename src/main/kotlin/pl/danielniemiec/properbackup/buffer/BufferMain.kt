@@ -26,6 +26,9 @@ import pl.danielniemiec.properbackup.buffer.ovh.DevSafetyGuard
 import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
+import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
+import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
+import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
@@ -112,7 +115,12 @@ fun main(args: Array<String>) {
         agentStatusStore,
     )
 
+    val subscriptionHandler = SubscriptionHandler(userStore)
+    val subscriptionGuard = SubscriptionGuard(userStore)
+    val trialNotifier = TrialNotifier(userStore, logStore)
+
     flusher.start()
+    trialNotifier.start()
 
     val app = Javalin.create { cfg ->
         cfg.http.maxRequestSize = 100L * 1024 * 1024
@@ -180,6 +188,34 @@ fun main(args: Array<String>) {
         ctx.contentType("application/json").result(Gson().toJson(userStore.listSummaries()))
     }
     app.get("/admin/logs", logApi::listLogsAdmin)
+
+    app.before("/account/*", jwtFilter)
+    app.get("/account/subscription", subscriptionHandler::getSubscription)
+
+    app.get("/health/inventory-summary") { ctx ->
+        val auth = ctx.header("Authorization")
+        if (auth == null || !auth.startsWith("Bearer ")) {
+            ctx.status(401).result("Unauthorized")
+            return@get
+        }
+        val serverId = ctx.queryParam("serverId")?.trim()
+        if (serverId.isNullOrBlank()) {
+            ctx.status(400).result("serverId required")
+            return@get
+        }
+        val agentStatus = agentStatusStore.get(serverId)
+        val totalFiles = fileStateStore.countForMachine(serverId)
+        val rootsCount = backupRootStore.listForMachine(serverId).size
+        ctx.contentType("application/json").result(
+            Gson().toJson(
+                mapOf(
+                    "agentStatus" to agentStatus,
+                    "totalFiles" to totalFiles,
+                    "rootsCount" to rootsCount,
+                ),
+            ),
+        )
+    }
 
     app.get("/servers", serverHandler::listServers)
     app.get("/servers/activation-tokens", serverHandler::listActivationTokens)

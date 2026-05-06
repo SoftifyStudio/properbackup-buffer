@@ -8,6 +8,16 @@ CREATE TABLE IF NOT EXISTS users (
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_system_admin BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Trial / subscription columns
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_expires_at  TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_plan VARCHAR(32);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT 2199023255552;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_trial_notification VARCHAR(16);
+
+-- Set trial_expires_at for existing users if NULL (30 days from creation)
+UPDATE users SET trial_expires_at = created_at + INTERVAL '30 days' WHERE trial_expires_at IS NULL AND subscription_plan IS NULL;
+
 CREATE TABLE IF NOT EXISTS servers (
   id           VARCHAR(36)  PRIMARY KEY,
   name         VARCHAR(255) NOT NULL,
