@@ -27,6 +27,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.DevSafetyGuard
 import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
+import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
 import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
@@ -122,6 +123,9 @@ fun main(args: Array<String>) {
     val subscriptionGuard = SubscriptionGuard(userStore)
     val trialNotifier = TrialNotifier(userStore, logStore)
 
+    val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
+    val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
+
     flusher.start()
     trialNotifier.start()
 
@@ -194,6 +198,9 @@ fun main(args: Array<String>) {
 
     app.before("/account/*", jwtFilter)
     app.get("/account/subscription", subscriptionHandler::getSubscription)
+    app.get("/account/checkout", lemonHandler::getCheckoutUrl)
+
+    app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)
