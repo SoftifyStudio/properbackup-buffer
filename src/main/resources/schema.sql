@@ -145,4 +145,15 @@ ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS current_file  TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_mas_updated ON machine_agent_status(updated_at DESC);
 
+-- Paths configured from web panel (user sets which folders to back up)
+CREATE TABLE IF NOT EXISTS server_backup_config (
+  server_id    VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  folder_path  TEXT         NOT NULL,
+  enabled      BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (server_id, folder_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sbc_server ON server_backup_config(server_id);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją

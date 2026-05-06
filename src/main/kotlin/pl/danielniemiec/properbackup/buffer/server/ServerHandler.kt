@@ -11,6 +11,7 @@ import pl.danielniemiec.properbackup.buffer.logs.AgentStatusStore
 import pl.danielniemiec.properbackup.buffer.logs.FileStateStore
 import pl.danielniemiec.properbackup.buffer.logs.MachineFileEventStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
+import pl.danielniemiec.properbackup.buffer.pathsidx.BackupConfigStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
@@ -28,6 +29,7 @@ class ServerHandler(
     private val archiveSnapshotStore: ArchiveSnapshotStore,
     private val backupRootStore: BackupRootStore,
     private val agentStatusStore: AgentStatusStore,
+    private val backupConfigStore: BackupConfigStore,
 ) {
 
     private val gson = Gson()
@@ -239,6 +241,42 @@ class ServerHandler(
                 conn.autoCommit = true
             }
         }
+    }
+
+    fun getBackupConfig(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val paths = backupConfigStore.listForServer(serverId)
+        ctx.contentType("application/json").result(gson.toJson(mapOf("paths" to paths)))
+    }
+
+    private data class AddPathReq(val folderPath: String?)
+    private data class RemovePathReq(val folderPath: String?)
+
+    fun addBackupPath(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val req = gson.fromJson(ctx.body(), AddPathReq::class.java)
+        val fp = req?.folderPath?.trim()
+        if (fp.isNullOrBlank()) {
+            ctx.status(400).result("folderPath required")
+            return
+        }
+        backupConfigStore.addPath(serverId, fp)
+        ctx.status(201).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
+    }
+
+    fun removeBackupPath(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val req = gson.fromJson(ctx.body(), RemovePathReq::class.java)
+        val fp = req?.folderPath?.trim()
+        if (fp.isNullOrBlank()) {
+            ctx.status(400).result("folderPath required")
+            return
+        }
+        backupConfigStore.removePath(serverId, fp)
+        ctx.contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
     }
 
     private fun requireServerAccess(ctx: Context, serverId: String) {

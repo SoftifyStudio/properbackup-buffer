@@ -32,6 +32,7 @@ import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
 import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
+import pl.danielniemiec.properbackup.buffer.pathsidx.BackupConfigStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.server.ActivationTokenStore
@@ -104,6 +105,7 @@ fun main(args: Array<String>) {
     val serverStore = ServerStore(db)
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
+    val backupConfigStore = BackupConfigStore(db)
     val serverHandler = ServerHandler(
         serverStore,
         tokenStore,
@@ -117,6 +119,7 @@ fun main(args: Array<String>) {
         archiveSnapshotStore,
         backupRootStore,
         agentStatusStore,
+        backupConfigStore,
     )
 
     val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard)
@@ -250,6 +253,9 @@ fun main(args: Array<String>) {
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)
+    app.get("/servers/{id}/backup-config", serverHandler::getBackupConfig)
+    app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
+    app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
 
     app.get("/objects") { ctx ->
         val list = objectRead.listMerged()
