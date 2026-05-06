@@ -82,6 +82,33 @@ class ArchiveSnapshotStore(private val db: Database) {
         }
     }
 
+    fun latestSealedAt(serverId: String): String? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT MAX(sealed_at) AS latest FROM archive_snapshot WHERE server_id = ?",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) rs.getTimestamp("latest")?.toInstant()?.toString() else null
+                }
+            }
+        }
+    }
+
+    fun latestSealedAtForPath(serverId: String, pathId: String): String? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT MAX(sealed_at) AS latest FROM archive_snapshot WHERE server_id = ? AND path_id = ?",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.setString(2, pathId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) rs.getTimestamp("latest")?.toInstant()?.toString() else null
+                }
+            }
+        }
+    }
+
     fun deleteOlderThan(days: Int): Int {
         db.getConnection().use { conn ->
             conn.prepareStatement(

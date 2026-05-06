@@ -28,6 +28,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
 import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
@@ -128,6 +129,10 @@ fun main(args: Array<String>) {
 
     val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
+
+    val auditReportHandler = AuditReportHandler(
+        serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
+    )
 
     flusher.start()
     trialNotifier.start()
@@ -253,6 +258,7 @@ fun main(args: Array<String>) {
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)
+    app.get("/servers/{id}/audit-report", auditReportHandler::downloadReport)
     app.get("/servers/{id}/backup-config", serverHandler::getBackupConfig)
     app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
     app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
