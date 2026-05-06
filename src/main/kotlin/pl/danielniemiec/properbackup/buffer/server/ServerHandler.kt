@@ -63,11 +63,12 @@ class ServerHandler(
         requireServerAccess(ctx, serverId)
         val page = ctx.queryParam("page")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
         val pageSize = (ctx.queryParam("pageSize")?.toIntOrNull() ?: 1000).coerceIn(1, 1000)
+        val sortBy = ctx.queryParam("sort")?.trim()?.ifBlank { null } ?: "path"
         val offset = (page - 1) * pageSize
 
         val machineId = serverId
         val totalFiles = fileStateStore.countForMachine(machineId)
-        val files = fileStateStore.listPaged(machineId, offset, pageSize)
+        val files = fileStateStore.listPaged(machineId, offset, pageSize, sortBy)
         val snapCounts = archiveSnapshotStore.countsByPathId(serverId)
         val rootRows = backupRootStore.listForMachine(machineId)
         val rootsOut = rootRows.map { r ->

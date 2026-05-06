@@ -127,6 +127,7 @@ fun main(args: Array<String>) {
     app.post("/auth/service-admin", authHandler::elevateServiceAdmin)
     app.post("/agent/logs", logApi::ingestLog)
     app.post("/agent/file-state", logApi::ingestFileState)
+    app.post("/agent/file-states", logApi::ingestFileStateBatch)
     app.post("/agent/backup-roots", logApi::ingestBackupRoots)
     app.post("/agent/register-paths", logApi::ingestRegisterPaths)
     app.post("/agent/status", logApi::ingestAgentStatus)

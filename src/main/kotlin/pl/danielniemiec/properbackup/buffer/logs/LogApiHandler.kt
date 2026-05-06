@@ -53,6 +53,18 @@ class LogApiHandler(
         ctx.status(202).result("ok")
     }
 
+    fun ingestFileStateBatch(ctx: Context) {
+        if (!checkToken(ctx)) return
+        val req = gson.fromJson(ctx.body(), FileStateBatchReq::class.java)
+        val mid = req?.machineId?.trim()
+        if (mid.isNullOrBlank() || req.files.isNullOrEmpty()) {
+            ctx.status(400).result("machineId and files required")
+            return
+        }
+        fileStateStore.upsertBatch(mid, req.files)
+        ctx.status(202).result("ok")
+    }
+
     fun ingestBackupRoots(ctx: Context) {
         if (!checkToken(ctx)) return
         val req = gson.fromJson(ctx.body(), BackupRootsReq::class.java)

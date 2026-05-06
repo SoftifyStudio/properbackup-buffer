@@ -35,11 +35,12 @@ class FileStateStore(private val db: Database) {
         }
     }
 
-    fun listPaged(machineId: String, offset: Int, limit: Int): List<Map<String, Any?>> {
+    fun listPaged(machineId: String, offset: Int, limit: Int, sortBy: String = "path"): List<Map<String, Any?>> {
+        val orderClause = if (sortBy == "recent") "ORDER BY updated_at DESC" else "ORDER BY full_path ASC"
         db.getConnection().use { conn ->
             conn.prepareStatement(
                 "SELECT machine_id, full_path, status, updated_at FROM machine_file_state WHERE machine_id = ? " +
-                    "ORDER BY full_path ASC OFFSET ? LIMIT ?",
+                    "$orderClause OFFSET ? LIMIT ?",
             ).use { ps ->
                 ps.setString(1, machineId)
                 ps.setInt(2, offset.coerceAtLeast(0))
@@ -73,6 +74,27 @@ class FileStateStore(private val db: Database) {
                 ps.setString(3, req.status ?: "current")
                 ps.setTimestamp(4, Timestamp.from(Instant.now()))
                 ps.executeUpdate()
+            }
+        }
+    }
+
+    fun upsertBatch(machineId: String, files: List<FileStateBatchEntry>) {
+        if (files.isEmpty()) return
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "INSERT INTO machine_file_state(machine_id, full_path, status, updated_at) VALUES (?, ?, ?, ?) " +
+                    "ON CONFLICT(machine_id, full_path) DO UPDATE SET status = EXCLUDED.status, updated_at = EXCLUDED.updated_at",
+            ).use { ps ->
+                val now = Timestamp.from(Instant.now())
+                for (f in files) {
+                    if (f.fullPath.isNullOrBlank()) continue
+                    ps.setString(1, machineId)
+                    ps.setString(2, f.fullPath)
+                    ps.setString(3, f.status ?: "current")
+                    ps.setTimestamp(4, now)
+                    ps.addBatch()
+                }
+                ps.executeBatch()
             }
         }
     }
