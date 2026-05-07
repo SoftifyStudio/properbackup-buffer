@@ -7,6 +7,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectStore
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.time.Instant
@@ -22,6 +23,11 @@ class ChunkSealer(
     private val archiveSnapshotStore: ArchiveSnapshotStore? = null,
     private val storageQuotaGuard: StorageQuotaGuard? = null,
 ) {
+    private var restoreVerifier: RestoreVerifier? = null
+
+    fun setVerifier(verifier: RestoreVerifier) {
+        this.restoreVerifier = verifier
+    }
 
     private val tsFmt = DateTimeFormatter.ofPattern("yyMMddHHmm").withZone(ZoneOffset.UTC)
 
@@ -96,6 +102,11 @@ class ChunkSealer(
 
         for (part in parts) {
             Files.deleteIfExists(part)
+        }
+
+        val verifier = restoreVerifier
+        if (verifier != null && !sid.isNullOrBlank()) {
+            verifier.scheduleVerification(sid, objectName, pathId)
         }
     }
 }

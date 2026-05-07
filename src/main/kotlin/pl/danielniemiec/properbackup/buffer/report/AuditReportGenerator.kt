@@ -152,8 +152,8 @@ class AuditReportGenerator {
     private fun addLine(document: Document) {
         val table = PdfPTable(1)
         table.widthPercentage = 100f
-        table.spacingBefore = 8f
-        table.spacingAfter = 0f
+        table.setSpacingBefore(8f)
+        table.setSpacingAfter(0f)
         val cell = PdfPCell()
         cell.border = PdfPCell.BOTTOM
         cell.borderColor = Color(220, 220, 220)
