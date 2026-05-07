@@ -18,6 +18,7 @@ class SseEventBus {
     fun subscribe(serverId: String, client: SseClient) {
         val list = clients.computeIfAbsent(serverId) { CopyOnWriteArrayList() }
         list.add(client)
+        client.keepAlive()
         client.onClose { list.remove(client) }
         client.sendEvent("connected", gson.toJson(mapOf("serverId" to serverId, "ts" to System.currentTimeMillis())))
     }
