@@ -40,6 +40,7 @@ import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.server.ActivationTokenStore
 import pl.danielniemiec.properbackup.buffer.server.ServerHandler
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
+import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.nio.file.Path
@@ -82,7 +83,8 @@ fun main(args: Array<String>) {
     val backupRootStore = BackupRootStore(db)
     val archiveSnapshotStore = ArchiveSnapshotStore(db)
     val agentStatusStore = AgentStatusStore(db)
-    val logApi = LogApiHandler(logStore, fileStateStore, fileEventStore, backupRootStore, agentStatusStore, db, ingestToken)
+    val sseBus = SseEventBus()
+    val logApi = LogApiHandler(logStore, fileStateStore, fileEventStore, backupRootStore, agentStatusStore, db, ingestToken, sseBus = sseBus)
 
     val objectStore = LocalObjectStore(storageDir)
     val chunkStorage = ChunkStorage(inboxDir)
@@ -261,6 +263,10 @@ fun main(args: Array<String>) {
     app.post("/servers/generate-token", serverHandler::generateToken)
     app.get("/servers/{id}/objects", serverHandler::listObjects)
     app.get("/servers/{id}/paths.idx", serverHandler::getPathsIdx)
+    app.sse("/servers/{id}/events") { client ->
+        val serverId = client.ctx().pathParam("id")
+        sseBus.subscribe(serverId, client)
+    }
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)

@@ -6,6 +6,7 @@ import io.javalin.http.ForbiddenResponse
 import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
+import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import java.time.Instant
 
 class LogApiHandler(
@@ -17,6 +18,7 @@ class LogApiHandler(
     private val db: Database,
     private val ingestToken: String,
     private val limiter: TokenBucketLimiter = TokenBucketLimiter(),
+    private val sseBus: SseEventBus? = null,
 ) {
     private val gson = Gson()
 
@@ -34,6 +36,14 @@ class LogApiHandler(
         }
         val dropped = limiter.consumeDropped(key)
         logStore.ingest(req, dropped)
+        sseBus?.publish(req.machineId!!, "log", mapOf(
+            "component" to (req.component ?: "Agent"),
+            "eventCode" to req.eventCode,
+            "level" to (req.level ?: "INFO"),
+            "message" to req.message,
+            "meta" to req.meta,
+            "ts" to Instant.now().toString(),
+        ))
         ctx.status(202).result("ok")
     }
 
@@ -50,6 +60,12 @@ class LogApiHandler(
             fileEventStore.insert(req.machineId!!, req.fullPath!!, next, prev)
         }
         fileStateStore.upsert(req)
+        sseBus?.publish(req.machineId!!, "fileState", mapOf(
+            "fullPath" to req.fullPath,
+            "status" to (req.status ?: "current"),
+            "previousStatus" to prev,
+            "ts" to Instant.now().toString(),
+        ))
         ctx.status(202).result("ok")
     }
 
@@ -62,6 +78,10 @@ class LogApiHandler(
             return
         }
         fileStateStore.upsertBatch(mid, req.files)
+        sseBus?.publish(mid, "fileStateBatch", mapOf(
+            "count" to req.files.size,
+            "ts" to Instant.now().toString(),
+        ))
         ctx.status(202).result("ok")
     }
 
@@ -118,6 +138,14 @@ class LogApiHandler(
             mid, phase, req.detail?.trim()?.ifBlank { null },
             req.totalFiles, req.scannedFiles, req.currentFile?.trim()?.ifBlank { null },
         )
+        sseBus?.publish(mid, "agentStatus", mapOf(
+            "phase" to phase,
+            "detail" to req.detail?.trim()?.ifBlank { null },
+            "totalFiles" to req.totalFiles,
+            "scannedFiles" to req.scannedFiles,
+            "currentFile" to req.currentFile?.trim()?.ifBlank { null },
+            "updatedAt" to Instant.now().toString(),
+        ))
         ctx.status(202).result("ok")
     }
 
