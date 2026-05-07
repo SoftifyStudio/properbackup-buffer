@@ -29,6 +29,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
 import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
@@ -106,6 +107,8 @@ fun main(args: Array<String>) {
     val serverStore = ServerStore(db)
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
+    val restoreVerifier = RestoreVerifier(db, objectRead)
+    sealer.setVerifier(restoreVerifier)
     val backupConfigStore = BackupConfigStore(db)
     val serverHandler = ServerHandler(
         serverStore,

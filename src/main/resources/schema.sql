@@ -156,4 +156,17 @@ CREATE TABLE IF NOT EXISTS server_backup_config (
 
 CREATE INDEX IF NOT EXISTS idx_sbc_server ON server_backup_config(server_id);
 
+-- Auto-test restore verification results
+CREATE TABLE IF NOT EXISTS verification_result (
+  server_id    VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  object_name  TEXT         NOT NULL,
+  path_id      TEXT         NOT NULL DEFAULT '',
+  status       VARCHAR(16)  NOT NULL DEFAULT 'pending',
+  detail       TEXT,
+  verified_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (server_id, object_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vr_server_time ON verification_result(server_id, verified_at DESC);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
