@@ -1,0 +1,47 @@
+version: '3.9'
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: properbackup
+      POSTGRES_USER: properbackup
+      POSTGRES_PASSWORD: ${PROPERBACKUP_DB_PASSWORD:-dev-pg-pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "properbackup"]
+      interval: 5s
+      retries: 10
+
+  buffer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PROPERBACKUP_DB_PASSWORD: ${PROPERBACKUP_DB_PASSWORD:-dev-pg-pass}
+      PROPERBACKUP_JWT_SECRET: ${PROPERBACKUP_JWT_SECRET:-dev-jwt-secret}
+      PROPERBACKUP_UPLOAD_TOKEN: ${PROPERBACKUP_UPLOAD_TOKEN:-dev-token-local}
+      PROPERBACKUP_LOG_INGEST_TOKEN: ${PROPERBACKUP_UPLOAD_TOKEN:-dev-token-local}
+    ports:
+      - "7100:7100"
+    volumes:
+      - storage:/opt/properbackup/storage
+      - inbox:/opt/properbackup/inbox
+    command: >
+      bin/properbackup-buffer
+      --db-url jdbc:postgresql://db:5432/properbackup
+      --db-user properbackup
+      --db-pass ${PROPERBACKUP_DB_PASSWORD:-dev-pg-pass}
+      --storage /opt/properbackup/storage
+      --inbox /opt/properbackup/inbox
+      --token ${PROPERBACKUP_UPLOAD_TOKEN:-dev-token-local}
+
+volumes:
+  pgdata:
+  storage:
+  inbox:
