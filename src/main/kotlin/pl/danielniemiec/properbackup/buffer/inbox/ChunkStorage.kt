@@ -23,6 +23,14 @@ class ChunkStorage(private val inboxDir: Path) {
     }
 
     @Throws(IOException::class)
+    fun listUserIds(): List<String> {
+        if (!Files.exists(inboxDir)) return emptyList()
+        return Files.list(inboxDir).use { dirs ->
+            dirs.filter { Files.isDirectory(it) }.map { it.fileName.toString() }.toList()
+        }
+    }
+
+    @Throws(IOException::class)
     fun getPathDirs(userId: String): List<Path> {
         val userDir = inboxDir.resolve(userId)
         if (!Files.exists(userDir)) return emptyList()

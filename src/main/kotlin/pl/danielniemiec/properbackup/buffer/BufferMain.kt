@@ -89,13 +89,14 @@ fun main(args: Array<String>) {
     val diskGuard = DiskGuard(inboxDir)
 
     val userStore = UserStore(db)
+    val serverStore = ServerStore(db)
 
     val budgetGuard = BudgetGuard(db)
     val swiftRemote = swiftClientFromEnv(storageDir)
     val storageQuotaGuard = StorageQuotaGuard(db, userStore)
     val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
     val flusher = FlushTrigger(chunkStorage, sealer, budgetGuard)
-    val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken)
+    val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken, serverStore)
 
     val jwtSecret = System.getenv().getOrDefault("PROPERBACKUP_JWT_SECRET", "dev-jwt-secret-change-in-prod")
     val serviceCodeStore = ServiceAdminCodeStore(db)
@@ -104,7 +105,6 @@ fun main(args: Array<String>) {
     val authHandler = AuthHandler(userStore, jwtService, serviceCodeStore)
     val jwtFilter = JwtFilter(jwtService)
 
-    val serverStore = ServerStore(db)
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
     val restoreVerifier = RestoreVerifier(db, objectRead)

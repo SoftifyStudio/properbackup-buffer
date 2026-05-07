@@ -29,36 +29,38 @@ class FlushTrigger(
 
     fun checkAndFlush() {
         try {
-            val userDirs = storage.getPathDirs("U1")
-            for (pathDir in userDirs) {
-                val pathId = pathDir.fileName.toString()
-                val totalSize = storage.totalSize("U1", pathId)
-                val sizeTriggered = totalSize >= FLUSH_SIZE_BYTES
+            for (userId in storage.listUserIds()) {
+                val userDirs = storage.getPathDirs(userId)
+                for (pathDir in userDirs) {
+                    val pathId = pathDir.fileName.toString()
+                    val totalSize = storage.totalSize(userId, pathId)
+                    val sizeTriggered = totalSize >= FLUSH_SIZE_BYTES
 
-                val parts = storage.getParts("U1", pathId)
-                var ageTriggered = false
-                if (parts.isNotEmpty()) {
-                    val firstName = parts[0].fileName.toString()
-                    try {
-                        val ts = firstName.split("-")[0].toLong()
-                        ageTriggered = (System.currentTimeMillis() - ts) >= FLUSH_AGE_MS
-                    } catch (ignored: NumberFormatException) {
+                    val parts = storage.getParts(userId, pathId)
+                    var ageTriggered = false
+                    if (parts.isNotEmpty()) {
+                        val firstName = parts[0].fileName.toString()
+                        try {
+                            val ts = firstName.split("-")[0].toLong()
+                            ageTriggered = (System.currentTimeMillis() - ts) >= FLUSH_AGE_MS
+                        } catch (ignored: NumberFormatException) {
+                        }
                     }
-                }
 
-                if (sizeTriggered || ageTriggered) {
-                    if (budgetGuard != null && budgetGuard.remaining("U1", pathId) <= 0) {
-                        println("[flush] budget exhausted — skip seal for $pathId")
-                        continue
-                    }
-                    val reason = if (sizeTriggered) "size" else "age"
-                    println("[flush] sealing $pathId (reason=$reason, size=$totalSize)")
-                    val reg = pathRegistry[pathId] ?: arrayOf("", "")
-                    try {
-                        sealer.seal("U1", pathId, reg[0].ifEmpty { null }, reg[1].ifEmpty { null })
-                        budgetGuard?.tryConsume("U1", pathId)
-                    } catch (e: Exception) {
-                        System.err.println("[flush] seal failed for $pathId: ${e.message}")
+                    if (sizeTriggered || ageTriggered) {
+                        if (budgetGuard != null && budgetGuard.remaining(userId, pathId) <= 0) {
+                            println("[flush] budget exhausted — skip seal for $userId/$pathId")
+                            continue
+                        }
+                        val reason = if (sizeTriggered) "size" else "age"
+                        println("[flush] sealing $userId/$pathId (reason=$reason, size=$totalSize)")
+                        val reg = pathRegistry[pathId] ?: arrayOf("", "")
+                        try {
+                            sealer.seal(userId, pathId, reg[0].ifEmpty { null }, reg[1].ifEmpty { null })
+                            budgetGuard?.tryConsume(userId, pathId)
+                        } catch (e: Exception) {
+                            System.err.println("[flush] seal failed for $userId/$pathId: ${e.message}")
+                        }
                     }
                 }
             }
@@ -69,21 +71,23 @@ class FlushTrigger(
 
     fun flushAll() {
         try {
-            val userDirs = storage.getPathDirs("U1")
-            for (pathDir in userDirs) {
-                val pathId = pathDir.fileName.toString()
-                val parts = storage.getParts("U1", pathId)
-                if (parts.isNotEmpty()) {
-                    if (budgetGuard != null && budgetGuard.remaining("U1", pathId) <= 0) {
-                        println("[flush] budget exhausted — skip flushAll for $pathId")
-                        continue
-                    }
-                    val reg = pathRegistry[pathId] ?: arrayOf("", "")
-                    try {
-                        sealer.seal("U1", pathId, reg[0].ifEmpty { null }, reg[1].ifEmpty { null })
-                        budgetGuard?.tryConsume("U1", pathId)
-                    } catch (e: Exception) {
-                        System.err.println("[flush] seal failed for $pathId: ${e.message}")
+            for (userId in storage.listUserIds()) {
+                val userDirs = storage.getPathDirs(userId)
+                for (pathDir in userDirs) {
+                    val pathId = pathDir.fileName.toString()
+                    val parts = storage.getParts(userId, pathId)
+                    if (parts.isNotEmpty()) {
+                        if (budgetGuard != null && budgetGuard.remaining(userId, pathId) <= 0) {
+                            println("[flush] budget exhausted — skip flushAll for $userId/$pathId")
+                            continue
+                        }
+                        val reg = pathRegistry[pathId] ?: arrayOf("", "")
+                        try {
+                            sealer.seal(userId, pathId, reg[0].ifEmpty { null }, reg[1].ifEmpty { null })
+                            budgetGuard?.tryConsume(userId, pathId)
+                        } catch (e: Exception) {
+                            System.err.println("[flush] seal failed for $userId/$pathId: ${e.message}")
+                        }
                     }
                 }
             }
