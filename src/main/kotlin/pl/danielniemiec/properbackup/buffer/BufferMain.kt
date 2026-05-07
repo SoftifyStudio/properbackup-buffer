@@ -282,7 +282,7 @@ fun main(args: Array<String>) {
                 client.sendEvent("error", "\"invalid_token\"")
             }
         } else {
-            sseBus.subscribe(serverId, client)
+            client.sendEvent("error", "\"token_required\"")
         }
     }
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
