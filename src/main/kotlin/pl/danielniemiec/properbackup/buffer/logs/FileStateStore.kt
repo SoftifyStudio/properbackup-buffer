@@ -99,6 +99,54 @@ class FileStateStore(private val db: Database) {
         }
     }
 
+    /**
+     * Returns file states as they were at a given point in time.
+     * Uses updated_at <= timestamp to reconstruct the snapshot.
+     */
+    fun listAtTimestamp(machineId: String, timestamp: Instant, offset: Int, limit: Int, sortBy: String = "path"): List<Map<String, Any?>> {
+        val orderClause = if (sortBy == "recent") "ORDER BY updated_at DESC" else "ORDER BY full_path ASC"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT machine_id, full_path, status, updated_at FROM machine_file_state " +
+                    "WHERE machine_id = ? AND updated_at <= ? $orderClause OFFSET ? LIMIT ?",
+            ).use { ps ->
+                ps.setString(1, machineId)
+                ps.setTimestamp(2, Timestamp.from(timestamp))
+                ps.setInt(3, offset.coerceAtLeast(0))
+                ps.setInt(4, limit.coerceIn(1, 10000))
+                ps.executeQuery().use { rs ->
+                    val out = ArrayList<Map<String, Any?>>()
+                    while (rs.next()) {
+                        out.add(
+                            linkedMapOf(
+                                "machineId" to rs.getString("machine_id"),
+                                "fullPath" to rs.getString("full_path"),
+                                "status" to rs.getString("status"),
+                                "updatedAt" to rs.getTimestamp("updated_at").toInstant().toString(),
+                            ),
+                        )
+                    }
+                    return out
+                }
+            }
+        }
+    }
+
+    fun countAtTimestamp(machineId: String, timestamp: Instant): Long {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT COUNT(*)::BIGINT FROM machine_file_state WHERE machine_id = ? AND updated_at <= ?",
+            ).use { ps ->
+                ps.setString(1, machineId)
+                ps.setTimestamp(2, Timestamp.from(timestamp))
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) return rs.getLong(1)
+                    return 0L
+                }
+            }
+        }
+    }
+
     fun deleteOlderThan(days: Int): Int {
         db.getConnection().use { conn ->
             conn.prepareStatement("DELETE FROM machine_file_state WHERE updated_at < NOW() - (?::text || ' days')::interval").use { ps ->

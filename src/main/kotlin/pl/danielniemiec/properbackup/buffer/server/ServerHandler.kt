@@ -251,6 +251,43 @@ class ServerHandler(
         }
     }
 
+    /** File states as they were at a given point in time (for time-travel). */
+    fun getFileStatesAt(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val tsParam = ctx.queryParam("ts")?.trim()
+        if (tsParam.isNullOrBlank()) {
+            ctx.status(400).result("ts (ISO timestamp) required")
+            return
+        }
+        val timestamp = try {
+            java.time.Instant.parse(tsParam)
+        } catch (e: Exception) {
+            ctx.status(400).result("Invalid ISO timestamp: $tsParam")
+            return
+        }
+        val page = ctx.queryParam("page")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val pageSize = (ctx.queryParam("pageSize")?.toIntOrNull() ?: 1000).coerceIn(1, 1000)
+        val sortBy = ctx.queryParam("sort")?.trim()?.ifBlank { null } ?: "path"
+        val offset = (page - 1) * pageSize
+
+        val machineId = serverId
+        val totalFiles = fileStateStore.countAtTimestamp(machineId, timestamp)
+        val files = fileStateStore.listAtTimestamp(machineId, timestamp, offset, pageSize, sortBy)
+        ctx.contentType("application/json").result(
+            gson.toJson(
+                mapOf(
+                    "files" to files,
+                    "page" to page,
+                    "pageSize" to pageSize,
+                    "totalFiles" to totalFiles,
+                    "hasMore" to (offset + files.size < totalFiles),
+                    "snapshotTs" to tsParam,
+                ),
+            ),
+        )
+    }
+
     fun getBackupConfig(ctx: Context) {
         val serverId = ctx.pathParam("id")
         requireServerAccess(ctx, serverId)

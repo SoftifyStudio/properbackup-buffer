@@ -264,11 +264,30 @@ fun main(args: Array<String>) {
     app.get("/servers/{id}/objects", serverHandler::listObjects)
     app.get("/servers/{id}/paths.idx", serverHandler::getPathsIdx)
     app.sse("/servers/{id}/events") { client ->
-        val serverId = client.ctx().pathParam("id")
-        sseBus.subscribe(serverId, client)
+        val ctx = client.ctx()
+        val serverId = ctx.pathParam("id")
+        val qToken = ctx.queryParam("token")?.trim()
+        if (!qToken.isNullOrBlank()) {
+            try {
+                val claims = jwtService.verify(qToken)
+                val userId = claims.subject
+                val isAdmin = claims["sa"] == true
+                val server = serverStore.findById(serverId)
+                if (server.isPresent && (server.get().userId == userId || isAdmin)) {
+                    sseBus.subscribe(serverId, client)
+                } else {
+                    client.sendEvent("error", "\"forbidden\"")
+                }
+            } catch (_: Exception) {
+                client.sendEvent("error", "\"invalid_token\"")
+            }
+        } else {
+            sseBus.subscribe(serverId, client)
+        }
     }
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
+    app.get("/servers/{id}/file-states-at", serverHandler::getFileStatesAt)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)
     app.get("/servers/{id}/audit-report", auditReportHandler::downloadReport)
     app.get("/servers/{id}/verification") { ctx ->
@@ -321,6 +340,7 @@ fun main(args: Array<String>) {
             meta = mapOf("port" to port),
         ),
     )
+    val snapshotRetentionDays = System.getenv().getOrDefault("PROPERBACKUP_SNAPSHOT_RETENTION_DAYS", retentionDays.toString()).toIntOrNull() ?: retentionDays
     thread(name = "logs-retention-cleaner", isDaemon = true) {
         while (!Thread.currentThread().isInterrupted) {
             try {
@@ -328,7 +348,7 @@ fun main(args: Array<String>) {
                 logStore.deleteOlderThan(retentionDays)
                 fileStateStore.deleteOlderThan(retentionDays)
                 fileEventStore.deleteOlderThan(retentionDays)
-                archiveSnapshotStore.deleteOlderThan(retentionDays)
+                archiveSnapshotStore.deleteOlderThan(snapshotRetentionDays)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break
