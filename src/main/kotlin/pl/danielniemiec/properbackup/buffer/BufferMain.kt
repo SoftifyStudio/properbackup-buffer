@@ -242,12 +242,14 @@ fun main(args: Array<String>) {
         val agentStatus = agentStatusStore.get(serverId)
         val totalFiles = fileStateStore.countForMachine(serverId)
         val rootsCount = backupRootStore.listForMachine(serverId).size
+        val latestVerification = restoreVerifier.getLatestResult(serverId)
         ctx.contentType("application/json").result(
             Gson().toJson(
                 mapOf(
                     "agentStatus" to agentStatus,
                     "totalFiles" to totalFiles,
                     "rootsCount" to rootsCount,
+                    "latestVerification" to latestVerification,
                 ),
             ),
         )
@@ -262,6 +264,15 @@ fun main(args: Array<String>) {
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)
     app.get("/servers/{id}/audit-report", auditReportHandler::downloadReport)
+    app.get("/servers/{id}/verification") { ctx ->
+        val serverId = ctx.pathParam("id")
+        val limit = ctx.queryParam("limit")?.toIntOrNull() ?: 20
+        val latest = restoreVerifier.getLatestResult(serverId)
+        val results = restoreVerifier.listResults(serverId, limit)
+        ctx.contentType("application/json").result(
+            Gson().toJson(mapOf("latest" to latest, "results" to results)),
+        )
+    }
     app.get("/servers/{id}/backup-config", serverHandler::getBackupConfig)
     app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
     app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
