@@ -15,6 +15,7 @@ import pl.danielniemiec.properbackup.buffer.pathsidx.BackupConfigStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 
 class ServerHandler(
     private val serverStore: ServerStore,
@@ -30,6 +31,7 @@ class ServerHandler(
     private val backupRootStore: BackupRootStore,
     private val agentStatusStore: AgentStatusStore,
     private val backupConfigStore: BackupConfigStore,
+    private val restoreVerifier: RestoreVerifier? = null,
 ) {
 
     private val gson = Gson()
@@ -49,7 +51,11 @@ class ServerHandler(
     fun listObjects(ctx: Context) {
         val serverId = ctx.pathParam("id")
         requireServerAccess(ctx, serverId)
-        ctx.contentType("application/json").result(gson.toJson(objects.listMerged()))
+        val localNames = try { objects.listMerged() } catch (_: Exception) { emptyList() }
+        val dbNames = archiveSnapshotStore.listObjectNames(serverId)
+        val merged = java.util.TreeSet(localNames)
+        merged.addAll(dbNames)
+        ctx.contentType("application/json").result(gson.toJson(merged.toList()))
     }
 
     fun getPathsIdx(ctx: Context) {
@@ -84,6 +90,7 @@ class ServerHandler(
             )
         }
         val agentStatus = agentStatusStore.get(machineId)
+        val latestVerification = restoreVerifier?.getLatestResult(serverId)
         ctx.contentType("application/json").result(
             gson.toJson(
                 mapOf(
@@ -94,6 +101,7 @@ class ServerHandler(
                     "totalFiles" to totalFiles,
                     "hasMore" to (offset + files.size < totalFiles),
                     "agentStatus" to agentStatus,
+                    "latestVerification" to latestVerification,
                 ),
             ),
         )

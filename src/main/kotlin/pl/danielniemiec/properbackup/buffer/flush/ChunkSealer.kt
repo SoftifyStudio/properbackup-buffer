@@ -86,10 +86,7 @@ class ChunkSealer(
 
         val store = archiveSnapshotStore
         val sid = serverId
-        if (store != null &&
-            !sid.isNullOrBlank() &&
-            !(swiftRemote != null && originalPath.isNullOrBlank())
-        ) {
+        if (store != null && !sid.isNullOrBlank()) {
             store.insert(
                 sid,
                 pathId,

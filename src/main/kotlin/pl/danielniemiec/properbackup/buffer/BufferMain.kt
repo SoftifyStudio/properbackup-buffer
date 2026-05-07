@@ -124,6 +124,7 @@ fun main(args: Array<String>) {
         backupRootStore,
         agentStatusStore,
         backupConfigStore,
+        restoreVerifier,
     )
 
     val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard)
