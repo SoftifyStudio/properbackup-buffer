@@ -169,4 +169,16 @@ CREATE TABLE IF NOT EXISTS verification_result (
 
 CREATE INDEX IF NOT EXISTS idx_vr_server_time ON verification_result(server_id, verified_at DESC);
 
+-- Agent resource metrics (CPU / RAM) — time-series per server
+CREATE TABLE IF NOT EXISTS agent_metrics (
+  id           BIGSERIAL PRIMARY KEY,
+  server_id    VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  cpu_percent  REAL         NOT NULL DEFAULT 0,
+  ram_used_mb  REAL         NOT NULL DEFAULT 0,
+  ram_total_mb REAL         NOT NULL DEFAULT 0,
+  recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_metrics_server_time ON agent_metrics(server_id, recorded_at DESC);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją

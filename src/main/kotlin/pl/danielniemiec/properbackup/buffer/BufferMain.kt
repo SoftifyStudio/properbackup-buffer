@@ -42,8 +42,11 @@ import pl.danielniemiec.properbackup.buffer.server.ServerHandler
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
+import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.nio.file.Path
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import kotlin.concurrent.thread
 
 fun main(args: Array<String>) {
@@ -83,6 +86,7 @@ fun main(args: Array<String>) {
     val backupRootStore = BackupRootStore(db)
     val archiveSnapshotStore = ArchiveSnapshotStore(db)
     val agentStatusStore = AgentStatusStore(db)
+    val agentMetricsStore = AgentMetricsStore(db)
     val sseBus = SseEventBus()
     val logApi = LogApiHandler(logStore, fileStateStore, fileEventStore, backupRootStore, agentStatusStore, db, ingestToken, sseBus = sseBus)
 
@@ -93,7 +97,8 @@ fun main(args: Array<String>) {
     val userStore = UserStore(db)
     val serverStore = ServerStore(db)
 
-    val budgetGuard = BudgetGuard(db)
+    val maxFlushes = System.getenv("PROPERBACKUP_MAX_FLUSHES_PER_DAY")?.toIntOrNull() ?: 50
+    val budgetGuard = BudgetGuard(db, maxFlushes)
     val swiftRemote = swiftClientFromEnv(storageDir)
     val storageQuotaGuard = StorageQuotaGuard(db, userStore)
     val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
@@ -160,6 +165,37 @@ fun main(args: Array<String>) {
     app.post("/agent/backup-roots", logApi::ingestBackupRoots)
     app.post("/agent/register-paths", logApi::ingestRegisterPaths)
     app.post("/agent/status", logApi::ingestAgentStatus)
+
+    app.post("/agent/scan-complete") { ctx ->
+        val auth = ctx.header("Authorization")
+        if (auth == null || auth != "Bearer $uploadToken") {
+            ctx.status(401).result("Unauthorized")
+            return@post
+        }
+        val serverId = ctx.header("X-Server-Id")?.trim()
+        println("[agent] scan-complete received" + if (!serverId.isNullOrBlank()) " (server=$serverId)" else "")
+        Thread { flusher.flushAll() }.start()
+        ctx.status(200).result("flush triggered")
+    }
+
+    app.post("/agent/metrics") { ctx ->
+        val auth = ctx.header("Authorization")
+        if (auth == null || auth != "Bearer $uploadToken") {
+            ctx.status(401).result("Unauthorized")
+            return@post
+        }
+        val body = Gson().fromJson(ctx.body(), Map::class.java)
+        val serverId = (body["serverId"] as? String)?.trim()
+        if (serverId.isNullOrBlank()) {
+            ctx.status(400).result("serverId required")
+            return@post
+        }
+        val cpu = (body["cpuPercent"] as? Number)?.toFloat() ?: 0f
+        val ramUsed = (body["ramUsedMb"] as? Number)?.toFloat() ?: 0f
+        val ramTotal = (body["ramTotalMb"] as? Number)?.toFloat() ?: 0f
+        agentMetricsStore.insert(serverId, cpu, ramUsed, ramTotal)
+        ctx.status(200).result("ok")
+    }
 
     app.get("/agent/paths.idx") { ctx ->
         val auth = ctx.header("Authorization")
@@ -299,6 +335,31 @@ fun main(args: Array<String>) {
             Gson().toJson(mapOf("latest" to latest, "results" to results)),
         )
     }
+    app.get("/servers/{id}/metrics") { ctx ->
+        val serverId = ctx.pathParam("id")
+        val userId = ctx.attribute<String>("userId")!!
+        val isAdmin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
+        val server = serverStore.findById(serverId)
+        if (!server.isPresent || (!isAdmin && server.get().userId != userId)) {
+            ctx.status(404).result("Not found")
+            return@get
+        }
+        val fromParam = ctx.queryParam("from")?.trim()
+        val toParam = ctx.queryParam("to")?.trim()
+        val from = if (!fromParam.isNullOrBlank()) {
+            try { Instant.parse(fromParam) } catch (_: Exception) { Instant.now().minus(24, ChronoUnit.HOURS) }
+        } else {
+            Instant.now().minus(24, ChronoUnit.HOURS)
+        }
+        val to = if (!toParam.isNullOrBlank()) {
+            try { Instant.parse(toParam) } catch (_: Exception) { Instant.now() }
+        } else {
+            Instant.now()
+        }
+        val limit = (ctx.queryParam("limit")?.toIntOrNull() ?: 1000).coerceIn(1, 5000)
+        val rows = agentMetricsStore.query(serverId, from, to, limit)
+        ctx.contentType("application/json").result(Gson().toJson(mapOf("metrics" to rows, "from" to from.toString(), "to" to to.toString())))
+    }
     app.get("/servers/{id}/backup-config", serverHandler::getBackupConfig)
     app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
     app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
@@ -349,6 +410,7 @@ fun main(args: Array<String>) {
                 fileStateStore.deleteOlderThan(retentionDays)
                 fileEventStore.deleteOlderThan(retentionDays)
                 archiveSnapshotStore.deleteOlderThan(snapshotRetentionDays)
+                agentMetricsStore.deleteOlderThan(retentionDays)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break
