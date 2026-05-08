@@ -9,6 +9,8 @@ class FlushTrigger(
     private val storage: ChunkStorage,
     private val sealer: ChunkSealer,
     private val budgetGuard: BudgetGuard? = null,
+    private val flushAgeMs: Long = System.getenv("PROPERBACKUP_FLUSH_AGE_SECONDS")?.toLongOrNull()?.times(1000L)
+        ?: DEFAULT_FLUSH_AGE_MS,
 ) {
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -20,7 +22,7 @@ class FlushTrigger(
 
     fun start() {
         scheduler.scheduleAtFixedRate({ checkAndFlush() }, 5, CHECK_INTERVAL_MS / 1000, TimeUnit.SECONDS)
-        println("[flush] FlushTrigger started (check every 60s)")
+        println("[flush] FlushTrigger started (check every 60s, age threshold=${flushAgeMs / 1000}s)")
     }
 
     fun stop() {
@@ -42,7 +44,7 @@ class FlushTrigger(
                         val firstName = parts[0].fileName.toString()
                         try {
                             val ts = firstName.split("-")[0].toLong()
-                            ageTriggered = (System.currentTimeMillis() - ts) >= FLUSH_AGE_MS
+                            ageTriggered = (System.currentTimeMillis() - ts) >= flushAgeMs
                         } catch (ignored: NumberFormatException) {
                         }
                     }
@@ -98,7 +100,7 @@ class FlushTrigger(
 
     companion object {
         private const val FLUSH_SIZE_BYTES = 900L * 1024 * 1024
-        private const val FLUSH_AGE_MS = 24 * 60 * 60 * 1000L
+        private const val DEFAULT_FLUSH_AGE_MS = 24 * 60 * 60 * 1000L
         private const val CHECK_INTERVAL_MS = 60_000L
     }
 }
