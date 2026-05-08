@@ -8,6 +8,16 @@ CREATE TABLE IF NOT EXISTS users (
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_system_admin BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Trial / subscription columns
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_expires_at  TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_plan VARCHAR(32);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT 2199023255552;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_trial_notification VARCHAR(16);
+
+-- Set trial_expires_at for existing users if NULL (30 days from creation)
+UPDATE users SET trial_expires_at = created_at + INTERVAL '30 days' WHERE trial_expires_at IS NULL AND subscription_plan IS NULL;
+
 CREATE TABLE IF NOT EXISTS servers (
   id           VARCHAR(36)  PRIMARY KEY,
   name         VARCHAR(255) NOT NULL,
@@ -123,9 +133,40 @@ CREATE TABLE IF NOT EXISTS machine_agent_status (
   machine_id   VARCHAR(128) PRIMARY KEY,
   phase        VARCHAR(32)  NOT NULL,
   detail       TEXT,
+  total_files   INT,
+  scanned_files INT,
+  current_file  TEXT,
   updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS total_files   INT;
+ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS scanned_files INT;
+ALTER TABLE machine_agent_status ADD COLUMN IF NOT EXISTS current_file  TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_mas_updated ON machine_agent_status(updated_at DESC);
+
+-- Paths configured from web panel (user sets which folders to back up)
+CREATE TABLE IF NOT EXISTS server_backup_config (
+  server_id    VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  folder_path  TEXT         NOT NULL,
+  enabled      BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (server_id, folder_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sbc_server ON server_backup_config(server_id);
+
+-- Auto-test restore verification results
+CREATE TABLE IF NOT EXISTS verification_result (
+  server_id    VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  object_name  TEXT         NOT NULL,
+  path_id      TEXT         NOT NULL DEFAULT '',
+  status       VARCHAR(16)  NOT NULL DEFAULT 'pending',
+  detail       TEXT,
+  verified_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (server_id, object_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vr_server_time ON verification_result(server_id, verified_at DESC);
 
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją

@@ -43,16 +43,7 @@ class AuthHandler(
         try {
             val user = userStore.register(req.email!!, req.password!!)
             val token = jwtService.generate(user.id, user.email, user.isSystemAdmin)
-            ctx.contentType("application/json").result(
-                gson.toJson(
-                    mapOf(
-                        "token" to token,
-                        "email" to user.email,
-                        "id" to user.id,
-                        "isSystemAdmin" to user.isSystemAdmin,
-                    ),
-                ),
-            )
+            ctx.contentType("application/json").result(gson.toJson(authResponse(token, user)))
         } catch (e: IllegalArgumentException) {
             ctx.status(409).result(e.message ?: "conflict")
         }
@@ -71,17 +62,19 @@ class AuthHandler(
         }
         val user = userOpt.get()
         val token = jwtService.generate(user.id, user.email, user.isSystemAdmin)
-        ctx.contentType("application/json").result(
-            gson.toJson(
-                mapOf(
-                    "token" to token,
-                    "email" to user.email,
-                    "id" to user.id,
-                    "isSystemAdmin" to user.isSystemAdmin,
-                ),
-            ),
-        )
+        ctx.contentType("application/json").result(gson.toJson(authResponse(token, user)))
     }
+
+    private fun authResponse(token: String, user: UserStore.User): Map<String, Any?> = mapOf(
+        "token" to token,
+        "email" to user.email,
+        "id" to user.id,
+        "isSystemAdmin" to user.isSystemAdmin,
+        "trialExpiresAt" to user.trialExpiresAt,
+        "subscriptionPlan" to user.subscriptionPlan,
+        "subscriptionExpiresAt" to user.subscriptionExpiresAt,
+        "storageLimitBytes" to user.storageLimitBytes,
+    )
 
     fun elevateServiceAdmin(ctx: Context) {
         val req = gson.fromJson(ctx.body(), ServiceReq::class.java)

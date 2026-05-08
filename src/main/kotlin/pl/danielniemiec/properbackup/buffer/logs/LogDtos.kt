@@ -15,6 +15,16 @@ data class FileStateReq(
     val status: String? = null,
 )
 
+data class FileStateBatchReq(
+    val machineId: String? = null,
+    val files: List<FileStateBatchEntry>? = null,
+)
+
+data class FileStateBatchEntry(
+    val fullPath: String? = null,
+    val status: String? = null,
+)
+
 data class BackupRootsReq(
     val machineId: String? = null,
     val roots: List<BackupRootEntry>? = null,
@@ -39,4 +49,7 @@ data class AgentStatusReq(
     val machineId: String? = null,
     val phase: String? = null,
     val detail: String? = null,
+    val totalFiles: Int? = null,
+    val scannedFiles: Int? = null,
+    val currentFile: String? = null,
 )

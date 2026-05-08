@@ -11,9 +11,11 @@ import pl.danielniemiec.properbackup.buffer.logs.AgentStatusStore
 import pl.danielniemiec.properbackup.buffer.logs.FileStateStore
 import pl.danielniemiec.properbackup.buffer.logs.MachineFileEventStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
+import pl.danielniemiec.properbackup.buffer.pathsidx.BackupConfigStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 
 class ServerHandler(
     private val serverStore: ServerStore,
@@ -28,6 +30,8 @@ class ServerHandler(
     private val archiveSnapshotStore: ArchiveSnapshotStore,
     private val backupRootStore: BackupRootStore,
     private val agentStatusStore: AgentStatusStore,
+    private val backupConfigStore: BackupConfigStore,
+    private val restoreVerifier: RestoreVerifier? = null,
 ) {
 
     private val gson = Gson()
@@ -47,7 +51,11 @@ class ServerHandler(
     fun listObjects(ctx: Context) {
         val serverId = ctx.pathParam("id")
         requireServerAccess(ctx, serverId)
-        ctx.contentType("application/json").result(gson.toJson(objects.listMerged()))
+        val localNames = try { objects.listMerged() } catch (_: Exception) { emptyList() }
+        val dbNames = archiveSnapshotStore.listObjectNames(serverId)
+        val merged = java.util.TreeSet(localNames)
+        merged.addAll(dbNames)
+        ctx.contentType("application/json").result(gson.toJson(merged.toList()))
     }
 
     fun getPathsIdx(ctx: Context) {
@@ -63,11 +71,12 @@ class ServerHandler(
         requireServerAccess(ctx, serverId)
         val page = ctx.queryParam("page")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
         val pageSize = (ctx.queryParam("pageSize")?.toIntOrNull() ?: 1000).coerceIn(1, 1000)
+        val sortBy = ctx.queryParam("sort")?.trim()?.ifBlank { null } ?: "path"
         val offset = (page - 1) * pageSize
 
         val machineId = serverId
         val totalFiles = fileStateStore.countForMachine(machineId)
-        val files = fileStateStore.listPaged(machineId, offset, pageSize)
+        val files = fileStateStore.listPaged(machineId, offset, pageSize, sortBy)
         val snapCounts = archiveSnapshotStore.countsByPathId(serverId)
         val rootRows = backupRootStore.listForMachine(machineId)
         val rootsOut = rootRows.map { r ->
@@ -81,6 +90,7 @@ class ServerHandler(
             )
         }
         val agentStatus = agentStatusStore.get(machineId)
+        val latestVerification = restoreVerifier?.getLatestResult(serverId)
         ctx.contentType("application/json").result(
             gson.toJson(
                 mapOf(
@@ -91,6 +101,7 @@ class ServerHandler(
                     "totalFiles" to totalFiles,
                     "hasMore" to (offset + files.size < totalFiles),
                     "agentStatus" to agentStatus,
+                    "latestVerification" to latestVerification,
                 ),
             ),
         )
@@ -238,6 +249,79 @@ class ServerHandler(
                 conn.autoCommit = true
             }
         }
+    }
+
+    /** File states as they were at a given point in time (for time-travel). */
+    fun getFileStatesAt(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val tsParam = ctx.queryParam("ts")?.trim()
+        if (tsParam.isNullOrBlank()) {
+            ctx.status(400).result("ts (ISO timestamp) required")
+            return
+        }
+        val timestamp = try {
+            java.time.Instant.parse(tsParam)
+        } catch (e: Exception) {
+            ctx.status(400).result("Invalid ISO timestamp: $tsParam")
+            return
+        }
+        val page = ctx.queryParam("page")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val pageSize = (ctx.queryParam("pageSize")?.toIntOrNull() ?: 1000).coerceIn(1, 1000)
+        val sortBy = ctx.queryParam("sort")?.trim()?.ifBlank { null } ?: "path"
+        val offset = (page - 1) * pageSize
+
+        val machineId = serverId
+        val totalFiles = fileStateStore.countAtTimestamp(machineId, timestamp)
+        val files = fileStateStore.listAtTimestamp(machineId, timestamp, offset, pageSize, sortBy)
+        ctx.contentType("application/json").result(
+            gson.toJson(
+                mapOf(
+                    "files" to files,
+                    "page" to page,
+                    "pageSize" to pageSize,
+                    "totalFiles" to totalFiles,
+                    "hasMore" to (offset + files.size < totalFiles),
+                    "snapshotTs" to tsParam,
+                ),
+            ),
+        )
+    }
+
+    fun getBackupConfig(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val paths = backupConfigStore.listForServer(serverId)
+        ctx.contentType("application/json").result(gson.toJson(mapOf("paths" to paths)))
+    }
+
+    private data class AddPathReq(val folderPath: String?)
+    private data class RemovePathReq(val folderPath: String?)
+
+    fun addBackupPath(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val req = gson.fromJson(ctx.body(), AddPathReq::class.java)
+        val fp = req?.folderPath?.trim()
+        if (fp.isNullOrBlank()) {
+            ctx.status(400).result("folderPath required")
+            return
+        }
+        backupConfigStore.addPath(serverId, fp)
+        ctx.status(201).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
+    }
+
+    fun removeBackupPath(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val req = gson.fromJson(ctx.body(), RemovePathReq::class.java)
+        val fp = req?.folderPath?.trim()
+        if (fp.isNullOrBlank()) {
+            ctx.status(400).result("folderPath required")
+            return
+        }
+        backupConfigStore.removePath(serverId, fp)
+        ctx.contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
     }
 
     private fun requireServerAccess(ctx: Context, serverId: String) {

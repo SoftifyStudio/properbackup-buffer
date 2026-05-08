@@ -33,6 +33,21 @@ class ArchiveSnapshotStore(private val db: Database) {
         }
     }
 
+    fun listObjectNames(serverId: String): List<String> {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT object_name FROM archive_snapshot WHERE server_id = ? ORDER BY sealed_at",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.executeQuery().use { rs ->
+                    val out = ArrayList<String>()
+                    while (rs.next()) out.add(rs.getString("object_name"))
+                    return out
+                }
+            }
+        }
+    }
+
     fun countsByPathId(serverId: String): Map<String, Long> {
         val m = LinkedHashMap<String, Long>()
         db.getConnection().use { conn ->
@@ -77,6 +92,33 @@ class ArchiveSnapshotStore(private val db: Database) {
                         )
                     }
                     return out
+                }
+            }
+        }
+    }
+
+    fun latestSealedAt(serverId: String): String? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT MAX(sealed_at) AS latest FROM archive_snapshot WHERE server_id = ?",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) rs.getTimestamp("latest")?.toInstant()?.toString() else null
+                }
+            }
+        }
+    }
+
+    fun latestSealedAtForPath(serverId: String, pathId: String): String? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT MAX(sealed_at) AS latest FROM archive_snapshot WHERE server_id = ? AND path_id = ?",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.setString(2, pathId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) rs.getTimestamp("latest")?.toInstant()?.toString() else null
                 }
             }
         }

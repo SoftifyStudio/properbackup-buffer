@@ -12,6 +12,7 @@ import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.flush.BudgetGuard
 import pl.danielniemiec.properbackup.buffer.flush.ChunkSealer
 import pl.danielniemiec.properbackup.buffer.flush.FlushTrigger
+import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
 import pl.danielniemiec.properbackup.buffer.inbox.ChunkStorage
 import pl.danielniemiec.properbackup.buffer.inbox.DiskGuard
 import pl.danielniemiec.properbackup.buffer.inbox.InboxReceiver
@@ -26,12 +27,20 @@ import pl.danielniemiec.properbackup.buffer.ovh.DevSafetyGuard
 import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
+import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
+import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
+import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
+import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
+import pl.danielniemiec.properbackup.buffer.pathsidx.BackupConfigStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.server.ActivationTokenStore
 import pl.danielniemiec.properbackup.buffer.server.ServerHandler
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
+import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.nio.file.Path
@@ -74,29 +83,35 @@ fun main(args: Array<String>) {
     val backupRootStore = BackupRootStore(db)
     val archiveSnapshotStore = ArchiveSnapshotStore(db)
     val agentStatusStore = AgentStatusStore(db)
-    val logApi = LogApiHandler(logStore, fileStateStore, fileEventStore, backupRootStore, agentStatusStore, db, ingestToken)
+    val sseBus = SseEventBus()
+    val logApi = LogApiHandler(logStore, fileStateStore, fileEventStore, backupRootStore, agentStatusStore, db, ingestToken, sseBus = sseBus)
 
     val objectStore = LocalObjectStore(storageDir)
     val chunkStorage = ChunkStorage(inboxDir)
     val diskGuard = DiskGuard(inboxDir)
 
+    val userStore = UserStore(db)
+    val serverStore = ServerStore(db)
+
     val budgetGuard = BudgetGuard(db)
     val swiftRemote = swiftClientFromEnv(storageDir)
-    val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore)
+    val storageQuotaGuard = StorageQuotaGuard(db, userStore)
+    val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
     val flusher = FlushTrigger(chunkStorage, sealer, budgetGuard)
-    val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken)
+    val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken, serverStore)
 
     val jwtSecret = System.getenv().getOrDefault("PROPERBACKUP_JWT_SECRET", "dev-jwt-secret-change-in-prod")
-    val userStore = UserStore(db)
     val serviceCodeStore = ServiceAdminCodeStore(db)
     serviceCodeStore.ensureSeedCode(System.getenv().getOrDefault("PROPERBACKUP_SERVICE_ADMIN_SEED_CODE", "dt5mkom8Serwer.13"))
     val jwtService = JwtService(jwtSecret)
     val authHandler = AuthHandler(userStore, jwtService, serviceCodeStore)
     val jwtFilter = JwtFilter(jwtService)
 
-    val serverStore = ServerStore(db)
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
+    val restoreVerifier = RestoreVerifier(db, objectRead)
+    sealer.setVerifier(restoreVerifier)
+    val backupConfigStore = BackupConfigStore(db)
     val serverHandler = ServerHandler(
         serverStore,
         tokenStore,
@@ -110,9 +125,23 @@ fun main(args: Array<String>) {
         archiveSnapshotStore,
         backupRootStore,
         agentStatusStore,
+        backupConfigStore,
+        restoreVerifier,
+    )
+
+    val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard)
+    val subscriptionGuard = SubscriptionGuard(userStore)
+    val trialNotifier = TrialNotifier(userStore, logStore)
+
+    val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
+    val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
+
+    val auditReportHandler = AuditReportHandler(
+        serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
     )
 
     flusher.start()
+    trialNotifier.start()
 
     val app = Javalin.create { cfg ->
         cfg.http.maxRequestSize = 100L * 1024 * 1024
@@ -127,6 +156,7 @@ fun main(args: Array<String>) {
     app.post("/auth/service-admin", authHandler::elevateServiceAdmin)
     app.post("/agent/logs", logApi::ingestLog)
     app.post("/agent/file-state", logApi::ingestFileState)
+    app.post("/agent/file-states", logApi::ingestFileStateBatch)
     app.post("/agent/backup-roots", logApi::ingestBackupRoots)
     app.post("/agent/register-paths", logApi::ingestRegisterPaths)
     app.post("/agent/status", logApi::ingestAgentStatus)
@@ -180,14 +210,98 @@ fun main(args: Array<String>) {
     }
     app.get("/admin/logs", logApi::listLogsAdmin)
 
+    app.before("/account/*", jwtFilter)
+    app.get("/account/subscription", subscriptionHandler::getSubscription)
+    app.get("/account/checkout", lemonHandler::getCheckoutUrl)
+
+    app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
+    app.get("/account/storage") { ctx ->
+        val userId = ctx.attribute<String>("userId")!!
+        val q = storageQuotaGuard.checkQuota(userId)
+        ctx.contentType("application/json").result(
+            Gson().toJson(
+                mapOf(
+                    "usedBytes" to q.usedBytes,
+                    "limitBytes" to q.limitBytes,
+                    "remainingBytes" to q.remainingBytes,
+                    "usedPercent" to q.usedPercent,
+                    "exceeded" to q.exceeded,
+                ),
+            ),
+        )
+    }
+
+    app.get("/health/inventory-summary") { ctx ->
+        val auth = ctx.header("Authorization")
+        if (auth == null || !auth.startsWith("Bearer ")) {
+            ctx.status(401).result("Unauthorized")
+            return@get
+        }
+        val serverId = ctx.queryParam("serverId")?.trim()
+        if (serverId.isNullOrBlank()) {
+            ctx.status(400).result("serverId required")
+            return@get
+        }
+        val agentStatus = agentStatusStore.get(serverId)
+        val totalFiles = fileStateStore.countForMachine(serverId)
+        val rootsCount = backupRootStore.listForMachine(serverId).size
+        val latestVerification = restoreVerifier.getLatestResult(serverId)
+        ctx.contentType("application/json").result(
+            Gson().toJson(
+                mapOf(
+                    "agentStatus" to agentStatus,
+                    "totalFiles" to totalFiles,
+                    "rootsCount" to rootsCount,
+                    "latestVerification" to latestVerification,
+                ),
+            ),
+        )
+    }
+
     app.get("/servers", serverHandler::listServers)
     app.get("/servers/activation-tokens", serverHandler::listActivationTokens)
     app.post("/servers/generate-token", serverHandler::generateToken)
     app.get("/servers/{id}/objects", serverHandler::listObjects)
     app.get("/servers/{id}/paths.idx", serverHandler::getPathsIdx)
+    app.sse("/servers/{id}/events") { client ->
+        val ctx = client.ctx()
+        val serverId = ctx.pathParam("id")
+        val qToken = ctx.queryParam("token")?.trim()
+        if (!qToken.isNullOrBlank()) {
+            try {
+                val claims = jwtService.verify(qToken)
+                val userId = claims.subject
+                val isAdmin = claims["sa"] == true
+                val server = serverStore.findById(serverId)
+                if (server.isPresent && (server.get().userId == userId || isAdmin)) {
+                    sseBus.subscribe(serverId, client)
+                } else {
+                    client.sendEvent("error", "\"forbidden\"")
+                }
+            } catch (_: Exception) {
+                client.sendEvent("error", "\"invalid_token\"")
+            }
+        } else {
+            client.sendEvent("error", "\"token_required\"")
+        }
+    }
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
+    app.get("/servers/{id}/file-states-at", serverHandler::getFileStatesAt)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)
+    app.get("/servers/{id}/audit-report", auditReportHandler::downloadReport)
+    app.get("/servers/{id}/verification") { ctx ->
+        val serverId = ctx.pathParam("id")
+        val limit = ctx.queryParam("limit")?.toIntOrNull() ?: 20
+        val latest = restoreVerifier.getLatestResult(serverId)
+        val results = restoreVerifier.listResults(serverId, limit)
+        ctx.contentType("application/json").result(
+            Gson().toJson(mapOf("latest" to latest, "results" to results)),
+        )
+    }
+    app.get("/servers/{id}/backup-config", serverHandler::getBackupConfig)
+    app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
+    app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
 
     app.get("/objects") { ctx ->
         val list = objectRead.listMerged()
@@ -226,6 +340,7 @@ fun main(args: Array<String>) {
             meta = mapOf("port" to port),
         ),
     )
+    val snapshotRetentionDays = System.getenv().getOrDefault("PROPERBACKUP_SNAPSHOT_RETENTION_DAYS", retentionDays.toString()).toIntOrNull() ?: retentionDays
     thread(name = "logs-retention-cleaner", isDaemon = true) {
         while (!Thread.currentThread().isInterrupted) {
             try {
@@ -233,7 +348,7 @@ fun main(args: Array<String>) {
                 logStore.deleteOlderThan(retentionDays)
                 fileStateStore.deleteOlderThan(retentionDays)
                 fileEventStore.deleteOlderThan(retentionDays)
-                archiveSnapshotStore.deleteOlderThan(retentionDays)
+                archiveSnapshotStore.deleteOlderThan(snapshotRetentionDays)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break

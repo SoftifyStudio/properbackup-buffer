@@ -9,13 +9,26 @@ import java.util.UUID
 
 class UserStore(private val db: Database) {
 
-    data class User(val id: String, val email: String, val bcryptHash: String, val createdAt: String, val isSystemAdmin: Boolean)
+    data class User(
+        val id: String,
+        val email: String,
+        val bcryptHash: String,
+        val createdAt: String,
+        val isSystemAdmin: Boolean,
+        val trialExpiresAt: String?,
+        val subscriptionPlan: String?,
+        val subscriptionExpiresAt: String?,
+        val storageLimitBytes: Long,
+        val lastTrialNotification: String?,
+    )
     data class UserSummary(val id: String, val email: String)
+
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT id, email, bcrypt_hash, created_at, is_system_admin FROM users WHERE email = ?",
+                "SELECT $SELECT_COLS FROM users WHERE email = ?",
             ).use { ps ->
                 ps.setString(1, email.lowercase())
                 ps.executeQuery().use { rs ->
@@ -28,7 +41,7 @@ class UserStore(private val db: Database) {
     fun findById(id: String): Optional<User> {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT id, email, bcrypt_hash, created_at, is_system_admin FROM users WHERE id = ?",
+                "SELECT $SELECT_COLS FROM users WHERE id = ?",
             ).use { ps ->
                 ps.setString(1, id)
                 ps.executeQuery().use { rs ->
@@ -55,18 +68,21 @@ class UserStore(private val db: Database) {
     fun register(email: String, plainPassword: String): User {
         val hash = BCrypt.withDefaults().hashToString(12, plainPassword.toCharArray())
         val id = UUID.randomUUID().toString()
+        val now = Instant.now()
+        val trialEnd = now.plusSeconds(30L * 24 * 60 * 60)
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO users (id, email, bcrypt_hash, created_at, is_system_admin) VALUES (?, ?, ?, ?, FALSE)",
+                "INSERT INTO users (id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, storage_limit_bytes) VALUES (?, ?, ?, ?, FALSE, ?, 2199023255552)",
             ).use { ps ->
                 ps.setString(1, id)
                 ps.setString(2, email.lowercase())
                 ps.setString(3, hash)
-                ps.setTimestamp(4, Timestamp.from(Instant.now()))
+                ps.setTimestamp(4, Timestamp.from(now))
+                ps.setTimestamp(5, Timestamp.from(trialEnd))
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, Instant.now().toString(), false)
+        return User(id, email.lowercase(), hash, now.toString(), false, trialEnd.toString(), null, null, 2199023255552L, null)
     }
 
     fun verifyPassword(user: User, plainPassword: String): Boolean =
@@ -83,11 +99,61 @@ class UserStore(private val db: Database) {
         }
     }
 
+    fun updateSubscription(userId: String, plan: String, expiresAt: Instant, storageLimitBytes: Long) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET subscription_plan = ?, subscription_expires_at = ?, storage_limit_bytes = ? WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, plan)
+                ps.setTimestamp(2, Timestamp.from(expiresAt))
+                ps.setLong(3, storageLimitBytes)
+                ps.setString(4, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun updateLastTrialNotification(userId: String, marker: String) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET last_trial_notification = ? WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, marker)
+                ps.setString(2, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun listTrialUsersNeedingNotification(): List<User> {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """SELECT $SELECT_COLS FROM users
+                   WHERE subscription_plan IS NULL
+                     AND trial_expires_at IS NOT NULL
+                     AND trial_expires_at > NOW()
+                     AND trial_expires_at <= NOW() + INTERVAL '14 days'
+                   ORDER BY trial_expires_at ASC""",
+            ).use { ps ->
+                ps.executeQuery().use { rs ->
+                    val out = ArrayList<User>()
+                    while (rs.next()) out.add(map(rs))
+                    return out
+                }
+            }
+        }
+    }
+
     private fun map(rs: java.sql.ResultSet): User = User(
         rs.getString("id"),
         rs.getString("email"),
         rs.getString("bcrypt_hash"),
         rs.getTimestamp("created_at").toInstant().toString(),
         rs.getBoolean("is_system_admin"),
+        rs.getTimestamp("trial_expires_at")?.toInstant()?.toString(),
+        rs.getString("subscription_plan"),
+        rs.getTimestamp("subscription_expires_at")?.toInstant()?.toString(),
+        rs.getLong("storage_limit_bytes").let { if (rs.wasNull()) 2199023255552L else it },
+        rs.getString("last_trial_notification"),
     )
 }

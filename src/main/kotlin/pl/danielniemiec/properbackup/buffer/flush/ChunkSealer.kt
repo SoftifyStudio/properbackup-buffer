@@ -7,6 +7,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectStore
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.time.Instant
@@ -20,7 +21,13 @@ class ChunkSealer(
     private val db: Database,
     private val swiftRemote: SwiftClient? = null,
     private val archiveSnapshotStore: ArchiveSnapshotStore? = null,
+    private val storageQuotaGuard: StorageQuotaGuard? = null,
 ) {
+    private var restoreVerifier: RestoreVerifier? = null
+
+    fun setVerifier(verifier: RestoreVerifier) {
+        this.restoreVerifier = verifier
+    }
 
     private val tsFmt = DateTimeFormatter.ofPattern("yyMMddHHmm").withZone(ZoneOffset.UTC)
 
@@ -40,6 +47,13 @@ class ChunkSealer(
             combined.write(Files.readAllBytes(part))
         }
         val data = combined.toByteArray()
+
+        if (storageQuotaGuard != null && !storageQuotaGuard.canUpload(userId, data.size.toLong())) {
+            val q = storageQuotaGuard.checkQuota(userId)
+            println("[seal] BLOCKED by StorageQuotaGuard for $userId/$pathId — used ${q.usedBytes}/${q.limitBytes} bytes (${String.format("%.1f", q.usedPercent)}%)")
+            for (part in parts) Files.deleteIfExists(part)
+            return
+        }
 
         val timestamp = tsFmt.format(ZonedDateTime.now(ZoneOffset.UTC))
         val shortHash = Integer.toHexString(java.util.Arrays.hashCode(data) and 0xFFFF)
@@ -72,10 +86,7 @@ class ChunkSealer(
 
         val store = archiveSnapshotStore
         val sid = serverId
-        if (store != null &&
-            !sid.isNullOrBlank() &&
-            !(swiftRemote != null && originalPath.isNullOrBlank())
-        ) {
+        if (store != null && !sid.isNullOrBlank()) {
             store.insert(
                 sid,
                 pathId,
@@ -88,6 +99,11 @@ class ChunkSealer(
 
         for (part in parts) {
             Files.deleteIfExists(part)
+        }
+
+        val verifier = restoreVerifier
+        if (verifier != null && !sid.isNullOrBlank()) {
+            verifier.scheduleVerification(sid, objectName, pathId)
         }
     }
 }

@@ -1,11 +1,13 @@
 package pl.danielniemiec.properbackup.buffer.inbox
 
 import io.javalin.http.Context
+import pl.danielniemiec.properbackup.buffer.server.ServerStore
 
 class InboxReceiver(
     private val storage: ChunkStorage,
     private val diskGuard: DiskGuard,
     private val expectedToken: String,
+    private val serverStore: ServerStore? = null,
 ) {
 
     fun handle(ctx: Context) {
@@ -26,7 +28,12 @@ class InboxReceiver(
         val pathId = ctx.header("X-Path-Id")
         val origPath = ctx.header("X-Original-Path")
         val flag = ctx.header("X-Flag")
-        val userId = "U1"
+        val serverId = ctx.header("X-Server-Id")
+        val userId = if (!serverId.isNullOrBlank() && serverStore != null) {
+            serverStore.findById(serverId).map { it.userId }.orElse("U1")
+        } else {
+            "U1"
+        }
 
         if (pathId == null || flag == null) {
             ctx.status(400).result("Missing X-Path-Id or X-Flag")
