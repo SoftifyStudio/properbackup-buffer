@@ -199,7 +199,10 @@ fun main(args: Array<String>) {
         val cpu = (body["cpuPercent"] as? Number)?.toFloat() ?: 0f
         val ramUsed = (body["ramUsedMb"] as? Number)?.toFloat() ?: 0f
         val ramTotal = (body["ramTotalMb"] as? Number)?.toFloat() ?: 0f
-        agentMetricsStore.insert(serverId, cpu, ramUsed, ramTotal)
+        val coreCount = (body["coreCount"] as? Number)?.toInt() ?: 1
+        @Suppress("UNCHECKED_CAST")
+        val perCoreCpu = (body["perCoreCpu"] as? List<*>)?.mapNotNull { (it as? Number)?.toFloat() }
+        agentMetricsStore.insert(serverId, cpu, ramUsed, ramTotal, coreCount, perCoreCpu)
         ctx.status(200).result("ok")
     }
 
