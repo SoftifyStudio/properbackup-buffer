@@ -181,8 +181,15 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
 
 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS core_count INT NOT NULL DEFAULT 1;
 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS per_core_cpu JSONB;
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS agent_cpu_percent REAL NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_agent_metrics_server_time ON agent_metrics(server_id, recorded_at DESC);
+
+-- Performance indexes for million-client scale
+CREATE INDEX IF NOT EXISTS idx_agent_metrics_recorded_at ON agent_metrics(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_stack_logs_created_at ON stack_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_mfe_occurred_at ON machine_file_event(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_mfs_machine_status ON machine_file_state(machine_id, status);
 
 -- Buffer packs — chunks collected into packs before flushing to remote storage
 CREATE TABLE IF NOT EXISTS buffer_pack (

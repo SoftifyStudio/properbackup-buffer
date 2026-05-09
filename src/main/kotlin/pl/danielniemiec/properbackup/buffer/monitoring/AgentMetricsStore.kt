@@ -16,18 +16,20 @@ class AgentMetricsStore(private val db: Database) {
         ramTotalMb: Float,
         coreCount: Int = 1,
         perCoreCpu: List<Float>? = null,
+        agentCpuPercent: Float = 0f,
     ) {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO agent_metrics (server_id, cpu_percent, ram_used_mb, ram_total_mb, core_count, per_core_cpu, recorded_at) VALUES (?, ?, ?, ?, ?, ?::jsonb, ?)",
+                "INSERT INTO agent_metrics (server_id, cpu_percent, agent_cpu_percent, ram_used_mb, ram_total_mb, core_count, per_core_cpu, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?::jsonb, ?)",
             ).use { ps ->
                 ps.setString(1, serverId)
                 ps.setFloat(2, cpuPercent)
-                ps.setFloat(3, ramUsedMb)
-                ps.setFloat(4, ramTotalMb)
-                ps.setInt(5, coreCount)
-                ps.setString(6, if (perCoreCpu != null) gson.toJson(perCoreCpu) else null)
-                ps.setTimestamp(7, Timestamp.from(Instant.now()))
+                ps.setFloat(3, agentCpuPercent)
+                ps.setFloat(4, ramUsedMb)
+                ps.setFloat(5, ramTotalMb)
+                ps.setInt(6, coreCount)
+                ps.setString(7, if (perCoreCpu != null) gson.toJson(perCoreCpu) else null)
+                ps.setTimestamp(8, Timestamp.from(Instant.now()))
                 ps.executeUpdate()
             }
         }
@@ -36,7 +38,7 @@ class AgentMetricsStore(private val db: Database) {
     fun query(serverId: String, from: Instant, to: Instant, limit: Int = 1000): List<Map<String, Any?>> {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT cpu_percent, ram_used_mb, ram_total_mb, core_count, per_core_cpu, recorded_at FROM agent_metrics " +
+                "SELECT cpu_percent, agent_cpu_percent, ram_used_mb, ram_total_mb, core_count, per_core_cpu, recorded_at FROM agent_metrics " +
                     "WHERE server_id = ? AND recorded_at >= ? AND recorded_at <= ? " +
                     "ORDER BY recorded_at ASC LIMIT ?",
             ).use { ps ->
@@ -59,6 +61,7 @@ class AgentMetricsStore(private val db: Database) {
                         out.add(
                             linkedMapOf(
                                 "cpuPercent" to rs.getFloat("cpu_percent"),
+                                "agentCpuPercent" to rs.getFloat("agent_cpu_percent"),
                                 "ramUsedMb" to rs.getFloat("ram_used_mb"),
                                 "ramTotalMb" to rs.getFloat("ram_total_mb"),
                                 "coreCount" to rs.getInt("core_count"),
