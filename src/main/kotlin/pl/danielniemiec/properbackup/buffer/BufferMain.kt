@@ -12,6 +12,7 @@ import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.flush.BudgetGuard
 import pl.danielniemiec.properbackup.buffer.flush.ChunkSealer
 import pl.danielniemiec.properbackup.buffer.flush.FlushTrigger
+import pl.danielniemiec.properbackup.buffer.flush.PackBuffer
 import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
 import pl.danielniemiec.properbackup.buffer.inbox.ChunkStorage
 import pl.danielniemiec.properbackup.buffer.inbox.DiskGuard
@@ -101,7 +102,11 @@ fun main(args: Array<String>) {
     val budgetGuard = BudgetGuard(db, maxFlushes)
     val swiftRemote = swiftClientFromEnv(storageDir)
     val storageQuotaGuard = StorageQuotaGuard(db, userStore)
+    val packBufferDir = Path.of(System.getenv().getOrDefault("PROPERBACKUP_PACK_BUFFER_DIR", "/tmp/properbackup/pack-buffer"))
+    val packBuffer = PackBuffer(packBufferDir, db, swiftRemote)
+
     val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
+    sealer.setPackBuffer(packBuffer)
     val flusher = FlushTrigger(chunkStorage, sealer, budgetGuard)
     val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken, serverStore)
 
@@ -146,6 +151,7 @@ fun main(args: Array<String>) {
     )
 
     flusher.start()
+    packBuffer.start()
     trialNotifier.start()
 
     val app = Javalin.create { cfg ->
@@ -386,11 +392,35 @@ fun main(args: Array<String>) {
         ctx.result("flushed")
     }
 
+    app.post("/flush-packs") { ctx ->
+        packBuffer.flushAll()
+        ctx.result("packs flushed")
+    }
+
+    app.get("/pack-buffer/status") { ctx ->
+        val serverIds = mutableListOf<Map<String, Any>>()
+        val bufDir = packBufferDir.toFile()
+        if (bufDir.exists()) {
+            for (dir in bufDir.listFiles()?.filter { it.isDirectory } ?: emptyList()) {
+                val packs = dir.listFiles()?.filter { it.name.endsWith(".pack") } ?: emptyList()
+                val totalBytes = packs.sumOf { it.length() }
+                serverIds.add(mapOf(
+                    "serverId" to dir.name,
+                    "packCount" to packs.size,
+                    "totalBytes" to totalBytes,
+                    "packs" to packs.map { mapOf("name" to it.name, "sizeBytes" to it.length()) },
+                ))
+            }
+        }
+        ctx.contentType("application/json").result(Gson().toJson(mapOf("servers" to serverIds)))
+    }
+
     app.start(port)
     println("ProperBackup Buffer listening on port $port")
-    println("  storage : ${storageDir.toAbsolutePath()}")
-    println("  inbox   : ${inboxDir.toAbsolutePath()}")
-    println("  db      : $dbUrl")
+    println("  storage    : ${storageDir.toAbsolutePath()}")
+    println("  inbox      : ${inboxDir.toAbsolutePath()}")
+    println("  pack-buffer: ${packBufferDir.toAbsolutePath()}")
+    println("  db         : $dbUrl")
     logStore.ingest(
         LogIngestReq(
             machineId = "buffer-local",
@@ -422,6 +452,7 @@ fun main(args: Array<String>) {
     Runtime.getRuntime().addShutdownHook(
         Thread {
             flusher.stop()
+            packBuffer.stop()
             app.stop()
             db.close()
         },

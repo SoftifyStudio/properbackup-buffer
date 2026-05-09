@@ -181,4 +181,16 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
 
 CREATE INDEX IF NOT EXISTS idx_agent_metrics_server_time ON agent_metrics(server_id, recorded_at DESC);
 
+-- Buffer packs — chunks collected into packs before flushing to remote storage
+CREATE TABLE IF NOT EXISTS buffer_pack (
+  id           BIGSERIAL PRIMARY KEY,
+  server_id    VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  pack_name    TEXT         NOT NULL,
+  size_bytes   BIGINT       NOT NULL,
+  flushed_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  UNIQUE (server_id, pack_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_buffer_pack_server_time ON buffer_pack(server_id, flushed_at DESC);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
