@@ -179,6 +179,9 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
   recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS core_count INT NOT NULL DEFAULT 1;
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS per_core_cpu JSONB;
+
 CREATE INDEX IF NOT EXISTS idx_agent_metrics_server_time ON agent_metrics(server_id, recorded_at DESC);
 
 -- Buffer packs — chunks collected into packs before flushing to remote storage
@@ -192,5 +195,23 @@ CREATE TABLE IF NOT EXISTS buffer_pack (
 );
 
 CREATE INDEX IF NOT EXISTS idx_buffer_pack_server_time ON buffer_pack(server_id, flushed_at DESC);
+
+-- ============================================================================
+-- Data retention / cleanup support
+-- ============================================================================
+
+-- Retention config per table (configurable from admin panel)
+CREATE TABLE IF NOT EXISTS data_retention_config (
+  table_name   VARCHAR(64) PRIMARY KEY,
+  retention_days INT NOT NULL DEFAULT 30,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Default retention: 30 days for metrics, 90 days for logs/events
+INSERT INTO data_retention_config (table_name, retention_days) VALUES
+  ('agent_metrics', 30),
+  ('stack_logs', 90),
+  ('machine_file_event', 90)
+ON CONFLICT (table_name) DO NOTHING;
 
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
