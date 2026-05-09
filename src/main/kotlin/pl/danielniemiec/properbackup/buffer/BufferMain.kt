@@ -317,6 +317,13 @@ fun main(args: Array<String>) {
                 val server = serverStore.findById(serverId)
                 if (server.isPresent && (server.get().userId == userId || isAdmin)) {
                     sseBus.subscribe(serverId, client)
+                    // Push current agent status immediately so Activity Log is populated on connect
+                    val currentStatus = agentStatusStore.get(serverId)
+                    if (currentStatus != null) {
+                        try {
+                            client.sendEvent("agentStatus", Gson().toJson(currentStatus))
+                        } catch (_: Exception) { /* ignore if client disconnected */ }
+                    }
                 } else {
                     client.sendEvent("error", "\"forbidden\"")
                 }
@@ -326,6 +333,25 @@ fun main(args: Array<String>) {
         } else {
             client.sendEvent("error", "\"token_required\"")
         }
+    }
+    app.get("/servers/{id}/activity") { ctx ->
+        val serverId = ctx.pathParam("id")
+        val userId = ctx.attribute<String>("userId")!!
+        val isAdmin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
+        val server = serverStore.findById(serverId)
+        if (!server.isPresent || (!isAdmin && server.get().userId != userId)) {
+            ctx.status(404).result("Not found")
+            return@get
+        }
+        val limit = (ctx.queryParam("limit")?.toIntOrNull() ?: 100).coerceIn(1, 500)
+        val agentStatus = agentStatusStore.get(serverId)
+        val recentLogs = logStore.list(serverId, null, null, null, null, limit)
+        val recentFileEvents = fileEventStore.listRecentForMachine(serverId, null, limit, 0)
+        ctx.contentType("application/json").result(Gson().toJson(mapOf(
+            "agentStatus" to agentStatus,
+            "recentLogs" to recentLogs,
+            "recentFileEvents" to recentFileEvents,
+        )))
     }
     app.get("/servers/{id}/inventory", serverHandler::getInventory)
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
