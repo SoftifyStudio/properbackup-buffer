@@ -24,9 +24,14 @@ class ChunkSealer(
     private val storageQuotaGuard: StorageQuotaGuard? = null,
 ) {
     private var restoreVerifier: RestoreVerifier? = null
+    private var packBuffer: PackBuffer? = null
 
     fun setVerifier(verifier: RestoreVerifier) {
         this.restoreVerifier = verifier
+    }
+
+    fun setPackBuffer(buffer: PackBuffer) {
+        this.packBuffer = buffer
     }
 
     private val tsFmt = DateTimeFormatter.ofPattern("yyMMddHHmm").withZone(ZoneOffset.UTC)
@@ -62,26 +67,37 @@ class ChunkSealer(
         objectStore.put(objectName, data)
         println("[seal] $pathId → $objectName (${data.size} bytes)")
 
-        try {
-            if (swiftRemote != null) {
-                swiftRemote.put(objectName, data)
-                if (!originalPath.isNullOrBlank() && !serverId.isNullOrBlank()) {
-                    PostUploadCleanup(objectStore, PathsIdxStore(db, serverId), swiftRemote)
-                        .afterUpload(objectName, pathId, originalPath)
-                } else {
-                    objectStore.delete(objectName)
-                }
-            } else if (!originalPath.isNullOrBlank() && !serverId.isNullOrBlank()) {
+        val pb = packBuffer
+        if (pb != null && !serverId.isNullOrBlank()) {
+            pb.addToPack(serverId, objectName, data)
+            if (!originalPath.isNullOrBlank()) {
                 PathsIdxStore(db, serverId).register(pathId, originalPath)
             }
-        } catch (e: Exception) {
             if (swiftRemote != null) {
-                try {
-                    objectStore.delete(objectName)
-                } catch (ignored: java.io.IOException) {
-                }
+                try { objectStore.delete(objectName) } catch (_: java.io.IOException) {}
             }
-            throw e
+        } else {
+            try {
+                if (swiftRemote != null) {
+                    swiftRemote.put(objectName, data)
+                    if (!originalPath.isNullOrBlank() && !serverId.isNullOrBlank()) {
+                        PostUploadCleanup(objectStore, PathsIdxStore(db, serverId), swiftRemote)
+                            .afterUpload(objectName, pathId, originalPath)
+                    } else {
+                        objectStore.delete(objectName)
+                    }
+                } else if (!originalPath.isNullOrBlank() && !serverId.isNullOrBlank()) {
+                    PathsIdxStore(db, serverId).register(pathId, originalPath)
+                }
+            } catch (e: Exception) {
+                if (swiftRemote != null) {
+                    try {
+                        objectStore.delete(objectName)
+                    } catch (ignored: java.io.IOException) {
+                    }
+                }
+                throw e
+            }
         }
 
         val store = archiveSnapshotStore
