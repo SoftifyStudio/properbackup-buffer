@@ -6,6 +6,7 @@ import pl.danielniemiec.properbackup.buffer.inbox.ChunkStorage
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
+import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.ObjectStore
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import java.io.ByteArrayOutputStream
@@ -22,6 +23,7 @@ class ChunkSealer(
     private val swiftRemote: SwiftClient? = null,
     private val archiveSnapshotStore: ArchiveSnapshotStore? = null,
     private val storageQuotaGuard: StorageQuotaGuard? = null,
+    private val sseBus: SseEventBus? = null,
 ) {
     private var restoreVerifier: RestoreVerifier? = null
     private var packBuffer: PackBuffer? = null
@@ -102,6 +104,7 @@ class ChunkSealer(
 
         val store = archiveSnapshotStore
         val sid = serverId
+        val sealedAt = Instant.now()
         if (store != null && !sid.isNullOrBlank()) {
             store.insert(
                 sid,
@@ -109,8 +112,16 @@ class ChunkSealer(
                 objectName,
                 flag,
                 data.size.toLong(),
-                Instant.now(),
+                sealedAt,
             )
+            sseBus?.publish(sid, "snapshotCreated", mapOf(
+                "objectName" to objectName,
+                "pathId" to pathId,
+                "flag" to flag,
+                "sizeBytes" to data.size.toLong(),
+                "sealedAt" to sealedAt.toString(),
+                "serverId" to sid,
+            ))
         }
 
         for (part in parts) {
