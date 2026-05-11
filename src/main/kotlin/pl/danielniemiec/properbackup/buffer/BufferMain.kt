@@ -105,7 +105,7 @@ fun main(args: Array<String>) {
     val packBufferDir = Path.of(System.getenv().getOrDefault("PROPERBACKUP_PACK_BUFFER_DIR", "/tmp/properbackup/pack-buffer"))
     val packBuffer = PackBuffer(packBufferDir, db, swiftRemote)
 
-    val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
+    val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard, sseBus)
     sealer.setPackBuffer(packBuffer)
     val flusher = FlushTrigger(chunkStorage, sealer, budgetGuard)
     val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken, serverStore)
