@@ -6,6 +6,7 @@ import pl.danielniemiec.properbackup.buffer.inbox.ChunkStorage
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
+import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.ObjectStore
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import java.io.ByteArrayOutputStream
@@ -25,6 +26,7 @@ class ChunkSealer(
 ) {
     private var restoreVerifier: RestoreVerifier? = null
     private var packBuffer: PackBuffer? = null
+    private var sseBus: SseEventBus? = null
 
     fun setVerifier(verifier: RestoreVerifier) {
         this.restoreVerifier = verifier
@@ -32,6 +34,10 @@ class ChunkSealer(
 
     fun setPackBuffer(buffer: PackBuffer) {
         this.packBuffer = buffer
+    }
+
+    fun setSseBus(bus: SseEventBus) {
+        this.sseBus = bus
     }
 
     private val tsFmt = DateTimeFormatter.ofPattern("yyMMddHHmm").withZone(ZoneOffset.UTC)
@@ -102,6 +108,7 @@ class ChunkSealer(
 
         val store = archiveSnapshotStore
         val sid = serverId
+        val sealedAt = Instant.now()
         if (store != null && !sid.isNullOrBlank()) {
             store.insert(
                 sid,
@@ -109,8 +116,21 @@ class ChunkSealer(
                 objectName,
                 flag,
                 data.size.toLong(),
-                Instant.now(),
+                sealedAt,
             )
+        }
+
+        // Emit real-time SSE event so the web panel Timeline updates instantly
+        val bus = sseBus
+        if (bus != null && !sid.isNullOrBlank()) {
+            bus.publish(sid, "snapshotCreated", mapOf(
+                "objectName" to objectName,
+                "pathId" to pathId,
+                "flag" to flag,
+                "sizeBytes" to data.size.toLong(),
+                "sealedAt" to sealedAt.toString(),
+                "serverId" to sid,
+            ))
         }
 
         for (part in parts) {

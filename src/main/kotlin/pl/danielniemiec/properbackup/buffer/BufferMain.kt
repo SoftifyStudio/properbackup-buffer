@@ -107,6 +107,7 @@ fun main(args: Array<String>) {
 
     val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard)
     sealer.setPackBuffer(packBuffer)
+    sealer.setSseBus(sseBus)
     val flusher = FlushTrigger(chunkStorage, sealer, budgetGuard)
     val inbox = InboxReceiver(chunkStorage, diskGuard, uploadToken, serverStore)
 
