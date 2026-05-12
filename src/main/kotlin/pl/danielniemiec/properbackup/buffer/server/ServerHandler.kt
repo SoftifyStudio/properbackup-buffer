@@ -192,6 +192,7 @@ class ServerHandler(
                 val body = linkedMapOf<String, Any?>(
                     "serverId" to server.id,
                     "name" to server.name,
+                    "uploadToken" to uploadToken,
                 )
                 if (java.lang.Boolean.TRUE == req.includeAuth) {
                     val u = userStore.findById(tk.userId).orElseThrow()
