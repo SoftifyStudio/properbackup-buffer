@@ -119,7 +119,7 @@ fun main(args: Array<String>) {
 
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
-    val restoreVerifier = RestoreVerifier(db, objectRead)
+    val restoreVerifier = RestoreVerifier(db, objectRead, sseBus)
     sealer.setVerifier(restoreVerifier)
     val backupConfigStore = BackupConfigStore(db)
     val serverHandler = ServerHandler(
@@ -147,7 +147,7 @@ fun main(args: Array<String>) {
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
 
     val auditReportHandler = AuditReportHandler(
-        serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
+        serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard, restoreVerifier,
     )
 
     flusher.start()
@@ -366,8 +366,9 @@ fun main(args: Array<String>) {
         val limit = ctx.queryParam("limit")?.toIntOrNull() ?: 20
         val latest = restoreVerifier.getLatestResult(serverId)
         val results = restoreVerifier.listResults(serverId, limit)
+        val summary = restoreVerifier.getSummary(serverId)
         ctx.contentType("application/json").result(
-            Gson().toJson(mapOf("latest" to latest, "results" to results)),
+            Gson().toJson(mapOf("latest" to latest, "results" to results, "summary" to summary)),
         )
     }
     app.get("/servers/{id}/metrics") { ctx ->

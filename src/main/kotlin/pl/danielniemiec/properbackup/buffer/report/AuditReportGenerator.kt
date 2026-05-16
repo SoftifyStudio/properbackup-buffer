@@ -29,6 +29,15 @@ class AuditReportGenerator {
         val verificationStatus: String,
         val storageLimitLabel: String,
         val storageUsedLabel: String,
+        val verificationResults: List<VerificationEntry> = emptyList(),
+    )
+
+    data class VerificationEntry(
+        val objectName: String,
+        val pathId: String,
+        val status: String,
+        val detail: String?,
+        val verifiedAt: String?,
     )
 
     data class RootEntry(
@@ -126,6 +135,63 @@ class AuditReportGenerator {
             }
 
             document.add(table)
+        }
+
+        if (data.verificationResults.isNotEmpty()) {
+            addLine(document)
+
+            document.add(Paragraph("Restore Verification", headingFont).apply {
+                spacingBefore = 16f
+                spacingAfter = 8f
+            })
+
+            val passedCount = data.verificationResults.count { it.status == "passed" }
+            val failedCount = data.verificationResults.count { it.status == "failed" }
+            addKeyValue(document, "Verified archives", "$passedCount passed, $failedCount failed")
+
+            val vTable = PdfPTable(4)
+            vTable.widthPercentage = 100f
+            vTable.setWidths(floatArrayOf(35f, 15f, 15f, 35f))
+
+            listOf("Archive", "Path", "Status", "Detail").forEach { header ->
+                vTable.addCell(PdfPCell(Phrase(header, boldFont)).apply {
+                    backgroundColor = Color(245, 245, 245)
+                    paddingBottom = 6f
+                    paddingTop = 4f
+                    borderColor = Color(220, 220, 220)
+                })
+            }
+
+            for (v in data.verificationResults.take(50)) {
+                vTable.addCell(PdfPCell(Phrase(v.objectName.takeLast(40), smallFont)).apply {
+                    paddingBottom = 4f
+                    paddingTop = 2f
+                    borderColor = Color(235, 235, 235)
+                })
+                vTable.addCell(PdfPCell(Phrase(v.pathId, normalFont)).apply {
+                    paddingBottom = 4f
+                    paddingTop = 2f
+                    borderColor = Color(235, 235, 235)
+                })
+                val statusFont = if (v.status == "passed") {
+                    Font(Font.HELVETICA, 9f, Font.BOLD, Color(22, 163, 74))
+                } else {
+                    Font(Font.HELVETICA, 9f, Font.BOLD, Color(220, 38, 38))
+                }
+                vTable.addCell(PdfPCell(Phrase(v.status.uppercase(), statusFont)).apply {
+                    paddingBottom = 4f
+                    paddingTop = 2f
+                    borderColor = Color(235, 235, 235)
+                    horizontalAlignment = Element.ALIGN_CENTER
+                })
+                vTable.addCell(PdfPCell(Phrase(v.detail ?: "—", smallFont)).apply {
+                    paddingBottom = 4f
+                    paddingTop = 2f
+                    borderColor = Color(235, 235, 235)
+                })
+            }
+
+            document.add(vTable)
         }
 
         document.add(Paragraph(

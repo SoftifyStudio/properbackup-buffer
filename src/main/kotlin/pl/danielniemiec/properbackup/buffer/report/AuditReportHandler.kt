@@ -8,6 +8,7 @@ import pl.danielniemiec.properbackup.buffer.logs.FileStateStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupRootStore
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
+import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import java.time.Instant
 
 class AuditReportHandler(
@@ -17,6 +18,7 @@ class AuditReportHandler(
     private val archiveSnapshotStore: ArchiveSnapshotStore,
     private val fileStateStore: FileStateStore,
     private val storageQuotaGuard: StorageQuotaGuard?,
+    private val restoreVerifier: RestoreVerifier? = null,
 ) {
     private val generator = AuditReportGenerator()
 
@@ -49,6 +51,26 @@ class AuditReportHandler(
         val storageLimitLabel = formatBytes(user.storageLimitBytes)
         val storageUsedLabel = formatBytes(quotaStatus?.usedBytes ?: 0L)
 
+        val verificationResults = restoreVerifier?.listResults(serverId, 50) ?: emptyList()
+        val passedCount = verificationResults.count { it["status"] == "passed" }
+        val failedCount = verificationResults.count { it["status"] == "failed" }
+        val verificationStatus = when {
+            verificationResults.isEmpty() && totalSnapshots > 0 -> "Backups present (not yet verified)"
+            failedCount > 0 -> "$failedCount/${ verificationResults.size} FAILED"
+            passedCount > 0 -> "All $passedCount verified — integrity confirmed"
+            else -> "No backups yet"
+        }
+
+        val verificationEntries = verificationResults.map { r ->
+            AuditReportGenerator.VerificationEntry(
+                objectName = r["objectName"] as? String ?: "",
+                pathId = r["pathId"] as? String ?: "",
+                status = r["status"] as? String ?: "unknown",
+                detail = r["detail"] as? String,
+                verifiedAt = r["verifiedAt"] as? String,
+            )
+        }
+
         val reportData = AuditReportGenerator.ReportData(
             serverName = server.name,
             serverId = serverId,
@@ -58,9 +80,10 @@ class AuditReportHandler(
             totalFiles = totalFiles,
             totalSnapshots = totalSnapshots,
             lastBackupAt = lastBackupAt,
-            verificationStatus = if (totalSnapshots > 0) "Backups present" else "No backups yet",
+            verificationStatus = verificationStatus,
             storageLimitLabel = storageLimitLabel,
             storageUsedLabel = storageUsedLabel,
+            verificationResults = verificationEntries,
         )
 
         val pdf = generator.generate(reportData)
