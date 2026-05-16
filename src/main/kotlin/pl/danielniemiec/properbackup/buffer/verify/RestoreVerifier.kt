@@ -34,10 +34,10 @@ class RestoreVerifier(
         private const val HEADER_SIZE = 49 // 4 magic + 1 version + 16 salt + 12 nonce + 16 authTag
     }
 
-    fun scheduleVerification(serverId: String, objectName: String, pathId: String) {
+    fun scheduleVerification(serverId: String, objectName: String, pathId: String, archiveData: ByteArray? = null) {
         executor.submit {
             try {
-                runVerification(serverId, objectName, pathId)
+                runVerification(serverId, objectName, pathId, archiveData)
             } catch (e: Exception) {
                 println("[verify] ERROR for $objectName: ${e.message}")
                 storeResult(serverId, objectName, pathId, "failed", e.message)
@@ -45,10 +45,10 @@ class RestoreVerifier(
         }
     }
 
-    private fun runVerification(serverId: String, objectName: String, pathId: String) {
+    private fun runVerification(serverId: String, objectName: String, pathId: String, preloaded: ByteArray?) {
         println("[verify] Starting verification for $objectName (server=$serverId, pathId=$pathId)")
 
-        val data = try {
+        val data = preloaded ?: try {
             objects.getMerged(objectName)
         } catch (e: Exception) {
             storeResult(serverId, objectName, pathId, "failed", "Cannot read object: ${e.message}")

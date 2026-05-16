@@ -130,7 +130,7 @@ class ChunkSealer(
 
         val verifier = restoreVerifier
         if (verifier != null && !sid.isNullOrBlank()) {
-            verifier.scheduleVerification(sid, objectName, pathId)
+            verifier.scheduleVerification(sid, objectName, pathId, data)
         }
     }
 }
