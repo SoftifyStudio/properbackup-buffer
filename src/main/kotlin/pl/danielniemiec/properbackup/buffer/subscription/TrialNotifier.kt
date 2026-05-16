@@ -1,6 +1,8 @@
 package pl.danielniemiec.properbackup.buffer.subscription
 
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
+import pl.danielniemiec.properbackup.buffer.email.EmailService
+import pl.danielniemiec.properbackup.buffer.email.EmailTemplates
 import pl.danielniemiec.properbackup.buffer.logs.LogIngestReq
 import pl.danielniemiec.properbackup.buffer.logs.StackLogStore
 import java.time.Duration
@@ -10,6 +12,7 @@ import kotlin.concurrent.thread
 class TrialNotifier(
     private val userStore: UserStore,
     private val logStore: StackLogStore,
+    private val emailService: EmailService? = null,
 ) {
     private val thresholds = listOf(14, 7, 2, 1)
 
@@ -56,6 +59,20 @@ class TrialNotifier(
             )
             userStore.updateLastTrialNotification(user.id, expectedMarker)
             println("[TrialNotifier] Notification sent: ${user.email} — $daysLeft days left (marker=$expectedMarker)")
+
+            if (emailService != null) {
+                val subject = if (daysLeft <= 0) {
+                    "Your ProperBackup trial has expired"
+                } else {
+                    "ProperBackup trial expires in $daysLeft day${if (daysLeft != 1) "s" else ""}"
+                }
+                val html = if (daysLeft <= 0) {
+                    EmailTemplates.trialExpired(user.email)
+                } else {
+                    EmailTemplates.trialExpiring(daysLeft, user.email)
+                }
+                emailService.send(user.email, subject, html)
+            }
         }
     }
 }

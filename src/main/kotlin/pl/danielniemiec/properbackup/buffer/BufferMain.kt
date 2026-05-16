@@ -4,6 +4,8 @@ import com.google.gson.Gson
 import io.javalin.Javalin
 import io.javalin.http.ForbiddenResponse
 import pl.danielniemiec.properbackup.buffer.auth.AuthHandler
+import pl.danielniemiec.properbackup.buffer.email.BackupHealthMonitor
+import pl.danielniemiec.properbackup.buffer.email.EmailService
 import pl.danielniemiec.properbackup.buffer.auth.JwtFilter
 import pl.danielniemiec.properbackup.buffer.auth.JwtService
 import pl.danielniemiec.properbackup.buffer.auth.ServiceAdminCodeStore
@@ -119,7 +121,11 @@ fun main(args: Array<String>) {
 
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
-    val restoreVerifier = RestoreVerifier(db, objectRead, sseBus)
+    val emailService = EmailService()
+    val restoreVerifier = RestoreVerifier(
+        db, objectRead, sseBus, emailService,
+        ownerEmailLookup = { serverId -> serverStore.findById(serverId).orElse(null)?.ownerEmail },
+    )
     sealer.setVerifier(restoreVerifier)
     val backupConfigStore = BackupConfigStore(db)
     val serverHandler = ServerHandler(
@@ -141,7 +147,7 @@ fun main(args: Array<String>) {
 
     val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard)
     val subscriptionGuard = SubscriptionGuard(userStore)
-    val trialNotifier = TrialNotifier(userStore, logStore)
+    val trialNotifier = TrialNotifier(userStore, logStore, emailService)
 
     val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
@@ -153,6 +159,12 @@ fun main(args: Array<String>) {
     flusher.start()
     packBuffer.start()
     trialNotifier.start()
+    if (emailService.isEnabled()) {
+        BackupHealthMonitor(db, emailService).start()
+        println("[email] Email notifications enabled (Resend API)")
+    } else {
+        println("[email] Email notifications disabled (set RESEND_API_KEY to enable)")
+    }
 
     val app = Javalin.create { cfg ->
         cfg.http.maxRequestSize = 100L * 1024 * 1024

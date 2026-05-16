@@ -1,6 +1,8 @@
 package pl.danielniemiec.properbackup.buffer.verify
 
 import pl.danielniemiec.properbackup.buffer.db.Database
+import pl.danielniemiec.properbackup.buffer.email.EmailService
+import pl.danielniemiec.properbackup.buffer.email.EmailTemplates
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.io.ByteArrayInputStream
@@ -23,6 +25,8 @@ class RestoreVerifier(
     private val db: Database,
     private val objects: ObjectReadFacade,
     private val sseBus: SseEventBus? = null,
+    private val emailService: EmailService? = null,
+    private val ownerEmailLookup: ((String) -> String?)? = null,
 ) {
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "restore-verifier").apply { isDaemon = true }
@@ -158,6 +162,17 @@ class RestoreVerifier(
             "detail" to detail,
             "verifiedAt" to verifiedAt.toString(),
         ))
+
+        if (status == "failed" && emailService != null && ownerEmailLookup != null) {
+            val email = ownerEmailLookup.invoke(serverId)
+            if (email != null) {
+                emailService.send(
+                    email,
+                    "ProperBackup: backup verification failed on $serverId",
+                    EmailTemplates.verificationFailed(serverId, objectName, detail ?: "Unknown error"),
+                )
+            }
+        }
     }
 
     fun getLatestResult(serverId: String): Map<String, Any?>? {

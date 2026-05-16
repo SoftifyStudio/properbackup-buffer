@@ -214,4 +214,7 @@ INSERT INTO data_retention_config (table_name, retention_days) VALUES
   ('machine_file_event', 90)
 ON CONFLICT (table_name) DO NOTHING;
 
+-- Stale backup notification tracking
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS stale_notified_at TIMESTAMPTZ;
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
