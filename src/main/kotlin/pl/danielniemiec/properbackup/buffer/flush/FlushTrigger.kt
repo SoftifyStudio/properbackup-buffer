@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.buffer.flush
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.inbox.ChunkStorage
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -13,6 +14,7 @@ class FlushTrigger(
         ?: DEFAULT_FLUSH_AGE_MS,
 ) {
 
+    private val log = LoggerFactory.getLogger(FlushTrigger::class.java)
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val pathRegistry = ConcurrentHashMap<String, Array<String>>()
 
@@ -22,7 +24,7 @@ class FlushTrigger(
 
     fun start() {
         scheduler.scheduleAtFixedRate({ checkAndFlush() }, 5, CHECK_INTERVAL_MS / 1000, TimeUnit.SECONDS)
-        println("[flush] FlushTrigger started (check every 60s, age threshold=${flushAgeMs / 1000}s)")
+        log.info("FlushTrigger started (check every 60s, age threshold={}s)", flushAgeMs / 1000)
     }
 
     fun stop() {
@@ -51,23 +53,23 @@ class FlushTrigger(
 
                     if (sizeTriggered || ageTriggered) {
                         if (budgetGuard != null && budgetGuard.remaining(userId, pathId) <= 0) {
-                            println("[flush] budget exhausted — skip seal for $userId/$pathId")
+                            log.info("Budget exhausted — skip seal for {}/{}", userId, pathId)
                             continue
                         }
                         val reason = if (sizeTriggered) "size" else "age"
-                        println("[flush] sealing $userId/$pathId (reason=$reason, size=$totalSize)")
+                        log.info("Sealing {}/{} (reason={}, size={})", userId, pathId, reason, totalSize)
                         val reg = pathRegistry[pathId] ?: arrayOf("", "")
                         try {
                             sealer.seal(userId, pathId, reg[0].ifEmpty { null }, reg[1].ifEmpty { null })
                             budgetGuard?.tryConsume(userId, pathId)
                         } catch (e: Exception) {
-                            System.err.println("[flush] seal failed for $userId/$pathId: ${e.message}")
+                            log.error("Seal failed for {}/{}: {}", userId, pathId, e.message)
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[flush] checkAndFlush error: ${e.message}")
+            log.error("checkAndFlush error: {}", e.message)
         }
     }
 
@@ -80,7 +82,7 @@ class FlushTrigger(
                     val parts = storage.getParts(userId, pathId)
                     if (parts.isNotEmpty()) {
                         if (budgetGuard != null && budgetGuard.remaining(userId, pathId) <= 0) {
-                            println("[flush] budget exhausted — skip flushAll for $userId/$pathId")
+                            log.info("Budget exhausted — skip flushAll for {}/{}", userId, pathId)
                             continue
                         }
                         val reg = pathRegistry[pathId] ?: arrayOf("", "")
@@ -88,13 +90,13 @@ class FlushTrigger(
                             sealer.seal(userId, pathId, reg[0].ifEmpty { null }, reg[1].ifEmpty { null })
                             budgetGuard?.tryConsume(userId, pathId)
                         } catch (e: Exception) {
-                            System.err.println("[flush] seal failed for $userId/$pathId: ${e.message}")
+                            log.error("Seal failed during flushAll for {}/{}: {}", userId, pathId, e.message)
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[flush] flushAll error: ${e.message}")
+            log.error("flushAll error: {}", e.message)
         }
     }
 

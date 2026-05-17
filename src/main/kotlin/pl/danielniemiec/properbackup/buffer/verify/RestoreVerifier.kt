@@ -5,6 +5,7 @@ import pl.danielniemiec.properbackup.buffer.email.EmailService
 import pl.danielniemiec.properbackup.buffer.email.EmailTemplates
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
+import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
 import java.sql.Timestamp
@@ -28,6 +29,7 @@ class RestoreVerifier(
     private val emailService: EmailService? = null,
     private val ownerEmailLookup: ((String) -> String?)? = null,
 ) {
+    private val log = LoggerFactory.getLogger(RestoreVerifier::class.java)
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "restore-verifier").apply { isDaemon = true }
     }
@@ -43,14 +45,14 @@ class RestoreVerifier(
             try {
                 runVerification(serverId, objectName, pathId, archiveData)
             } catch (e: Exception) {
-                println("[verify] ERROR for $objectName: ${e.message}")
+                log.error("Verification error for {}: {}", objectName, e.message)
                 storeResult(serverId, objectName, pathId, "failed", e.message)
             }
         }
     }
 
     private fun runVerification(serverId: String, objectName: String, pathId: String, preloaded: ByteArray?) {
-        println("[verify] Starting verification for $objectName (server=$serverId, pathId=$pathId)")
+        log.info("Starting verification for {} (server={}, pathId={})", objectName, serverId, pathId)
 
         val data = preloaded ?: try {
             objects.getMerged(objectName)
@@ -94,7 +96,7 @@ class RestoreVerifier(
         val frameCount = countFrames(frameData)
         val detail = "Header OK (PROP v1), $frameCount frame(s), ${data.size} bytes total"
         storeResult(serverId, objectName, pathId, "passed", detail)
-        println("[verify] PASSED for $objectName ($detail)")
+        log.info("PASSED for {} ({})", objectName, detail)
     }
 
     private fun validateFrames(frameData: ByteArray): String? {
@@ -157,7 +159,7 @@ class RestoreVerifier(
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[verify] DB write failed for $objectName: ${e.message}")
+            log.error("DB write failed for {}: {}", objectName, e.message)
             return
         }
         try {
@@ -169,7 +171,7 @@ class RestoreVerifier(
                 "verifiedAt" to verifiedAt.toString(),
             ))
         } catch (e: Exception) {
-            System.err.println("[verify] SSE publish failed for $objectName: ${e.message}")
+            log.warn("SSE publish failed for {}: {}", objectName, e.message)
         }
 
         if (status == "failed" && emailService != null && ownerEmailLookup != null) {
@@ -183,7 +185,7 @@ class RestoreVerifier(
                     )
                 }
             } catch (e: Exception) {
-                System.err.println("[verify] Email notification failed for $objectName: ${e.message}")
+                log.warn("Email notification failed for {}: {}", objectName, e.message)
             }
         }
     }

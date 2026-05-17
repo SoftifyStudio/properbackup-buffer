@@ -2,12 +2,14 @@ package pl.danielniemiec.properbackup.buffer.db
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import org.slf4j.LoggerFactory
 import java.nio.charset.StandardCharsets
 import java.sql.Connection
 import java.sql.Statement
 
 class Database(jdbcUrl: String, user: String, password: String) {
 
+    private val log = LoggerFactory.getLogger(Database::class.java)
     private val ds: HikariDataSource
 
     init {
@@ -43,6 +45,6 @@ class Database(jdbcUrl: String, user: String, password: String) {
                 }
             }
         }
-        println("[db] Schema initialized")
+        log.info("Schema initialized")
     }
 }

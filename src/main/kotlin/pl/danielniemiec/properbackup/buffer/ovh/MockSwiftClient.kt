@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.buffer.ovh
 
+import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
@@ -9,11 +10,12 @@ import kotlin.streams.toList
 
 class MockSwiftClient(private val mockDir: Path) : SwiftClient {
 
+    private val log = LoggerFactory.getLogger(MockSwiftClient::class.java)
     private val existsCache = ConcurrentHashMap<String, Boolean>()
 
     init {
         Files.createDirectories(mockDir)
-        println("[MockSwiftClient] Mock OVH at: ${mockDir.toAbsolutePath()}")
+        log.info("Mock OVH at: {}", mockDir.toAbsolutePath())
     }
 
     override fun put(objectName: String, data: ByteArray) {
@@ -23,7 +25,7 @@ class MockSwiftClient(private val mockDir: Path) : SwiftClient {
         Files.write(tmp, data)
         Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         existsCache[objectName] = true
-        println("[MockSwiftClient] PUT $objectName (${data.size} bytes)")
+        log.info("PUT {} ({} bytes)", objectName, data.size)
     }
 
     override fun get(objectName: String): ByteArray = Files.readAllBytes(mockDir.resolve(objectName))
@@ -41,7 +43,7 @@ class MockSwiftClient(private val mockDir: Path) : SwiftClient {
     override fun delete(objectName: String) {
         Files.deleteIfExists(mockDir.resolve(objectName))
         existsCache.remove(objectName)
-        println("[MockSwiftClient] DELETE $objectName")
+        log.info("DELETE {}", objectName)
     }
 
     override fun exists(objectName: String): Boolean = Files.exists(mockDir.resolve(objectName))

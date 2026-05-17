@@ -1,6 +1,7 @@
 package pl.danielniemiec.properbackup.buffer.email
 
 import com.google.gson.Gson
+import org.slf4j.LoggerFactory
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -12,6 +13,7 @@ import java.net.http.HttpResponse
  */
 class EmailService {
 
+    private val log = LoggerFactory.getLogger(EmailService::class.java)
     private val gson = Gson()
     private val apiKey = System.getenv("RESEND_API_KEY") ?: ""
     private val fromAddress = System.getenv("EMAIL_FROM") ?: "ProperBackup <noreply@properbackup.com>"
@@ -22,7 +24,7 @@ class EmailService {
 
     fun send(to: String, subject: String, html: String) {
         if (!enabled) {
-            println("[email] SKIP (no RESEND_API_KEY): to=$to subject=$subject")
+            log.info("SKIP (no RESEND_API_KEY): to={} subject={}", to, subject)
             return
         }
 
@@ -45,12 +47,12 @@ class EmailService {
 
             val response = client.send(request, HttpResponse.BodyHandlers.ofString())
             if (response.statusCode() in 200..299) {
-                println("[email] Sent to=$to subject=$subject")
+                log.info("Sent to={} subject={}", to, subject)
             } else {
-                println("[email] ERROR ${response.statusCode()}: ${response.body()}")
+                log.error("Send error {} for to={}: {}", response.statusCode(), to, response.body())
             }
         } catch (e: Exception) {
-            println("[email] FAILED to=$to: ${e.message}")
+            log.error("Send failed to={}: {}", to, e.message)
         }
     }
 }

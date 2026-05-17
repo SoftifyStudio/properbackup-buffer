@@ -1,9 +1,12 @@
 package pl.danielniemiec.properbackup.buffer.flush
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.db.Database
 import java.sql.SQLException
 
 class BudgetGuard(private val db: Database, private val maxFlushesPerDay: Int = 3) {
+
+    private val log = LoggerFactory.getLogger(BudgetGuard::class.java)
 
     @Synchronized
     fun tryConsume(userId: String, pathId: String): Boolean {
@@ -24,7 +27,7 @@ class BudgetGuard(private val db: Database, private val maxFlushesPerDay: Int = 
                     }
                     if (current >= maxFlushesPerDay) {
                         conn.rollback()
-                        println("[BudgetGuard] Flush blocked for $userId/$pathId — $current/$maxFlushesPerDay used today")
+                        log.warn("Flush blocked for {}/{} — {}/{} used today", userId, pathId, current, maxFlushesPerDay)
                         return false
                     }
                     if (current < 0) {
@@ -49,12 +52,12 @@ class BudgetGuard(private val db: Database, private val maxFlushesPerDay: Int = 
                     return true
                 } catch (e: SQLException) {
                     conn.rollback()
-                    System.err.println("[BudgetGuard] DB error: ${e.message}")
+                    log.error("DB error during tryConsume for {}/{}: {}", userId, pathId, e.message)
                     return false
                 }
             }
         } catch (e: SQLException) {
-            System.err.println("[BudgetGuard] connection error: ${e.message}")
+            log.error("Connection error during tryConsume for {}/{}: {}", userId, pathId, e.message)
             return false
         }
     }
@@ -75,7 +78,7 @@ class BudgetGuard(private val db: Database, private val maxFlushesPerDay: Int = 
                 }
             }
         } catch (e: SQLException) {
-            System.err.println("[BudgetGuard] remaining() DB error for $userId/$pathId: ${e.message}")
+            log.error("DB error in remaining() for {}/{}: {}", userId, pathId, e.message)
             0
         }
     }

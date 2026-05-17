@@ -1,6 +1,10 @@
 package pl.danielniemiec.properbackup.buffer.ovh
 
+import org.slf4j.LoggerFactory
+
 class DevSafetyGuard(private val delegate: SwiftClient) : SwiftClient {
+
+    private val log = LoggerFactory.getLogger(DevSafetyGuard::class.java)
 
     private val safeMode: Boolean
 
@@ -8,10 +12,7 @@ class DevSafetyGuard(private val delegate: SwiftClient) : SwiftClient {
         val env = System.getenv("PROPERBACKUP_ENV")
         safeMode = !env.equals("production", ignoreCase = true)
         if (safeMode) {
-            println(
-                "[DevSafetyGuard] Safe mode ON — DELETE and overwrite blocked. " +
-                    "Set PROPERBACKUP_ENV=production to disable.",
-            )
+            log.warn("Safe mode ON — DELETE and overwrite blocked. Set PROPERBACKUP_ENV=production to disable.")
         }
     }
 

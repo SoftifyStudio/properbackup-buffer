@@ -2,6 +2,7 @@ package pl.danielniemiec.properbackup.buffer
 
 import com.google.gson.Gson
 import io.javalin.Javalin
+import org.slf4j.LoggerFactory
 import io.javalin.http.ForbiddenResponse
 import pl.danielniemiec.properbackup.buffer.auth.AuthHandler
 import pl.danielniemiec.properbackup.buffer.email.BackupHealthMonitor
@@ -51,6 +52,8 @@ import java.nio.file.Path
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlin.concurrent.thread
+
+private val log = LoggerFactory.getLogger("pl.danielniemiec.properbackup.buffer.BufferMain")
 
 fun main(args: Array<String>) {
     var port = 7100
@@ -161,9 +164,9 @@ fun main(args: Array<String>) {
     trialNotifier.start()
     if (emailService.isEnabled()) {
         BackupHealthMonitor(db, emailService).start()
-        println("[email] Email notifications enabled (Resend API)")
+        log.info("Email notifications enabled (Resend API)")
     } else {
-        println("[email] Email notifications disabled (set RESEND_API_KEY to enable)")
+        log.info("Email notifications disabled (set RESEND_API_KEY to enable)")
     }
 
     val app = Javalin.create { cfg ->
@@ -191,7 +194,7 @@ fun main(args: Array<String>) {
             return@post
         }
         val serverId = ctx.header("X-Server-Id")?.trim()
-        println("[agent] scan-complete received" + if (!serverId.isNullOrBlank()) " (server=$serverId)" else "")
+        log.info("scan-complete received{}", if (!serverId.isNullOrBlank()) " (server=$serverId)" else "")
         Thread { flusher.flushAll() }.start()
         ctx.status(200).result("flush triggered")
     }
@@ -459,11 +462,11 @@ fun main(args: Array<String>) {
     }
 
     app.start(port)
-    println("ProperBackup Buffer listening on port $port")
-    println("  storage    : ${storageDir.toAbsolutePath()}")
-    println("  inbox      : ${inboxDir.toAbsolutePath()}")
-    println("  pack-buffer: ${packBufferDir.toAbsolutePath()}")
-    println("  db         : $dbUrl")
+    log.info("ProperBackup Buffer listening on port {}", port)
+    log.info("  storage    : {}", storageDir.toAbsolutePath())
+    log.info("  inbox      : {}", inboxDir.toAbsolutePath())
+    log.info("  pack-buffer: {}", packBufferDir.toAbsolutePath())
+    log.info("  db         : {}", dbUrl)
     logStore.ingest(
         LogIngestReq(
             machineId = "buffer-local",
@@ -509,11 +512,11 @@ private fun swiftClientFromEnv(storageDir: Path): SwiftClient? {
 
     val real = OvhSwiftClient.tryCreateFromEnv()
     if (real != null) {
-        println("[buffer] Swift remote: Keystone v3 + java.net.http.HttpClient")
+        log.info("Swift remote: Keystone v3 + java.net.http.HttpClient")
         return DevSafetyGuard(real)
     }
     if (mockDisabled) {
-        println("[buffer] No Swift credentials and PROPERBACKUP_OVH_MOCK=false — archive layer off")
+        log.warn("No Swift credentials and PROPERBACKUP_OVH_MOCK=false — archive layer off")
         return null
     }
     val mockDir = Path.of(
@@ -522,6 +525,6 @@ private fun swiftClientFromEnv(storageDir: Path): SwiftClient? {
             storageDir.resolve("swift-mock").toString(),
         ),
     )
-    println("[buffer] Swift mock (no OS_* / OVH creds): ${mockDir.toAbsolutePath()}")
+    log.info("Swift mock (no OS_* / OVH creds): {}", mockDir.toAbsolutePath())
     return DevSafetyGuard(MockSwiftClient(mockDir))
 }

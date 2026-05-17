@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.buffer.subscription
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.email.EmailService
 import pl.danielniemiec.properbackup.buffer.email.EmailTemplates
@@ -14,6 +15,7 @@ class TrialNotifier(
     private val logStore: StackLogStore,
     private val emailService: EmailService? = null,
 ) {
+    private val log = LoggerFactory.getLogger(TrialNotifier::class.java)
     private val thresholds = listOf(14, 7, 2, 1)
 
     fun start() {
@@ -25,7 +27,7 @@ class TrialNotifier(
                 } catch (_: InterruptedException) {
                     break
                 } catch (e: Exception) {
-                    System.err.println("[TrialNotifier] error: ${e.message}")
+                    log.error("Trial notification check failed: {}", e.message)
                 }
             }
         }
@@ -58,7 +60,7 @@ class TrialNotifier(
                 ),
             )
             userStore.updateLastTrialNotification(user.id, expectedMarker)
-            println("[TrialNotifier] Notification sent: ${user.email} — $daysLeft days left (marker=$expectedMarker)")
+            log.info("Trial notification: {} — {} days left (marker={})", user.email, daysLeft, expectedMarker)
 
             if (emailService != null) {
                 val subject = if (daysLeft <= 0) {

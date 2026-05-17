@@ -1,6 +1,7 @@
 package pl.danielniemiec.properbackup.buffer.inbox
 
 import io.javalin.http.Context
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
 
 class InboxReceiver(
@@ -9,6 +10,7 @@ class InboxReceiver(
     private val expectedToken: String,
     private val serverStore: ServerStore? = null,
 ) {
+    private val log = LoggerFactory.getLogger(InboxReceiver::class.java)
 
     fun handle(ctx: Context) {
         val auth = ctx.header("Authorization")
@@ -42,7 +44,7 @@ class InboxReceiver(
 
         storage.store(userId, pathId, body, flag ?: "A")
         ctx.status(200).result("OK")
-        println("[inbox] stored ${body.size} bytes for $pathId ($origPath) flag=$flag")
+        log.info("Stored {} bytes for {} ({}) flag={}", body.size, pathId, origPath, flag)
     }
 
     companion object {

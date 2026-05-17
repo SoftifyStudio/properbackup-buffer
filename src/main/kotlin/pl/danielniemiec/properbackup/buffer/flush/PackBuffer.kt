@@ -1,8 +1,10 @@
 package pl.danielniemiec.properbackup.buffer.flush
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.DataOutputStream
 import java.io.DataInputStream
 import java.io.ByteArrayInputStream
@@ -40,6 +42,7 @@ class PackBuffer(
     private val swiftRemote: SwiftClient? = null,
     private val maxPackBytes: Long = PACK_MAX_BYTES,
 ) {
+    private val log = LoggerFactory.getLogger(PackBuffer::class.java)
     private val locks = ConcurrentHashMap<String, ReentrantLock>()
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val tsFmt = DateTimeFormatter.ofPattern("yyyyMMddHHmmss").withZone(ZoneOffset.UTC)
@@ -50,7 +53,7 @@ class PackBuffer(
 
     fun start() {
         scheduler.scheduleAtFixedRate({ flushFullPacks() }, 30, 30, TimeUnit.SECONDS)
-        println("[pack-buffer] started (check every 30s, max pack size=${maxPackBytes / 1024 / 1024}MB)")
+        log.info("PackBuffer started (check every 30s, max pack size={}MB)", maxPackBytes / 1024 / 1024)
     }
 
     fun stop() {
@@ -79,7 +82,7 @@ class PackBuffer(
             val packFile = findOpenPack(serverDir) ?: createNewPack(serverDir, serverId)
             appendEntry(packFile, objectName, data)
 
-            println("[pack-buffer] added $objectName (${data.size} bytes) to pack ${packFile.fileName}")
+            log.info("Added {} ({} bytes) to pack {}", objectName, data.size, packFile.fileName)
 
             val newSize = Files.size(packFile)
             if (newSize >= maxPackBytes) {
@@ -159,7 +162,7 @@ class PackBuffer(
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[pack-buffer] flushFullPacks error: ${e.message}")
+            log.error("flushFullPacks error: {}", e.message)
         }
     }
 
@@ -191,7 +194,7 @@ class PackBuffer(
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[pack-buffer] flushAll error: ${e.message}")
+            log.error("flushAll error: {}", e.message)
         }
     }
 
@@ -217,8 +220,15 @@ class PackBuffer(
         dos.writeShort(VERSION)
         dos.flush()
 
-        Files.write(packFile, header.toByteArray())
-        println("[pack-buffer] created new pack: $packName")
+        val tmp = Files.createTempFile(serverDir, "pack_", ".tmp")
+        try {
+            Files.write(tmp, header.toByteArray())
+            Files.move(tmp, packFile, StandardCopyOption.ATOMIC_MOVE)
+        } catch (e: IOException) {
+            Files.deleteIfExists(tmp)
+            throw e
+        }
+        log.info("Created new pack: {}", packName)
         return packFile
     }
 
@@ -232,8 +242,16 @@ class PackBuffer(
         dos.write(data)
         dos.flush()
 
-        Files.newOutputStream(packFile, java.nio.file.StandardOpenOption.APPEND).use { out ->
-            out.write(entry.toByteArray())
+        val tmp = Files.createTempFile(packFile.parent, "append_", ".tmp")
+        try {
+            Files.copy(packFile, tmp, StandardCopyOption.REPLACE_EXISTING)
+            Files.newOutputStream(tmp, java.nio.file.StandardOpenOption.APPEND).use { out ->
+                out.write(entry.toByteArray())
+            }
+            Files.move(tmp, packFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: IOException) {
+            Files.deleteIfExists(tmp)
+            throw e
         }
     }
 
@@ -248,7 +266,7 @@ class PackBuffer(
     private fun flushPack(serverId: String, packFile: Path) {
         if (!Files.exists(packFile)) return
         val remote = swiftRemote ?: run {
-            println("[pack-buffer] no remote configured, keeping pack locally: ${packFile.fileName}")
+            log.info("No remote configured, keeping pack locally: {}", packFile.fileName)
             return
         }
 
@@ -264,14 +282,14 @@ class PackBuffer(
             val remotePackName = actualPath.fileName.toString()
 
             remote.put(remotePackName, packData)
-            println("[pack-buffer] flushed pack to remote: $remotePackName (${packData.size} bytes)")
+            log.info("Flushed pack to remote: {} ({} bytes)", remotePackName, packData.size)
 
             recordPackInDb(serverId, remotePackName, packData.size.toLong())
 
             Files.deleteIfExists(actualPath)
-            println("[pack-buffer] deleted local pack: $remotePackName")
+            log.info("Deleted local pack: {}", remotePackName)
         } catch (e: Exception) {
-            System.err.println("[pack-buffer] flush failed for ${packFile.fileName}: ${e.message}")
+            log.error("Flush failed for {}: {}", packFile.fileName, e.message)
         }
     }
 
@@ -290,7 +308,7 @@ class PackBuffer(
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[pack-buffer] DB record failed for $packName: ${e.message}")
+            log.error("DB record failed for {}: {}", packName, e.message)
         }
     }
 

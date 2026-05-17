@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.buffer.email
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.db.Database
 import java.time.Duration
 import java.time.Instant
@@ -14,6 +15,8 @@ class BackupHealthMonitor(
     private val emailService: EmailService,
     private val staleHoursThreshold: Long = 24,
 ) {
+    private val log = LoggerFactory.getLogger(BackupHealthMonitor::class.java)
+
     fun start() {
         thread(name = "backup-health-monitor", isDaemon = true) {
             while (!Thread.currentThread().isInterrupted) {
@@ -23,7 +26,7 @@ class BackupHealthMonitor(
                 } catch (_: InterruptedException) {
                     break
                 } catch (e: Exception) {
-                    System.err.println("[BackupHealthMonitor] error: ${e.message}")
+                    log.error("Health check error: {}", e.message)
                 }
             }
         }
@@ -64,7 +67,7 @@ class BackupHealthMonitor(
                             up.executeUpdate()
                         }
 
-                        println("[BackupHealthMonitor] Alert sent for $serverId ($serverName) — $hoursSince hours since last backup")
+                        log.warn("Alert sent for {} ({}) — {} hours since last backup", serverId, serverName, hoursSince)
                     }
                 }
             }

@@ -9,6 +9,7 @@ import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.ObjectStore
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
+import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.time.Instant
@@ -25,6 +26,7 @@ class ChunkSealer(
     private val storageQuotaGuard: StorageQuotaGuard? = null,
     private val sseBus: SseEventBus? = null,
 ) {
+    private val log = LoggerFactory.getLogger(ChunkSealer::class.java)
     private var restoreVerifier: RestoreVerifier? = null
     private var packBuffer: PackBuffer? = null
 
@@ -54,7 +56,7 @@ class ChunkSealer(
             try {
                 combined.write(Files.readAllBytes(part))
             } catch (e: java.io.IOException) {
-                System.err.println("[seal] Failed to read part ${part.fileName} for $userId/$pathId: ${e.message}")
+                log.error("Failed to read part {} for {}/{}: {}", part.fileName, userId, pathId, e.message)
                 return
             }
         }
@@ -62,7 +64,7 @@ class ChunkSealer(
 
         if (storageQuotaGuard != null && !storageQuotaGuard.canUpload(userId, data.size.toLong())) {
             val q = storageQuotaGuard.checkQuota(userId)
-            System.err.println("[seal] BLOCKED by StorageQuotaGuard for $userId/$pathId — used ${q.usedBytes}/${q.limitBytes} bytes (${String.format("%.1f", q.usedPercent)}%)")
+            log.warn("BLOCKED by StorageQuotaGuard for {}/{} — used {}/{} bytes ({} %)", userId, pathId, q.usedBytes, q.limitBytes, String.format("%.1f", q.usedPercent))
             cleanupParts(parts)
             return
         }
@@ -72,7 +74,7 @@ class ChunkSealer(
         val objectName = "$userId-$timestamp-$pathId-$flag-$shortHash.enc"
 
         objectStore.put(objectName, data)
-        println("[seal] $pathId → $objectName (${data.size} bytes)")
+        log.info("Sealed {} → {} ({} bytes)", pathId, objectName, data.size)
 
         val pb = packBuffer
         if (pb != null && !serverId.isNullOrBlank()) {
@@ -142,7 +144,7 @@ class ChunkSealer(
             try {
                 Files.deleteIfExists(part)
             } catch (e: java.io.IOException) {
-                System.err.println("[seal] Cannot delete part ${part.fileName}: ${e.message}")
+                log.warn("Cannot delete part {}: {}", part.fileName, e.message)
             }
         }
     }

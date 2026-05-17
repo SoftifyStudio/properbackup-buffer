@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import io.javalin.http.Context
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
 import java.time.Instant
@@ -14,6 +15,7 @@ class LemonSqueezyHandler(
     private val userStore: UserStore,
     private val webhookSecret: String,
 ) {
+    private val log = LoggerFactory.getLogger(LemonSqueezyHandler::class.java)
     private val gson = Gson()
 
     private val storeId = System.getenv("LEMONSQUEEZY_STORE_ID") ?: ""
@@ -60,7 +62,7 @@ class LemonSqueezyHandler(
         val body = ctx.body()
 
         if (webhookSecret.isNotBlank() && !verifySignature(body, signature)) {
-            println("[LemonSqueezy] Invalid webhook signature")
+            log.warn("Invalid webhook signature")
             ctx.status(401).result("Invalid signature")
             return
         }
@@ -80,12 +82,12 @@ class LemonSqueezyHandler(
         val customData = meta.getAsJsonObject("custom_data")
         val userId = customData?.get("user_id")?.asString
 
-        println("[LemonSqueezy] Webhook: event=$eventName userId=$userId")
+        log.info("Webhook: event={} userId={}", eventName, userId)
 
         when (eventName) {
             "order_created", "subscription_created" -> {
                 if (userId.isNullOrBlank()) {
-                    println("[LemonSqueezy] No user_id in custom_data — skipping")
+                    log.warn("No user_id in custom_data — skipping")
                     ctx.status(200).result("ok (no user_id)")
                     return
                 }
@@ -116,7 +118,7 @@ class LemonSqueezyHandler(
 
                 val expiresAt = Instant.now().plusSeconds(365L * 24 * 60 * 60)
                 userStore.updateSubscription(userId, plan, expiresAt, storageLimitBytes)
-                println("[LemonSqueezy] Activated $plan for $userId until $expiresAt")
+                log.info("Activated {} for {} until {}", plan, userId, expiresAt)
             }
 
             "subscription_updated" -> {
@@ -129,12 +131,12 @@ class LemonSqueezyHandler(
                 val status = attrs?.get("status")?.asString
 
                 if (status == "cancelled" || status == "expired") {
-                    println("[LemonSqueezy] Subscription $status for $userId")
+                    log.info("Subscription {} for {}", status, userId)
                 }
             }
 
             "subscription_cancelled" -> {
-                println("[LemonSqueezy] Subscription cancelled for $userId")
+                log.info("Subscription cancelled for {}", userId)
             }
         }
 
@@ -150,7 +152,7 @@ class LemonSqueezyHandler(
             val hex = computed.joinToString("") { "%02x".format(it) }
             hex.equals(signature, ignoreCase = true)
         } catch (e: Exception) {
-            println("[LemonSqueezy] Signature verification error: ${e.message}")
+            log.error("Signature verification error: {}", e.message)
             false
         }
     }

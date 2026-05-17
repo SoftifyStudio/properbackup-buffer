@@ -1,12 +1,15 @@
 package pl.danielniemiec.properbackup.buffer.pathsidx
 
 import com.google.gson.GsonBuilder
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.db.Database
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.LinkedHashMap
 
 class PathsIdxStore(private val db: Database, private val serverId: String) {
+
+    private val log = LoggerFactory.getLogger(PathsIdxStore::class.java)
 
     class PathsIdx(var version: Int, var updated: String, var paths: Map<String, String>)
 
@@ -25,7 +28,7 @@ class PathsIdxStore(private val db: Database, private val serverId: String) {
                 val now = Timestamp.from(Instant.now())
                 ps.setTimestamp(4, now)
                 val rows = ps.executeUpdate()
-                if (rows > 0) println("[idx] upsert $pathId → $originalPath")
+                if (rows > 0) log.info("Upsert {} → {}", pathId, originalPath)
             }
         }
     }

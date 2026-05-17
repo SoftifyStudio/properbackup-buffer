@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.buffer.cleanup
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.pathsidx.PathsIdxStore
 import pl.danielniemiec.properbackup.buffer.store.ObjectStore
@@ -9,6 +10,7 @@ class PostUploadCleanup(
     private val idxStore: PathsIdxStore?,
     private val swiftClient: SwiftClient,
 ) {
+    private val log = LoggerFactory.getLogger(PostUploadCleanup::class.java)
 
     fun afterUpload(objectName: String, pathId: String, originalPath: String?) {
         try {
@@ -16,21 +18,17 @@ class PostUploadCleanup(
                 idxStore.register(pathId, originalPath)
             }
         } catch (e: Exception) {
-            System.err.printf(
-                "[PostUploadCleanup] paths.idx registration failed for %s: %s — local copy kept%n",
-                objectName,
-                e.message,
-            )
+            log.error("paths.idx registration failed for {} — local copy kept: {}", objectName, e.message)
             return
         }
         try {
             val objects = localStore.list()
             if (objects.contains(objectName)) {
                 localStore.delete(objectName)
-                println("[PostUploadCleanup] Deleted local: $objectName")
+                log.info("Deleted local: {}", objectName)
             }
         } catch (e: java.io.IOException) {
-            System.err.printf("[PostUploadCleanup] Could not delete local copy %s: %s%n", objectName, e.message)
+            log.error("Could not delete local copy {}: {}", objectName, e.message)
         }
     }
 }

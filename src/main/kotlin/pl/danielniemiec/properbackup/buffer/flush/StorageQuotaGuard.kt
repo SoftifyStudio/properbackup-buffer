@@ -1,5 +1,6 @@
 package pl.danielniemiec.properbackup.buffer.flush
 
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
 
@@ -7,6 +8,7 @@ class StorageQuotaGuard(
     private val db: Database,
     private val userStore: UserStore,
 ) {
+    private val log = LoggerFactory.getLogger(StorageQuotaGuard::class.java)
 
     data class QuotaStatus(
         val usedBytes: Long,
@@ -46,7 +48,7 @@ class StorageQuotaGuard(
                 }
             }
         } catch (e: java.sql.SQLException) {
-            System.err.println("[StorageQuotaGuard] DB error querying storage usage: ${e.message}")
+            log.error("DB error querying storage usage for user {}: {}", userId, e.message)
             // Fail-safe: treat DB errors as quota exceeded to prevent unmetered uploads
             Long.MAX_VALUE
         }
