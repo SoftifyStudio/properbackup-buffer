@@ -85,6 +85,21 @@ class ServerStore(private val db: Database) {
         return Server(id, name, userId, null, now.toString(), now.toString())
     }
 
+    fun registerPending(conn: Connection, userId: String, name: String): Server {
+        val id = UUID.randomUUID().toString()
+        val now = Instant.now()
+        conn.prepareStatement(
+            "INSERT INTO servers (id, name, user_id, activated_at) VALUES (?, ?, ?, ?)",
+        ).use { ps ->
+            ps.setString(1, id)
+            ps.setString(2, name)
+            ps.setString(3, userId)
+            ps.setTimestamp(4, Timestamp.from(now))
+            ps.executeUpdate()
+        }
+        return Server(id, name, userId, null, now.toString(), null)
+    }
+
     fun registerWithId(conn: Connection, serverId: String, userId: String, name: String): Server {
         val now = Instant.now()
         conn.prepareStatement(
@@ -140,6 +155,6 @@ class ServerStore(private val db: Database) {
         rs.getString("user_id"),
         rs.getString("owner_email"),
         rs.getTimestamp("activated_at").toInstant().toString(),
-        rs.getTimestamp("last_seen_at").toInstant().toString(),
+        rs.getTimestamp("last_seen_at")?.toInstant()?.toString(),
     )
 }

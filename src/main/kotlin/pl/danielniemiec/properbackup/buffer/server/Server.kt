@@ -6,5 +6,5 @@ data class Server(
     val userId: String,
     val ownerEmail: String?,
     val activatedAt: String,
-    val lastSeen: String,
+    val lastSeen: String?,
 )

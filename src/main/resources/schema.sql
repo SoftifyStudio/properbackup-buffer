@@ -23,8 +23,9 @@ CREATE TABLE IF NOT EXISTS servers (
   name         VARCHAR(255) NOT NULL,
   user_id      VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   activated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-  last_seen_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+  last_seen_at TIMESTAMPTZ
 );
+ALTER TABLE servers ALTER COLUMN last_seen_at DROP NOT NULL;
 
 CREATE TABLE IF NOT EXISTS activation_tokens (
   token      VARCHAR(16)  PRIMARY KEY,

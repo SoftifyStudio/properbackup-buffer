@@ -170,7 +170,7 @@ class ServerHandler(
         db.getConnection().use { conn ->
             conn.autoCommit = false
             try {
-                val server = serverStore.register(conn, targetUserId, serverName)
+                val server = serverStore.registerPending(conn, targetUserId, serverName)
                 conn.commit()
                 val token = tokenStore.generate(targetUserId, server.id)
                 ctx.contentType("application/json").result(gson.toJson(mapOf("token" to token, "serverId" to server.id)))
