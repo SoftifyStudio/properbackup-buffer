@@ -36,7 +36,7 @@ class ServerHandler(
 
     private val gson = Gson()
 
-    private data class GenBody(val forUserId: String?)
+    private data class GenBody(val forUserId: String?, val name: String?)
 
     private data class ActivateReq(val token: String?, val name: String?, val hostname: String?, val includeAuth: Boolean?)
     private data class AutoRegisterReq(val machineId: String?, val ownerEmail: String?, val name: String?)
@@ -149,6 +149,7 @@ class ServerHandler(
         val admin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
         var jwtUserId = ctx.attribute<String>("userId")!!
         var targetUserId = jwtUserId
+        var serverName = "Server"
         val body = ctx.body()
         if (!body.isNullOrBlank()) {
             val parsed = gson.fromJson(body, GenBody::class.java)
@@ -162,9 +163,31 @@ class ServerHandler(
                     return
                 }
             }
+            if (!parsed?.name.isNullOrBlank()) {
+                serverName = parsed!!.name!!.trim()
+            }
         }
-        val token = tokenStore.generate(targetUserId)
-        ctx.contentType("application/json").result(gson.toJson(mapOf("token" to token)))
+        db.getConnection().use { conn ->
+            conn.autoCommit = false
+            try {
+                val server = serverStore.register(conn, targetUserId, serverName)
+                conn.commit()
+                val token = tokenStore.generate(targetUserId, server.id)
+                ctx.contentType("application/json").result(gson.toJson(mapOf("token" to token, "serverId" to server.id)))
+            } catch (e: Exception) {
+                conn.rollback()
+                throw e
+            } finally {
+                conn.autoCommit = true
+            }
+        }
+    }
+
+    fun getServer(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val server = serverStore.findById(serverId).orElseThrow { NotFoundResponse() }
+        ctx.contentType("application/json").result(gson.toJson(server))
     }
 
     fun activate(ctx: Context) {
@@ -185,7 +208,11 @@ class ServerHandler(
                 }
                 val tk = tkOpt.get()
                 val name = req.name ?: (req.hostname ?: "Server")
-                val server = serverStore.register(conn, tk.userId, name)
+                val server = if (tk.serverId != null) {
+                    serverStore.activateExisting(conn, tk.serverId, name)
+                } else {
+                    serverStore.register(conn, tk.userId, name)
+                }
                 tokenStore.markUsed(conn, req.token!!)
                 conn.commit()
 

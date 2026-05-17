@@ -31,8 +31,10 @@ CREATE TABLE IF NOT EXISTS activation_tokens (
   user_id    VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   expires_at TIMESTAMPTZ  NOT NULL,
   used       BOOLEAN      NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  server_id  VARCHAR(36)  REFERENCES servers(id) ON DELETE SET NULL
 );
+ALTER TABLE activation_tokens ADD COLUMN IF NOT EXISTS server_id VARCHAR(36) REFERENCES servers(id) ON DELETE SET NULL;
 
 -- Indeks ścieżek (path_id → ścieżka pliku/folderu) — źródło prawdy dla panelu i /servers/{id}/paths.idx.
 -- Zasilany przy każdym zapisanym pakiecie (flush). Ta sama baza co users/servers/logi.

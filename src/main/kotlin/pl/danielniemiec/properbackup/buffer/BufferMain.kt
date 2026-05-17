@@ -318,6 +318,7 @@ fun main(args: Array<String>) {
     app.get("/servers", serverHandler::listServers)
     app.get("/servers/activation-tokens", serverHandler::listActivationTokens)
     app.post("/servers/generate-token", serverHandler::generateToken)
+    app.get("/servers/{id}", serverHandler::getServer)
     app.get("/servers/{id}/objects", serverHandler::listObjects)
     app.get("/servers/{id}/paths.idx", serverHandler::getPathsIdx)
     app.sse("/servers/{id}/events") { client ->

@@ -110,6 +110,30 @@ class ServerStore(private val db: Database) {
         }
     }
 
+    fun activateExisting(conn: Connection, serverId: String, name: String): Server {
+        val now = Instant.now()
+        conn.prepareStatement("UPDATE servers SET name = ?, activated_at = ?, last_seen_at = ? WHERE id = ?").use { ps ->
+            ps.setString(1, name)
+            ps.setTimestamp(2, Timestamp.from(now))
+            ps.setTimestamp(3, Timestamp.from(now))
+            ps.setString(4, serverId)
+            ps.executeUpdate()
+        }
+        return findByIdInConn(conn, serverId).orElseThrow()
+    }
+
+    fun findByIdInConn(conn: Connection, serverId: String): Optional<Server> {
+        conn.prepareStatement(
+            "SELECT s.id, s.name, s.user_id, u.email AS owner_email, s.activated_at, s.last_seen_at " +
+                "FROM servers s JOIN users u ON u.id = s.user_id WHERE s.id = ?",
+        ).use { ps ->
+            ps.setString(1, serverId)
+            ps.executeQuery().use { rs ->
+                return if (rs.next()) Optional.of(map(rs)) else Optional.empty()
+            }
+        }
+    }
+
     private fun map(rs: java.sql.ResultSet): Server = Server(
         rs.getString("id"),
         rs.getString("name"),

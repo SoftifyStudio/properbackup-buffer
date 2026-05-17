@@ -10,23 +10,24 @@ import java.util.UUID
 
 class ActivationTokenStore(private val db: Database) {
 
-    data class ActivationToken(val token: String, val userId: String, val expiresAt: String, val used: Boolean)
+    data class ActivationToken(val token: String, val userId: String, val expiresAt: String, val used: Boolean, val serverId: String? = null)
     data class ActivationTokenPending(val token: String, val expiresAt: String, val createdAt: String, val ownerEmail: String)
 
     companion object {
         private val TTL_MS = 24L * 60 * 60 * 1000
     }
 
-    fun generate(userId: String): String {
+    fun generate(userId: String, serverId: String? = null): String {
         val token = UUID.randomUUID().toString().replace("-", "").substring(0, 16).uppercase()
         val expiresAt = Instant.ofEpochMilli(System.currentTimeMillis() + TTL_MS)
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO activation_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+                "INSERT INTO activation_tokens (token, user_id, expires_at, server_id) VALUES (?, ?, ?, ?)",
             ).use { ps ->
                 ps.setString(1, token)
                 ps.setString(2, userId)
                 ps.setTimestamp(3, Timestamp.from(expiresAt))
+                if (serverId != null) ps.setString(4, serverId) else ps.setNull(4, java.sql.Types.VARCHAR)
                 ps.executeUpdate()
             }
         }
@@ -35,7 +36,7 @@ class ActivationTokenStore(private val db: Database) {
 
     fun findValid(conn: Connection, token: String): Optional<ActivationToken> {
         conn.prepareStatement(
-            "SELECT token, user_id, expires_at, used FROM activation_tokens " +
+            "SELECT token, user_id, expires_at, used, server_id FROM activation_tokens " +
                 "WHERE token = ? AND used = false AND expires_at > NOW()",
         ).use { ps ->
             ps.setString(1, token)
@@ -47,6 +48,7 @@ class ActivationTokenStore(private val db: Database) {
                             rs.getString("user_id"),
                             rs.getTimestamp("expires_at").toInstant().toString(),
                             rs.getBoolean("used"),
+                            rs.getString("server_id"),
                         ),
                     )
                 } else {
