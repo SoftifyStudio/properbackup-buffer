@@ -31,6 +31,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.DevSafetyGuard
 import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
+import pl.danielniemiec.properbackup.buffer.payment.GiftCodeHandler
 import pl.danielniemiec.properbackup.buffer.payment.HotPayHandler
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
@@ -156,6 +157,7 @@ fun main(args: Array<String>) {
     val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
     val hotPayHandler = HotPayHandler(db, userStore)
+    val giftCodeHandler = GiftCodeHandler(db, userStore)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard, restoreVerifier,
@@ -286,6 +288,9 @@ fun main(args: Array<String>) {
     app.post("/payment/simulate", hotPayHandler::simulatePayment)
     app.get("/payment/orders", hotPayHandler::listOrders)
     app.post("/webhooks/hotpay", hotPayHandler::handleNotification)
+    app.post("/payment/redeem-gift", giftCodeHandler::redeemGiftCode)
+    app.before("/admin/gift-codes", jwtFilter)
+    app.get("/admin/gift-codes", giftCodeHandler::listGiftCodes)
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)

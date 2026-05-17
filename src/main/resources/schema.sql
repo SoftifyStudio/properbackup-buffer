@@ -256,4 +256,20 @@ CREATE TABLE IF NOT EXISTS archive_chunk (
 CREATE INDEX IF NOT EXISTS idx_archive_chunk_server_snapshot ON archive_chunk(server_id, snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_archive_chunk_server_time ON archive_chunk(server_id, created_at DESC);
 
+-- Gift codes (manual SQL insert, redeemable via API)
+CREATE TABLE IF NOT EXISTS gift_code (
+  id              BIGSERIAL PRIMARY KEY,
+  code            VARCHAR(64) UNIQUE NOT NULL,
+  plan            VARCHAR(32) NOT NULL DEFAULT 'monthly',
+  duration_days   INT         NOT NULL DEFAULT 30,
+  redeemed_by     VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL,
+  redeemed_email  VARCHAR(255),
+  redeemed_at     TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_gift_code_code ON gift_code(code);
+CREATE INDEX IF NOT EXISTS idx_gift_code_redeemed ON gift_code(redeemed_by);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
