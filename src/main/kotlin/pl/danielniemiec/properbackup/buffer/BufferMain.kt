@@ -31,6 +31,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.DevSafetyGuard
 import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
+import pl.danielniemiec.properbackup.buffer.payment.HotPayHandler
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
@@ -119,12 +120,12 @@ fun main(args: Array<String>) {
     val serviceCodeStore = ServiceAdminCodeStore(db)
     serviceCodeStore.ensureSeedCode(System.getenv().getOrDefault("PROPERBACKUP_SERVICE_ADMIN_SEED_CODE", "dt5mkom8Serwer.13"))
     val jwtService = JwtService(jwtSecret)
-    val authHandler = AuthHandler(userStore, jwtService, serviceCodeStore)
+    val emailService = EmailService()
+    val authHandler = AuthHandler(userStore, jwtService, serviceCodeStore, emailService)
     val jwtFilter = JwtFilter(jwtService)
 
     val tokenStore = ActivationTokenStore(db)
     val objectRead = ObjectReadFacade(objectStore, swiftRemote)
-    val emailService = EmailService()
     val restoreVerifier = RestoreVerifier(
         db, objectRead, sseBus, emailService,
         ownerEmailLookup = { serverId -> serverStore.findById(serverId).orElse(null)?.ownerEmail },
@@ -154,6 +155,7 @@ fun main(args: Array<String>) {
 
     val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
+    val hotPayHandler = HotPayHandler(db, userStore)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard, restoreVerifier,
@@ -178,6 +180,9 @@ fun main(args: Array<String>) {
 
     app.post("/auth/login", authHandler::login)
     app.post("/auth/register", authHandler::register)
+    app.get("/auth/verify-email", authHandler::verifyEmail)
+    app.before("/auth/resend-verification", jwtFilter)
+    app.post("/auth/resend-verification", authHandler::resendVerification)
     app.before("/auth/service-admin", jwtFilter)
     app.post("/auth/service-admin", authHandler::elevateServiceAdmin)
     app.post("/agent/logs", logApi::ingestLog)
@@ -275,6 +280,12 @@ fun main(args: Array<String>) {
     app.get("/account/checkout", lemonHandler::getCheckoutUrl)
 
     app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
+
+    app.before("/payment/*", jwtFilter)
+    app.get("/payment/checkout", hotPayHandler::initiateCheckout)
+    app.post("/payment/simulate", hotPayHandler::simulatePayment)
+    app.get("/payment/orders", hotPayHandler::listOrders)
+    app.post("/webhooks/hotpay", hotPayHandler::handleNotification)
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)
@@ -376,6 +387,8 @@ fun main(args: Array<String>) {
     app.get("/servers/{id}/file-events", serverHandler::getFileEvents)
     app.get("/servers/{id}/file-states-at", serverHandler::getFileStatesAt)
     app.get("/servers/{id}/archive-snapshots", serverHandler::listArchiveSnapshots)
+    app.get("/servers/{id}/file-tree", serverHandler::getFileTree)
+    app.post("/servers/{id}/restore-selected", serverHandler::restoreSelectedFiles)
     app.get("/servers/{id}/audit-report", auditReportHandler::downloadReport)
     app.get("/servers/{id}/verification") { ctx ->
         val serverId = ctx.pathParam("id")

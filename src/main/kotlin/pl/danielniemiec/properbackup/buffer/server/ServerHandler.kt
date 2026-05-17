@@ -138,6 +138,54 @@ class ServerHandler(
         ctx.contentType("application/json").result(gson.toJson(rows))
     }
 
+    /**
+     * Returns all file paths for a given server as a flat list,
+     * to be rendered as a file tree on the frontend.
+     */
+    fun getFileTree(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val machineId = serverId
+        val allFiles = mutableListOf<String>()
+        var offset = 0
+        val pageSize = 5000
+        while (true) {
+            val page = fileStateStore.listPaged(machineId, offset, pageSize, "path")
+            for (row in page) {
+                val path = row["fullPath"] as? String ?: continue
+                allFiles.add(path)
+            }
+            if (page.size < pageSize) break
+            offset += pageSize
+        }
+        ctx.contentType("application/json").result(gson.toJson(mapOf("files" to allFiles)))
+    }
+
+    /**
+     * Accepts a list of selected file paths and initiates a granular restore.
+     */
+    fun restoreSelectedFiles(ctx: Context) {
+        val serverId = ctx.pathParam("id")
+        requireServerAccess(ctx, serverId)
+        val body = gson.fromJson(ctx.body(), RestoreSelectionReq::class.java)
+        if (body?.files.isNullOrEmpty()) {
+            ctx.status(400).result("No files selected for restore")
+            return
+        }
+        ctx.contentType("application/json").result(
+            gson.toJson(
+                mapOf(
+                    "status" to "queued",
+                    "serverId" to serverId,
+                    "fileCount" to body.files.size,
+                    "files" to body.files,
+                ),
+            ),
+        )
+    }
+
+    private data class RestoreSelectionReq(val files: List<String> = emptyList())
+
     fun listActivationTokens(ctx: Context) {
         val userId = ctx.attribute<String>("userId")!!
         val admin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")

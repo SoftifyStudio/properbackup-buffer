@@ -306,6 +306,17 @@ class PackBuffer(
                     ps.setLong(3, sizeBytes)
                     ps.executeUpdate()
                 }
+                conn.prepareStatement(
+                    "INSERT INTO archive_chunk(server_id, chunk_name, chunk_index, size_bytes) " +
+                        "VALUES (?, ?, (SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM archive_chunk WHERE server_id = ?), ?) " +
+                        "ON CONFLICT (server_id, chunk_name) DO NOTHING"
+                ).use { ps ->
+                    ps.setString(1, serverId)
+                    ps.setString(2, packName)
+                    ps.setString(3, serverId)
+                    ps.setLong(4, sizeBytes)
+                    ps.executeUpdate()
+                }
             }
         } catch (e: Exception) {
             log.error("DB record failed for {}: {}", packName, e.message)
@@ -324,7 +335,7 @@ class PackBuffer(
     companion object {
         const val MAGIC = 0x50424B31 // "PBK1"
         const val VERSION = 1
-        const val PACK_MAX_BYTES = 900L * 1024 * 1024 // 900 MB
+        const val PACK_MAX_BYTES = 950L * 1024 * 1024 // 950 MB tar.gz volume limit
 
         fun parsePackData(raw: ByteArray): List<PackEntry> {
             val entries = mutableListOf<PackEntry>()

@@ -20,10 +20,11 @@ class UserStore(private val db: Database) {
         val subscriptionExpiresAt: String?,
         val storageLimitBytes: Long,
         val lastTrialNotification: String?,
+        val emailVerified: Boolean = false,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -70,19 +71,61 @@ class UserStore(private val db: Database) {
         val id = UUID.randomUUID().toString()
         val now = Instant.now()
         val trialEnd = now.plusSeconds(30L * 24 * 60 * 60)
+        val verifyToken = UUID.randomUUID().toString().replace("-", "")
+        val verifyExpires = now.plusSeconds(24 * 60 * 60)
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO users (id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, storage_limit_bytes) VALUES (?, ?, ?, ?, FALSE, ?, 2199023255552)",
+                "INSERT INTO users (id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, storage_limit_bytes, email_verified, email_verify_token, email_verify_expires_at) VALUES (?, ?, ?, ?, FALSE, ?, 2199023255552, FALSE, ?, ?)",
             ).use { ps ->
                 ps.setString(1, id)
                 ps.setString(2, email.lowercase())
                 ps.setString(3, hash)
                 ps.setTimestamp(4, Timestamp.from(now))
                 ps.setTimestamp(5, Timestamp.from(trialEnd))
+                ps.setString(6, verifyToken)
+                ps.setTimestamp(7, Timestamp.from(verifyExpires))
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, trialEnd.toString(), null, null, 2199023255552L, null)
+        return User(id, email.lowercase(), hash, now.toString(), false, trialEnd.toString(), null, null, 2199023255552L, null, false)
+    }
+
+    fun verifyEmail(token: String): Boolean {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET email_verified = TRUE, email_verify_token = NULL WHERE email_verify_token = ? AND email_verify_expires_at > NOW()",
+            ).use { ps ->
+                ps.setString(1, token)
+                return ps.executeUpdate() > 0
+            }
+        }
+    }
+
+    fun getVerifyToken(userId: String): String? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement("SELECT email_verify_token FROM users WHERE id = ?").use { ps ->
+                ps.setString(1, userId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) rs.getString("email_verify_token") else null
+                }
+            }
+        }
+    }
+
+    fun regenerateVerifyToken(userId: String): String {
+        val newToken = UUID.randomUUID().toString().replace("-", "")
+        val expires = Instant.now().plusSeconds(24 * 60 * 60)
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET email_verify_token = ?, email_verify_expires_at = ? WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, newToken)
+                ps.setTimestamp(2, Timestamp.from(expires))
+                ps.setString(3, userId)
+                ps.executeUpdate()
+            }
+        }
+        return newToken
     }
 
     fun verifyPassword(user: User, plainPassword: String): Boolean =
@@ -155,5 +198,6 @@ class UserStore(private val db: Database) {
         rs.getTimestamp("subscription_expires_at")?.toInstant()?.toString(),
         rs.getLong("storage_limit_bytes").let { if (rs.wasNull()) 2199023255552L else it },
         rs.getString("last_trial_notification"),
+        rs.getBoolean("email_verified"),
     )
 }

@@ -220,4 +220,40 @@ ON CONFLICT (table_name) DO NOTHING;
 -- Stale backup notification tracking
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS stale_notified_at TIMESTAMPTZ;
 
+-- Email verification
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_token VARCHAR(64);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_expires_at TIMESTAMPTZ;
+
+-- HotPay payment tracking
+CREATE TABLE IF NOT EXISTS payment_order (
+  id               VARCHAR(64) PRIMARY KEY,
+  user_id          VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  plan             VARCHAR(32) NOT NULL,
+  amount_pln       NUMERIC(10,2) NOT NULL,
+  status           VARCHAR(16) NOT NULL DEFAULT 'pending',
+  hotpay_payment_id VARCHAR(64),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_order_user ON payment_order(user_id, created_at DESC);
+
+-- 950MB chunk-to-snapshot mapping (Task D)
+CREATE TABLE IF NOT EXISTS archive_chunk (
+  id              BIGSERIAL PRIMARY KEY,
+  server_id       VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  snapshot_id     BIGINT       REFERENCES archive_snapshot(id) ON DELETE SET NULL,
+  chunk_name      TEXT         NOT NULL,
+  chunk_index     INT          NOT NULL DEFAULT 0,
+  size_bytes      BIGINT       NOT NULL DEFAULT 0,
+  path_id         VARCHAR(8),
+  original_paths  TEXT,
+  created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  UNIQUE (server_id, chunk_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_chunk_server_snapshot ON archive_chunk(server_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_archive_chunk_server_time ON archive_chunk(server_id, created_at DESC);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
