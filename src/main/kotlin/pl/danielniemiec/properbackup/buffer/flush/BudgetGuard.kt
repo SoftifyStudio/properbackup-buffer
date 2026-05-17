@@ -75,7 +75,8 @@ class BudgetGuard(private val db: Database, private val maxFlushesPerDay: Int = 
                 }
             }
         } catch (e: SQLException) {
-            maxFlushesPerDay
+            System.err.println("[BudgetGuard] remaining() DB error for $userId/$pathId: ${e.message}")
+            0
         }
     }
 }

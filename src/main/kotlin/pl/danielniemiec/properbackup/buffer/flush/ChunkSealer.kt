@@ -51,14 +51,19 @@ class ChunkSealer(
 
         val combined = ByteArrayOutputStream()
         for (part in parts) {
-            combined.write(Files.readAllBytes(part))
+            try {
+                combined.write(Files.readAllBytes(part))
+            } catch (e: java.io.IOException) {
+                System.err.println("[seal] Failed to read part ${part.fileName} for $userId/$pathId: ${e.message}")
+                return
+            }
         }
         val data = combined.toByteArray()
 
         if (storageQuotaGuard != null && !storageQuotaGuard.canUpload(userId, data.size.toLong())) {
             val q = storageQuotaGuard.checkQuota(userId)
-            println("[seal] BLOCKED by StorageQuotaGuard for $userId/$pathId — used ${q.usedBytes}/${q.limitBytes} bytes (${String.format("%.1f", q.usedPercent)}%)")
-            for (part in parts) Files.deleteIfExists(part)
+            System.err.println("[seal] BLOCKED by StorageQuotaGuard for $userId/$pathId — used ${q.usedBytes}/${q.limitBytes} bytes (${String.format("%.1f", q.usedPercent)}%)")
+            cleanupParts(parts)
             return
         }
 
@@ -124,13 +129,21 @@ class ChunkSealer(
             ))
         }
 
-        for (part in parts) {
-            Files.deleteIfExists(part)
-        }
+        cleanupParts(parts)
 
         val verifier = restoreVerifier
         if (verifier != null && !sid.isNullOrBlank()) {
             verifier.scheduleVerification(sid, objectName, pathId, data)
+        }
+    }
+
+    private fun cleanupParts(parts: List<java.nio.file.Path>) {
+        for (part in parts) {
+            try {
+                Files.deleteIfExists(part)
+            } catch (e: java.io.IOException) {
+                System.err.println("[seal] Cannot delete part ${part.fileName}: ${e.message}")
+            }
         }
     }
 }

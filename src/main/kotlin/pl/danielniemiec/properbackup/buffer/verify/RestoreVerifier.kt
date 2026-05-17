@@ -140,37 +140,50 @@ class RestoreVerifier(
 
     private fun storeResult(serverId: String, objectName: String, pathId: String, status: String, detail: String?) {
         val verifiedAt = Instant.now()
-        db.getConnection().use { conn ->
-            conn.prepareStatement(
-                """INSERT INTO verification_result (server_id, object_name, path_id, status, detail, verified_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (server_id, object_name) DO UPDATE SET status = EXCLUDED.status, detail = EXCLUDED.detail, verified_at = EXCLUDED.verified_at""",
-            ).use { ps ->
-                ps.setString(1, serverId)
-                ps.setString(2, objectName)
-                ps.setString(3, pathId)
-                ps.setString(4, status)
-                ps.setString(5, detail)
-                ps.setTimestamp(6, Timestamp.from(verifiedAt))
-                ps.executeUpdate()
+        try {
+            db.getConnection().use { conn ->
+                conn.prepareStatement(
+                    """INSERT INTO verification_result (server_id, object_name, path_id, status, detail, verified_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (server_id, object_name) DO UPDATE SET status = EXCLUDED.status, detail = EXCLUDED.detail, verified_at = EXCLUDED.verified_at""",
+                ).use { ps ->
+                    ps.setString(1, serverId)
+                    ps.setString(2, objectName)
+                    ps.setString(3, pathId)
+                    ps.setString(4, status)
+                    ps.setString(5, detail)
+                    ps.setTimestamp(6, Timestamp.from(verifiedAt))
+                    ps.executeUpdate()
+                }
             }
+        } catch (e: Exception) {
+            System.err.println("[verify] DB write failed for $objectName: ${e.message}")
+            return
         }
-        sseBus?.publish(serverId, "verificationResult", mapOf(
-            "objectName" to objectName,
-            "pathId" to pathId,
-            "status" to status,
-            "detail" to detail,
-            "verifiedAt" to verifiedAt.toString(),
-        ))
+        try {
+            sseBus?.publish(serverId, "verificationResult", mapOf(
+                "objectName" to objectName,
+                "pathId" to pathId,
+                "status" to status,
+                "detail" to detail,
+                "verifiedAt" to verifiedAt.toString(),
+            ))
+        } catch (e: Exception) {
+            System.err.println("[verify] SSE publish failed for $objectName: ${e.message}")
+        }
 
         if (status == "failed" && emailService != null && ownerEmailLookup != null) {
-            val email = ownerEmailLookup.invoke(serverId)
-            if (email != null) {
-                emailService.send(
-                    email,
-                    "ProperBackup: backup verification failed on $serverId",
-                    EmailTemplates.verificationFailed(serverId, objectName, detail ?: "Unknown error"),
-                )
+            try {
+                val email = ownerEmailLookup.invoke(serverId)
+                if (email != null) {
+                    emailService.send(
+                        email,
+                        "ProperBackup: backup verification failed on $serverId",
+                        EmailTemplates.verificationFailed(serverId, objectName, detail ?: "Unknown error"),
+                    )
+                }
+            } catch (e: Exception) {
+                System.err.println("[verify] Email notification failed for $objectName: ${e.message}")
             }
         }
     }

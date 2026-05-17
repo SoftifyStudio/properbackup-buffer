@@ -46,8 +46,9 @@ class StorageQuotaGuard(
                 }
             }
         } catch (e: java.sql.SQLException) {
-            System.err.println("[StorageQuotaGuard] DB error: ${e.message}")
-            0L
+            System.err.println("[StorageQuotaGuard] DB error querying storage usage: ${e.message}")
+            // Fail-safe: treat DB errors as quota exceeded to prevent unmetered uploads
+            Long.MAX_VALUE
         }
     }
 }
