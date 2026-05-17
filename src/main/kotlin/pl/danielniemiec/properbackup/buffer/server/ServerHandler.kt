@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import io.javalin.http.Context
 import io.javalin.http.ForbiddenResponse
 import io.javalin.http.NotFoundResponse
+import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.auth.JwtService
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
@@ -35,6 +36,7 @@ class ServerHandler(
 ) {
 
     private val gson = Gson()
+    private val log = LoggerFactory.getLogger(ServerHandler::class.java)
 
     private data class GenBody(val forUserId: String?, val name: String?)
 
@@ -196,6 +198,15 @@ class ServerHandler(
     fun generateToken(ctx: Context) {
         val admin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
         var jwtUserId = ctx.attribute<String>("userId")!!
+
+        if (!admin) {
+            val user = userStore.findById(jwtUserId).orElse(null)
+            if (user == null || user.subscriptionPlan == null) {
+                log.warn("Payment gate: denied generate-token for userId={} — no active subscription", jwtUserId)
+                throw ForbiddenResponse("Active subscription required. Please set up a payment method or redeem a gift code.")
+            }
+        }
+
         var targetUserId = jwtUserId
         var serverName = "Server"
         val body = ctx.body()
