@@ -272,4 +272,18 @@ CREATE TABLE IF NOT EXISTS gift_code (
 CREATE INDEX IF NOT EXISTS idx_gift_code_code ON gift_code(code);
 CREATE INDEX IF NOT EXISTS idx_gift_code_redeemed ON gift_code(redeemed_by);
 
+-- Stripe payment integration
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(64);
+
+CREATE TABLE IF NOT EXISTS stripe_event (
+  id                BIGSERIAL PRIMARY KEY,
+  user_id           VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_type        VARCHAR(64) NOT NULL,
+  stripe_session_id VARCHAR(128),
+  plan              VARCHAR(32),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stripe_event_user ON stripe_event(user_id, created_at DESC);
+
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją

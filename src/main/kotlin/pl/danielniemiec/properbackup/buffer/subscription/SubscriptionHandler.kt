@@ -56,8 +56,13 @@ class SubscriptionHandler(
                 daysRemaining = Duration.between(now, trialExpiresAt).toDays()
                 active = true
             }
-            else -> {
+            trialExpiresAt != null && !trialExpiresAt.isAfter(now) -> {
                 status = "trial_expired"
+                daysRemaining = 0
+                active = false
+            }
+            else -> {
+                status = "pending_payment"
                 daysRemaining = 0
                 active = false
             }

@@ -34,6 +34,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.GiftCodeHandler
 import pl.danielniemiec.properbackup.buffer.payment.HotPayHandler
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.payment.StripeHandler
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
@@ -158,6 +159,7 @@ fun main(args: Array<String>) {
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
     val hotPayHandler = HotPayHandler(db, userStore)
     val giftCodeHandler = GiftCodeHandler(db, userStore)
+    val stripeHandler = StripeHandler(db, userStore)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard, restoreVerifier,
@@ -289,6 +291,10 @@ fun main(args: Array<String>) {
     app.get("/payment/orders", hotPayHandler::listOrders)
     app.post("/webhooks/hotpay", hotPayHandler::handleNotification)
     app.post("/payment/redeem-gift", giftCodeHandler::redeemGiftCode)
+    app.post("/payment/stripe/checkout", stripeHandler::createCheckoutSession)
+    app.get("/payment/stripe/public-key", stripeHandler::getPublicKey)
+    app.get("/payment/stripe/status", stripeHandler::getPaymentStatus)
+    app.post("/webhooks/stripe", stripeHandler::handleWebhook)
     app.before("/admin/gift-codes", jwtFilter)
     app.get("/admin/gift-codes", giftCodeHandler::listGiftCodes)
     app.get("/account/storage") { ctx ->
