@@ -188,7 +188,13 @@ class StripeHandler(
     }
 
     private fun handleCheckoutCompleted(event: Event) {
-        val dataObj = event.dataObjectDeserializer.`object`.orElse(null)
+        val deserializer = event.dataObjectDeserializer
+        val dataObj = try {
+            deserializer.`object`.orElseGet { deserializer.deserializeUnsafe() }
+        } catch (e: Exception) {
+            log.warn("Stripe checkout.session.completed: deserialization failed", e)
+            null
+        }
         if (dataObj == null || dataObj !is Session) {
             log.warn("Stripe checkout.session.completed: could not deserialize session")
             return
