@@ -12,11 +12,13 @@ import io.javalin.http.Context
 import org.slf4j.LoggerFactory
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
+import java.time.Duration
 import java.time.Instant
 
 class StripeHandler(
     private val db: Database,
     private val userStore: UserStore,
+    private val promoCodeHandler: PromoCodeHandler? = null,
 ) {
     private val log = LoggerFactory.getLogger(StripeHandler::class.java)
     private val gson = Gson()
@@ -31,6 +33,7 @@ class StripeHandler(
         const val MONTHLY_PRICE_PLN = 1900L   // 19.00 PLN in grosz
         const val ANNUAL_PRICE_PLN = 19000L   // 190.00 PLN in grosz
         const val TRIAL_DAYS = 30L
+        const val STORAGE_LIMIT_BYTES = 2199023255552L // 2TB
     }
 
     init {
@@ -43,9 +46,9 @@ class StripeHandler(
     }
 
     /**
-     * Creates a Stripe Checkout Session in "setup" mode.
-     * This verifies the customer's card without charging them.
-     * After successful setup, the webhook activates the trial.
+     * Creates a Stripe Checkout Session.
+     * Supports payment mode with prorated + promo code discounts.
+     * If final amount is 0 (100% coupon), uses setup mode (card verification only).
      */
     fun createCheckoutSession(ctx: Context) {
         val userId = ctx.attribute<String>("userId")
@@ -65,30 +68,80 @@ class StripeHandler(
             return
         }
 
-        val plan = ctx.queryParam("plan") ?: MONTHLY_PLAN
+        val body = try { gson.fromJson(ctx.body(), Map::class.java) } catch (_: Exception) { null }
+        val plan = (body?.get("plan") as? String) ?: ctx.queryParam("plan") ?: MONTHLY_PLAN
+        val promoCode = (body?.get("promoCode") as? String)?.trim()?.uppercase()
+
+        val basePriceGrosze = if (plan == ANNUAL_PLAN) ANNUAL_PRICE_PLN else MONTHLY_PRICE_PLN
+        val totalDays = if (plan == ANNUAL_PLAN) 365L else 31L
+
+        val daysRemaining = calculateDaysRemaining(user)
+        val proratedDiscount = if (daysRemaining > 0) (basePriceGrosze * daysRemaining / totalDays) else 0L
+
+        var promoDiscount = 0L
+        if (!promoCode.isNullOrBlank() && promoCodeHandler != null) {
+            promoDiscount = promoCodeHandler.calculateDiscount(promoCode, basePriceGrosze)
+        }
+
+        val finalAmount = maxOf(0L, basePriceGrosze - proratedDiscount - promoDiscount)
+
+        log.info(
+            "Stripe checkout: userId={} plan={} base={} prorated=-{} promo=-{} final={} promoCode={}",
+            userId, plan, basePriceGrosze, proratedDiscount, promoDiscount, finalAmount, promoCode,
+        )
 
         try {
             val customerId = getOrCreateStripeCustomer(userId, user.email)
 
-            val sessionParams = SessionCreateParams.builder()
-                .setMode(SessionCreateParams.Mode.SETUP)
+            val sessionBuilder = SessionCreateParams.builder()
                 .setCustomer(customerId)
                 .setSuccessUrl("$panelUrl/subscription?stripe=success&session_id={CHECKOUT_SESSION_ID}")
                 .setCancelUrl("$panelUrl/subscription?stripe=cancelled")
                 .putMetadata("userId", userId)
                 .putMetadata("plan", plan)
+                .putMetadata("basePriceGrosze", basePriceGrosze.toString())
+                .putMetadata("proratedDiscount", proratedDiscount.toString())
+                .putMetadata("promoDiscount", promoDiscount.toString())
                 .addPaymentMethodType(SessionCreateParams.PaymentMethodType.CARD)
-                .build()
 
-            val session = Session.create(sessionParams)
+            if (!promoCode.isNullOrBlank()) {
+                sessionBuilder.putMetadata("promoCode", promoCode)
+            }
 
-            log.info("Stripe Checkout session created: sessionId={} userId={} plan={}", session.id, userId, plan)
+            if (finalAmount > 0) {
+                val planLabel = if (plan == ANNUAL_PLAN) "ProperBackup Roczny" else "ProperBackup Miesięczny"
+                sessionBuilder
+                    .setMode(SessionCreateParams.Mode.PAYMENT)
+                    .addLineItem(
+                        SessionCreateParams.LineItem.builder()
+                            .setQuantity(1)
+                            .setPriceData(
+                                SessionCreateParams.LineItem.PriceData.builder()
+                                    .setCurrency("pln")
+                                    .setUnitAmount(finalAmount)
+                                    .setProductData(
+                                        SessionCreateParams.LineItem.PriceData.ProductData.builder()
+                                            .setName(planLabel)
+                                            .build(),
+                                    )
+                                    .build(),
+                            )
+                            .build(),
+                    )
+            } else {
+                sessionBuilder.setMode(SessionCreateParams.Mode.SETUP)
+            }
+
+            val session = Session.create(sessionBuilder.build())
+
+            log.info("Stripe Checkout session created: sessionId={} userId={} plan={} amount={}", session.id, userId, plan, finalAmount)
 
             ctx.contentType("application/json").result(
                 gson.toJson(
                     mapOf(
                         "sessionId" to session.id,
                         "checkoutUrl" to session.url,
+                        "finalAmountGrosze" to finalAmount,
                     ),
                 ),
             )
@@ -100,10 +153,6 @@ class StripeHandler(
         }
     }
 
-    /**
-     * Handles Stripe webhook events.
-     * Key event: checkout.session.completed (setup mode) → activate trial.
-     */
     fun handleWebhook(ctx: Context) {
         val payload = ctx.body()
         val sigHeader = ctx.header("Stripe-Signature")
@@ -145,9 +194,6 @@ class StripeHandler(
         ctx.status(200).result("OK")
     }
 
-    /**
-     * Returns the Stripe public key to the frontend.
-     */
     fun getPublicKey(ctx: Context) {
         val publicKey = System.getenv("STRIPE_PUBLIC_KEY") ?: ""
         ctx.contentType("application/json").result(
@@ -155,9 +201,6 @@ class StripeHandler(
         )
     }
 
-    /**
-     * Returns the user's payment status (has card, trial status, etc.)
-     */
     fun getPaymentStatus(ctx: Context) {
         val userId = ctx.attribute<String>("userId")
         if (userId == null) {
@@ -203,6 +246,7 @@ class StripeHandler(
         val session = dataObj
         val userId = session.metadata?.get("userId")
         val plan = session.metadata?.get("plan") ?: MONTHLY_PLAN
+        val promoCode = session.metadata?.get("promoCode")
 
         if (userId.isNullOrBlank()) {
             log.warn("Stripe checkout.session.completed: missing userId in metadata, sessionId={}", session.id)
@@ -210,12 +254,16 @@ class StripeHandler(
         }
 
         log.info(
-            "Stripe checkout completed: sessionId={} userId={} plan={} mode={}",
-            session.id, userId, plan, session.mode,
+            "Stripe checkout completed: sessionId={} userId={} plan={} mode={} promoCode={}",
+            session.id, userId, plan, session.mode, promoCode,
         )
 
-        if (session.mode == "setup") {
-            activateTrialAfterCardVerification(userId, plan)
+        if (session.mode == "payment" || session.mode == "setup") {
+            activateSubscription(userId, plan)
+        }
+
+        if (!promoCode.isNullOrBlank() && promoCodeHandler != null) {
+            promoCodeHandler.markPromoCodeUsed(promoCode, userId, session.id)
         }
 
         saveStripeEvent(userId, "checkout_completed", session.id, plan)
@@ -233,28 +281,28 @@ class StripeHandler(
         log.info("Stripe customer.subscription.deleted: eventId={}", event.id)
     }
 
-    /**
-     * After card verification (Stripe Checkout setup mode),
-     * activate the trial for the user.
-     */
-    private fun activateTrialAfterCardVerification(userId: String, plan: String) {
-        val user = userStore.findById(userId).orElse(null)
-        if (user == null) {
-            log.error("Cannot activate trial: user not found userId={}", userId)
-            return
-        }
-
-        if (user.subscriptionPlan != null) {
-            log.info("User already has subscription, skipping trial activation: userId={} plan={}", userId, user.subscriptionPlan)
-            return
-        }
-
-        val trialExpiresAt = Instant.now().plusSeconds(TRIAL_DAYS * 24 * 60 * 60)
-        userStore.activateTrial(userId, trialExpiresAt)
+    private fun activateSubscription(userId: String, plan: String) {
+        val durationSeconds = if (plan == ANNUAL_PLAN) 365L * 24 * 60 * 60 else 31L * 24 * 60 * 60
+        val expiresAt = Instant.now().plusSeconds(durationSeconds)
+        userStore.updateSubscription(userId, plan, expiresAt, STORAGE_LIMIT_BYTES)
         log.info(
-            "Trial activated after card verification: userId={} plan={} trialExpiresAt={}",
-            userId, plan, trialExpiresAt,
+            "Subscription activated: userId={} plan={} expiresAt={}",
+            userId, plan, expiresAt,
         )
+    }
+
+    private fun calculateDaysRemaining(user: UserStore.User): Long {
+        val now = Instant.now()
+        val trialExpiresAt = user.trialExpiresAt?.let { Instant.parse(it) }
+        val subscriptionExpiresAt = user.subscriptionExpiresAt?.let { Instant.parse(it) }
+
+        return when {
+            user.subscriptionPlan != null && subscriptionExpiresAt != null && subscriptionExpiresAt.isAfter(now) ->
+                Duration.between(now, subscriptionExpiresAt).toDays()
+            trialExpiresAt != null && trialExpiresAt.isAfter(now) ->
+                Duration.between(now, trialExpiresAt).toDays()
+            else -> 0L
+        }
     }
 
     private fun getOrCreateStripeCustomer(userId: String, email: String): String {

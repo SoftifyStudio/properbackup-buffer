@@ -4,6 +4,7 @@ import com.google.gson.Gson
 import io.javalin.http.Context
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
+import pl.danielniemiec.properbackup.buffer.payment.StripeHandler
 import java.time.Duration
 import java.time.Instant
 
@@ -70,6 +71,17 @@ class SubscriptionHandler(
 
         val quotaStatus = storageQuotaGuard?.checkQuota(userId)
 
+        val monthlyPriceGrosze = StripeHandler.MONTHLY_PRICE_PLN
+        val annualPriceGrosze = StripeHandler.ANNUAL_PRICE_PLN
+
+        val monthlyProratedGrosze = if (daysRemaining > 0) {
+            (monthlyPriceGrosze * daysRemaining / 31)
+        } else 0L
+
+        val annualProratedGrosze = if (daysRemaining > 0) {
+            (annualPriceGrosze * daysRemaining / 365)
+        } else 0L
+
         ctx.contentType("application/json").result(
             gson.toJson(
                 mapOf(
@@ -85,6 +97,18 @@ class SubscriptionHandler(
                     "storageUsedLabel" to formatStorageLimit(quotaStatus?.usedBytes ?: 0L),
                     "storageUsedPercent" to (quotaStatus?.usedPercent ?: 0.0),
                     "storageExceeded" to (quotaStatus?.exceeded ?: false),
+                    "pricing" to mapOf(
+                        "monthly" to mapOf(
+                            "basePriceGrosze" to monthlyPriceGrosze,
+                            "proratedDiscountGrosze" to monthlyProratedGrosze,
+                            "totalDays" to 31,
+                        ),
+                        "annual" to mapOf(
+                            "basePriceGrosze" to annualPriceGrosze,
+                            "proratedDiscountGrosze" to annualProratedGrosze,
+                            "totalDays" to 365,
+                        ),
+                    ),
                     "plans" to listOf(
                         mapOf(
                             "id" to PLAN_HOBBY,

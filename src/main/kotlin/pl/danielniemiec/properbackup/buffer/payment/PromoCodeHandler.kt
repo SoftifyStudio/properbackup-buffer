@@ -1,0 +1,332 @@
+package pl.danielniemiec.properbackup.buffer.payment
+
+import com.google.gson.Gson
+import io.javalin.http.Context
+import org.slf4j.LoggerFactory
+import pl.danielniemiec.properbackup.buffer.auth.UserStore
+import pl.danielniemiec.properbackup.buffer.db.Database
+import java.sql.Timestamp
+import java.time.Instant
+
+class PromoCodeHandler(
+    private val db: Database,
+    private val userStore: UserStore,
+) {
+    private val log = LoggerFactory.getLogger(PromoCodeHandler::class.java)
+    private val gson = Gson()
+
+    /**
+     * POST /payment/validate-promo
+     * Validates a promo code without marking it as used.
+     * Returns discount info so the frontend can recalculate prices.
+     */
+    fun validatePromoCode(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        val body = gson.fromJson(ctx.body(), Map::class.java) ?: emptyMap<String, Any>()
+        val code = (body["code"] as? String)?.trim()?.uppercase()
+
+        if (code.isNullOrBlank()) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("valid" to false, "reason" to "code_required")),
+            )
+            return
+        }
+
+        log.info("Promo code validation: userId={} code={}", userId, code)
+
+        val promo = findValidPromoCode(code)
+        if (promo == null) {
+            log.info("Promo code INVALID: code={} userId={}", code, userId)
+            ctx.contentType("application/json").result(
+                gson.toJson(mapOf("valid" to false, "reason" to "not_found_or_expired")),
+            )
+            return
+        }
+
+        val type = promo["type"] as String
+
+        if (type == "first_order" && userHadSubscription(userId)) {
+            log.info("Promo code REJECTED (first_order, user already had subscription): code={} userId={}", code, userId)
+            ctx.contentType("application/json").result(
+                gson.toJson(mapOf("valid" to false, "reason" to "not_eligible_first_order")),
+            )
+            return
+        }
+
+        if (type == "one_time" && userAlreadyUsedCode(promo["id"] as Long, userId)) {
+            log.info("Promo code REJECTED (one_time, already used by user): code={} userId={}", code, userId)
+            ctx.contentType("application/json").result(
+                gson.toJson(mapOf("valid" to false, "reason" to "already_used_by_user")),
+            )
+            return
+        }
+
+        val discountPercent = promo["discount_percent"] as? Int
+        val discountGrosze = promo["discount_grosz"] as? Int
+        val applicablePlan = promo["applicable_plan"] as? String
+
+        log.info(
+            "Promo code VALID: code={} userId={} type={} discountPercent={} discountGrosze={}",
+            code, userId, type, discountPercent, discountGrosze,
+        )
+
+        ctx.contentType("application/json").result(
+            gson.toJson(
+                mapOf(
+                    "valid" to true,
+                    "code" to code,
+                    "type" to type,
+                    "discountPercent" to discountPercent,
+                    "discountGrosze" to discountGrosze,
+                    "applicablePlan" to applicablePlan,
+                ),
+            ),
+        )
+    }
+
+    /**
+     * Mark a promo code as used (called after successful Stripe payment).
+     */
+    fun markPromoCodeUsed(code: String, userId: String, stripeSession: String?) {
+        db.getConnection().use { conn ->
+            val promoId = conn.prepareStatement("SELECT id FROM promo_code WHERE code = ?").use { ps ->
+                ps.setString(1, code.uppercase())
+                ps.executeQuery().use { rs -> if (rs.next()) rs.getLong("id") else null }
+            } ?: return
+
+            conn.prepareStatement(
+                "INSERT INTO promo_code_usage (promo_code_id, user_id, stripe_session, used_at) VALUES (?, ?, ?, ?)",
+            ).use { ps ->
+                ps.setLong(1, promoId)
+                ps.setString(2, userId)
+                ps.setString(3, stripeSession)
+                ps.setTimestamp(4, Timestamp.from(Instant.now()))
+                ps.executeUpdate()
+            }
+
+            conn.prepareStatement(
+                "UPDATE promo_code SET used_count = used_count + 1 WHERE id = ?",
+            ).use { ps ->
+                ps.setLong(1, promoId)
+                ps.executeUpdate()
+            }
+
+            log.info("Promo code USED: code={} userId={} stripeSession={}", code, userId, stripeSession)
+        }
+    }
+
+    /**
+     * Calculate discount amount in grosze for a given promo code and base price.
+     */
+    fun calculateDiscount(code: String, basePriceGrosze: Long): Long {
+        val promo = findValidPromoCode(code) ?: return 0L
+        val discountPercent = promo["discount_percent"] as? Int
+        val discountGrosze = promo["discount_grosz"] as? Int
+
+        return when {
+            discountPercent != null && discountPercent > 0 -> (basePriceGrosze * discountPercent / 100)
+            discountGrosze != null && discountGrosze > 0 -> discountGrosze.toLong()
+            else -> 0L
+        }
+    }
+
+    // ---- Admin CRUD ----
+
+    fun listPromoCodes(ctx: Context) {
+        requireAdmin(ctx) ?: return
+
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """SELECT id, code, type, discount_percent, discount_grosz, applicable_plan,
+                          max_uses, used_count, active, expires_at, created_at
+                   FROM promo_code ORDER BY created_at DESC LIMIT 200""",
+            ).use { ps ->
+                ps.executeQuery().use { rs ->
+                    val codes = mutableListOf<Map<String, Any?>>()
+                    while (rs.next()) {
+                        codes.add(
+                            mapOf(
+                                "id" to rs.getLong("id"),
+                                "code" to rs.getString("code"),
+                                "type" to rs.getString("type"),
+                                "discountPercent" to rs.getObject("discount_percent"),
+                                "discountGrosze" to rs.getObject("discount_grosz"),
+                                "applicablePlan" to rs.getString("applicable_plan"),
+                                "maxUses" to rs.getInt("max_uses"),
+                                "usedCount" to rs.getInt("used_count"),
+                                "active" to rs.getBoolean("active"),
+                                "expiresAt" to rs.getTimestamp("expires_at")?.toInstant()?.toString(),
+                                "createdAt" to rs.getTimestamp("created_at").toInstant().toString(),
+                            ),
+                        )
+                    }
+                    ctx.contentType("application/json").result(gson.toJson(mapOf("promoCodes" to codes)))
+                }
+            }
+        }
+    }
+
+    fun createPromoCode(ctx: Context) {
+        requireAdmin(ctx) ?: return
+
+        val body = gson.fromJson(ctx.body(), Map::class.java) ?: emptyMap<String, Any>()
+        val code = (body["code"] as? String)?.trim()?.uppercase()
+        val type = (body["type"] as? String) ?: "percentage"
+        val discountPercent = (body["discountPercent"] as? Number)?.toInt()
+        val discountGrosze = (body["discountGrosze"] as? Number)?.toInt()
+        val applicablePlan = body["applicablePlan"] as? String
+        val maxUses = (body["maxUses"] as? Number)?.toInt() ?: 1
+        val expiresAt = (body["expiresAt"] as? String)?.let { Instant.parse(it) }
+
+        if (code.isNullOrBlank()) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "code_required")),
+            )
+            return
+        }
+
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO promo_code (code, type, discount_percent, discount_grosz, applicable_plan, max_uses, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ).use { ps ->
+                ps.setString(1, code)
+                ps.setString(2, type)
+                if (discountPercent != null) ps.setInt(3, discountPercent) else ps.setNull(3, java.sql.Types.INTEGER)
+                if (discountGrosze != null) ps.setInt(4, discountGrosze) else ps.setNull(4, java.sql.Types.INTEGER)
+                if (applicablePlan != null) ps.setString(5, applicablePlan) else ps.setNull(5, java.sql.Types.VARCHAR)
+                ps.setInt(6, maxUses)
+                if (expiresAt != null) ps.setTimestamp(7, Timestamp.from(expiresAt)) else ps.setNull(7, java.sql.Types.TIMESTAMP)
+                ps.executeUpdate()
+            }
+        }
+
+        log.info("Promo code CREATED: code={} type={} discountPercent={} discountGrosze={}", code, type, discountPercent, discountGrosze)
+        ctx.status(201).contentType("application/json").result(gson.toJson(mapOf("status" to "created", "code" to code)))
+    }
+
+    fun updatePromoCode(ctx: Context) {
+        requireAdmin(ctx) ?: return
+
+        val id = ctx.pathParam("id").toLongOrNull()
+        if (id == null) {
+            ctx.status(400).result("Invalid id")
+            return
+        }
+
+        val body = gson.fromJson(ctx.body(), Map::class.java) ?: emptyMap<String, Any>()
+        val active = body["active"] as? Boolean
+        val maxUses = (body["maxUses"] as? Number)?.toInt()
+        val expiresAt = (body["expiresAt"] as? String)?.let { Instant.parse(it) }
+
+        db.getConnection().use { conn ->
+            val updates = mutableListOf<String>()
+            if (active != null) updates.add("active = $active")
+            if (maxUses != null) updates.add("max_uses = $maxUses")
+            if (expiresAt != null) updates.add("expires_at = '${Timestamp.from(expiresAt)}'")
+
+            if (updates.isEmpty()) {
+                ctx.status(400).result("Nothing to update")
+                return
+            }
+
+            conn.prepareStatement(
+                "UPDATE promo_code SET ${updates.joinToString(", ")} WHERE id = ?",
+            ).use { ps ->
+                ps.setLong(1, id)
+                val rows = ps.executeUpdate()
+                if (rows == 0) {
+                    ctx.status(404).result("Not found")
+                } else {
+                    ctx.contentType("application/json").result(gson.toJson(mapOf("status" to "updated")))
+                }
+            }
+        }
+    }
+
+    fun deletePromoCode(ctx: Context) {
+        requireAdmin(ctx) ?: return
+
+        val id = ctx.pathParam("id").toLongOrNull()
+        if (id == null) {
+            ctx.status(400).result("Invalid id")
+            return
+        }
+
+        db.getConnection().use { conn ->
+            conn.prepareStatement("UPDATE promo_code SET active = FALSE WHERE id = ?").use { ps ->
+                ps.setLong(1, id)
+                val rows = ps.executeUpdate()
+                if (rows == 0) ctx.status(404).result("Not found")
+                else ctx.contentType("application/json").result(gson.toJson(mapOf("status" to "deactivated")))
+            }
+        }
+    }
+
+    // ---- Private helpers ----
+
+    private fun findValidPromoCode(code: String): Map<String, Any?>? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """SELECT id, code, type, discount_percent, discount_grosz, applicable_plan, max_uses, used_count
+                   FROM promo_code
+                   WHERE code = ?
+                     AND active = TRUE
+                     AND used_count < max_uses
+                     AND (expires_at IS NULL OR expires_at > NOW())""",
+            ).use { ps ->
+                ps.setString(1, code)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) {
+                        mapOf(
+                            "id" to rs.getLong("id"),
+                            "code" to rs.getString("code"),
+                            "type" to rs.getString("type"),
+                            "discount_percent" to rs.getObject("discount_percent") as? Int,
+                            "discount_grosz" to rs.getObject("discount_grosz") as? Int,
+                            "applicable_plan" to rs.getString("applicable_plan"),
+                            "max_uses" to rs.getInt("max_uses"),
+                            "used_count" to rs.getInt("used_count"),
+                        )
+                    } else {
+                        null
+                    }
+                }
+            }
+        }
+    }
+
+    private fun userHadSubscription(userId: String): Boolean {
+        val user = userStore.findById(userId).orElse(null) ?: return false
+        return user.subscriptionPlan != null
+    }
+
+    private fun userAlreadyUsedCode(promoCodeId: Long, userId: String): Boolean {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT COUNT(*) FROM promo_code_usage WHERE promo_code_id = ? AND user_id = ?",
+            ).use { ps ->
+                ps.setLong(1, promoCodeId)
+                ps.setString(2, userId)
+                ps.executeQuery().use { rs ->
+                    rs.next()
+                    return rs.getInt(1) > 0
+                }
+            }
+        }
+    }
+
+    private fun requireAdmin(ctx: Context): Boolean? {
+        val isAdmin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
+        if (!isAdmin) {
+            ctx.status(403).result("Forbidden — admin only")
+            return null
+        }
+        return true
+    }
+}

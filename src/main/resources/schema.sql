@@ -286,4 +286,30 @@ CREATE TABLE IF NOT EXISTS stripe_event (
 
 CREATE INDEX IF NOT EXISTS idx_stripe_event_user ON stripe_event(user_id, created_at DESC);
 
--- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
+-- Promo codes (coupon system — validate-then-charge flow)
+CREATE TABLE IF NOT EXISTS promo_code (
+  id                BIGSERIAL PRIMARY KEY,
+  code              VARCHAR(64) UNIQUE NOT NULL,
+  type              VARCHAR(16) NOT NULL DEFAULT 'percentage',
+  discount_percent  INT,
+  discount_grosz    INT,
+  applicable_plan   VARCHAR(16),
+  max_uses          INT         NOT NULL DEFAULT 1,
+  used_count        INT         NOT NULL DEFAULT 0,
+  active            BOOLEAN     NOT NULL DEFAULT TRUE,
+  expires_at        TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_promo_code_code ON promo_code(code);
+
+CREATE TABLE IF NOT EXISTS promo_code_usage (
+  id             BIGSERIAL PRIMARY KEY,
+  promo_code_id  BIGINT      NOT NULL REFERENCES promo_code(id),
+  user_id        VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  stripe_session VARCHAR(128),
+  used_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_promo_usage_code ON promo_code_usage(promo_code_id);
+CREATE INDEX IF NOT EXISTS idx_promo_usage_user ON promo_code_usage(user_id);

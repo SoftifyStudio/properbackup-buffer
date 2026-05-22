@@ -34,6 +34,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.GiftCodeHandler
 import pl.danielniemiec.properbackup.buffer.payment.HotPayHandler
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.payment.PromoCodeHandler
 import pl.danielniemiec.properbackup.buffer.payment.StripeHandler
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
@@ -159,7 +160,8 @@ fun main(args: Array<String>) {
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
     val hotPayHandler = HotPayHandler(db, userStore)
     val giftCodeHandler = GiftCodeHandler(db, userStore)
-    val stripeHandler = StripeHandler(db, userStore)
+    val promoCodeHandler = PromoCodeHandler(db, userStore)
+    val stripeHandler = StripeHandler(db, userStore, promoCodeHandler)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard, restoreVerifier,
@@ -291,12 +293,19 @@ fun main(args: Array<String>) {
     app.get("/payment/orders", hotPayHandler::listOrders)
     app.post("/webhooks/hotpay", hotPayHandler::handleNotification)
     app.post("/payment/redeem-gift", giftCodeHandler::redeemGiftCode)
+    app.post("/payment/validate-promo", promoCodeHandler::validatePromoCode)
     app.post("/payment/stripe/checkout", stripeHandler::createCheckoutSession)
     app.get("/payment/stripe/public-key", stripeHandler::getPublicKey)
     app.get("/payment/stripe/status", stripeHandler::getPaymentStatus)
     app.post("/webhooks/stripe", stripeHandler::handleWebhook)
     app.before("/admin/gift-codes", jwtFilter)
     app.get("/admin/gift-codes", giftCodeHandler::listGiftCodes)
+    app.before("/admin/promo-codes", jwtFilter)
+    app.before("/admin/promo-codes/*", jwtFilter)
+    app.get("/admin/promo-codes", promoCodeHandler::listPromoCodes)
+    app.post("/admin/promo-codes", promoCodeHandler::createPromoCode)
+    app.put("/admin/promo-codes/{id}", promoCodeHandler::updatePromoCode)
+    app.delete("/admin/promo-codes/{id}", promoCodeHandler::deletePromoCode)
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)
