@@ -313,3 +313,25 @@ CREATE TABLE IF NOT EXISTS promo_code_usage (
 
 CREATE INDEX IF NOT EXISTS idx_promo_usage_code ON promo_code_usage(promo_code_id);
 CREATE INDEX IF NOT EXISTS idx_promo_usage_user ON promo_code_usage(user_id);
+
+-- Subscription configuration (VAT rate, etc.)
+CREATE TABLE IF NOT EXISTS subscription_config (
+  key            VARCHAR(64) PRIMARY KEY,
+  value          TEXT NOT NULL,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO subscription_config (key, value) VALUES ('vat_rate', '0.23')
+ON CONFLICT (key) DO NOTHING;
+
+-- Subscription audit log (all subscription-related actions)
+CREATE TABLE IF NOT EXISTS subscription_audit_log (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  action      VARCHAR(64) NOT NULL,
+  details     TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sub_audit_user ON subscription_audit_log(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sub_audit_action ON subscription_audit_log(action, created_at DESC);

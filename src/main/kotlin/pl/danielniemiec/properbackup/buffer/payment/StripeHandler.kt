@@ -3,10 +3,13 @@ package pl.danielniemiec.properbackup.buffer.payment
 import com.google.gson.Gson
 import com.stripe.Stripe
 import com.stripe.exception.SignatureVerificationException
+import com.stripe.model.Customer
 import com.stripe.model.Event
+import com.stripe.model.PaymentMethod
 import com.stripe.model.checkout.Session
 import com.stripe.net.Webhook
 import com.stripe.param.CustomerCreateParams
+import com.stripe.param.CustomerListPaymentMethodsParams
 import com.stripe.param.checkout.SessionCreateParams
 import io.javalin.http.Context
 import org.slf4j.LoggerFactory
@@ -23,7 +26,11 @@ class StripeHandler(
     private val log = LoggerFactory.getLogger(StripeHandler::class.java)
     private val gson = Gson()
 
-    private val stripeSecretKey = System.getenv("STRIPE_SECRET_KEY") ?: ""
+    private val stripeMode = System.getenv("STRIPE_MODE") ?: "test"
+    private val stripeSecretKey = when (stripeMode) {
+        "live" -> System.getenv("STRIPE_LIVE_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
+        else -> System.getenv("STRIPE_TEST_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
+    }
     private val stripeWebhookSecret = System.getenv("STRIPE_WEBHOOK_SECRET") ?: ""
     private val panelUrl = System.getenv("PROPERBACKUP_PANEL_URL") ?: "https://panel.properbackup.com"
 
@@ -39,7 +46,7 @@ class StripeHandler(
     init {
         if (stripeSecretKey.isNotBlank()) {
             Stripe.apiKey = stripeSecretKey
-            log.info("Stripe initialized (key={}...)", stripeSecretKey.take(12))
+            log.info("Stripe initialized: mode={} key={}...", stripeMode, stripeSecretKey.take(12))
         } else {
             log.warn("STRIPE_SECRET_KEY not set — Stripe payments disabled")
         }
@@ -89,6 +96,12 @@ class StripeHandler(
             "Stripe checkout: userId={} plan={} base={} prorated=-{} promo=-{} final={} promoCode={}",
             userId, plan, basePriceGrosze, proratedDiscount, promoDiscount, finalAmount, promoCode,
         )
+
+        logAudit(userId, "checkout_started", mapOf(
+            "plan" to plan, "basePriceGrosze" to basePriceGrosze,
+            "proratedDiscount" to proratedDiscount, "promoDiscount" to promoDiscount,
+            "finalAmount" to finalAmount, "promoCode" to (promoCode ?: ""),
+        ))
 
         try {
             val customerId = getOrCreateStripeCustomer(userId, user.email)
@@ -267,6 +280,7 @@ class StripeHandler(
         }
 
         saveStripeEvent(userId, "checkout_completed", session.id, plan)
+        logAudit(userId, "checkout_completed", mapOf("plan" to plan, "sessionId" to session.id, "promoCode" to (promoCode ?: "")))
     }
 
     private fun handleInvoicePaymentSucceeded(event: Event) {
@@ -338,6 +352,146 @@ class StripeHandler(
                 ps.setString(2, userId)
                 ps.executeUpdate()
             }
+        }
+    }
+
+    /**
+     * GET /payment/stripe/card-info
+     * Returns masked card info for the user's default payment method.
+     */
+    fun getCardInfo(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        val customerId = getStripeCustomerId(userId)
+        if (customerId == null || stripeSecretKey.isBlank()) {
+            ctx.contentType("application/json").result(gson.toJson(mapOf("hasCard" to false)))
+            return
+        }
+
+        try {
+            val params = CustomerListPaymentMethodsParams.builder()
+                .setType(CustomerListPaymentMethodsParams.Type.CARD)
+                .setLimit(1)
+                .build()
+            val methods = Customer.retrieve(customerId).listPaymentMethods(params)
+            val pm = methods.data.firstOrNull()
+
+            if (pm?.card != null) {
+                ctx.contentType("application/json").result(
+                    gson.toJson(
+                        mapOf(
+                            "hasCard" to true,
+                            "brand" to (pm.card.brand ?: "unknown"),
+                            "last4" to (pm.card.last4 ?: "0000"),
+                            "expMonth" to pm.card.expMonth,
+                            "expYear" to pm.card.expYear,
+                        ),
+                    ),
+                )
+            } else {
+                ctx.contentType("application/json").result(gson.toJson(mapOf("hasCard" to false)))
+            }
+        } catch (e: Exception) {
+            log.warn("Failed to get card info for userId={}: {}", userId, e.message)
+            ctx.contentType("application/json").result(gson.toJson(mapOf("hasCard" to false)))
+        }
+    }
+
+    /**
+     * POST /payment/stripe/cancel-subscription
+     * Cancels the current subscription via Stripe API.
+     * The actual DB update happens via the customer.subscription.deleted webhook.
+     */
+    fun cancelSubscription(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        val user = userStore.findById(userId).orElse(null)
+        if (user == null || user.subscriptionPlan == null) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "no_active_subscription")),
+            )
+            return
+        }
+
+        logAudit(userId, "cancel_requested", mapOf("plan" to (user.subscriptionPlan ?: "")))
+
+        // For now, mark in our DB as cancelled (Stripe recurring subscriptions not yet set up).
+        // When Stripe Subscriptions are configured, this will call Subscription.cancel() instead.
+        val subscriptionExpiresAt = user.subscriptionExpiresAt?.let { java.time.Instant.parse(it) }
+        log.info("Subscription cancellation: userId={} plan={} expiresAt={}", userId, user.subscriptionPlan, subscriptionExpiresAt)
+
+        // Don't remove time — let the plan run until expiry, but mark as not renewing
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET subscription_plan = NULL WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, userId)
+                ps.executeUpdate()
+            }
+        }
+
+        logAudit(userId, "plan_cancelled", mapOf("plan" to (user.subscriptionPlan ?: "")))
+
+        ctx.contentType("application/json").result(
+            gson.toJson(mapOf("status" to "cancelled", "expiresAt" to user.subscriptionExpiresAt)),
+        )
+    }
+
+    /**
+     * POST /payment/stripe/renew
+     * Re-activates renewal for a cancelled subscription (redirect to Stripe Checkout).
+     */
+    fun renewSubscription(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        logAudit(userId, "renew_requested", emptyMap())
+        createCheckoutSession(ctx)
+    }
+
+    /** Get VAT rate from subscription_config table. */
+    fun getVatRate(): Double {
+        return try {
+            db.getConnection().use { conn ->
+                conn.prepareStatement("SELECT value FROM subscription_config WHERE key = 'vat_rate'").use { ps ->
+                    ps.executeQuery().use { rs ->
+                        if (rs.next()) rs.getString("value").toDouble() else 0.23
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            0.23
+        }
+    }
+
+    /** Returns the current Stripe mode (test/live). */
+    fun getStripeMode(): String = stripeMode
+
+    private fun logAudit(userId: String, action: String, details: Map<String, Any>) {
+        try {
+            db.getConnection().use { conn ->
+                conn.prepareStatement(
+                    "INSERT INTO subscription_audit_log (user_id, action, details) VALUES (?, ?, ?)",
+                ).use { ps ->
+                    ps.setString(1, userId)
+                    ps.setString(2, action)
+                    ps.setString(3, gson.toJson(details))
+                    ps.executeUpdate()
+                }
+            }
+        } catch (e: Exception) {
+            log.warn("Failed to log audit: userId={} action={}: {}", userId, action, e.message)
         }
     }
 

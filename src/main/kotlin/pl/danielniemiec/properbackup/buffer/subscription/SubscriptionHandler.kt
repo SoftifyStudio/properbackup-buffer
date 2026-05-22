@@ -11,6 +11,7 @@ import java.time.Instant
 class SubscriptionHandler(
     private val userStore: UserStore,
     private val storageQuotaGuard: StorageQuotaGuard? = null,
+    private val stripeHandler: StripeHandler? = null,
 ) {
     private val gson = Gson()
 
@@ -97,6 +98,8 @@ class SubscriptionHandler(
                     "storageUsedLabel" to formatStorageLimit(quotaStatus?.usedBytes ?: 0L),
                     "storageUsedPercent" to (quotaStatus?.usedPercent ?: 0.0),
                     "storageExceeded" to (quotaStatus?.exceeded ?: false),
+                    "vatRate" to (stripeHandler?.getVatRate() ?: 0.23),
+                    "stripeMode" to (stripeHandler?.getStripeMode() ?: "test"),
                     "pricing" to mapOf(
                         "monthly" to mapOf(
                             "basePriceGrosze" to monthlyPriceGrosze,

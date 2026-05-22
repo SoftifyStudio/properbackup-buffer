@@ -42,6 +42,7 @@ class PromoCodeHandler(
         val promo = findValidPromoCode(code)
         if (promo == null) {
             log.info("Promo code INVALID: code={} userId={}", code, userId)
+            logAudit(userId, "promo_rejected", mapOf("code" to code, "reason" to "not_found_or_expired"))
             ctx.contentType("application/json").result(
                 gson.toJson(mapOf("valid" to false, "reason" to "not_found_or_expired")),
             )
@@ -52,6 +53,7 @@ class PromoCodeHandler(
 
         if (type == "first_order" && userHadSubscription(userId)) {
             log.info("Promo code REJECTED (first_order, user already had subscription): code={} userId={}", code, userId)
+            logAudit(userId, "promo_rejected", mapOf("code" to code, "reason" to "not_eligible_first_order"))
             ctx.contentType("application/json").result(
                 gson.toJson(mapOf("valid" to false, "reason" to "not_eligible_first_order")),
             )
@@ -60,6 +62,7 @@ class PromoCodeHandler(
 
         if (type == "one_time" && userAlreadyUsedCode(promo["id"] as Long, userId)) {
             log.info("Promo code REJECTED (one_time, already used by user): code={} userId={}", code, userId)
+            logAudit(userId, "promo_rejected", mapOf("code" to code, "reason" to "already_used_by_user"))
             ctx.contentType("application/json").result(
                 gson.toJson(mapOf("valid" to false, "reason" to "already_used_by_user")),
             )
@@ -74,6 +77,11 @@ class PromoCodeHandler(
             "Promo code VALID: code={} userId={} type={} discountPercent={} discountGrosze={}",
             code, userId, type, discountPercent, discountGrosze,
         )
+
+        logAudit(userId, "promo_validated", mapOf(
+            "code" to code, "type" to type,
+            "discountPercent" to (discountPercent ?: 0), "discountGrosze" to (discountGrosze ?: 0),
+        ))
 
         ctx.contentType("application/json").result(
             gson.toJson(
@@ -328,5 +336,22 @@ class PromoCodeHandler(
             return null
         }
         return true
+    }
+
+    private fun logAudit(userId: String, action: String, details: Map<String, Any>) {
+        try {
+            db.getConnection().use { conn ->
+                conn.prepareStatement(
+                    "INSERT INTO subscription_audit_log (user_id, action, details) VALUES (?, ?, ?)",
+                ).use { ps ->
+                    ps.setString(1, userId)
+                    ps.setString(2, action)
+                    ps.setString(3, gson.toJson(details))
+                    ps.executeUpdate()
+                }
+            }
+        } catch (e: Exception) {
+            log.warn("Failed to log audit: userId={} action={}: {}", userId, action, e.message)
+        }
     }
 }

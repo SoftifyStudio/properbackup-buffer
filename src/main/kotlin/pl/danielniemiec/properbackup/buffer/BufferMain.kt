@@ -152,7 +152,6 @@ fun main(args: Array<String>) {
         restoreVerifier,
     )
 
-    val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard)
     val subscriptionGuard = SubscriptionGuard(userStore)
     val trialNotifier = TrialNotifier(userStore, logStore, emailService)
 
@@ -162,6 +161,7 @@ fun main(args: Array<String>) {
     val giftCodeHandler = GiftCodeHandler(db, userStore)
     val promoCodeHandler = PromoCodeHandler(db, userStore)
     val stripeHandler = StripeHandler(db, userStore, promoCodeHandler)
+    val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard, stripeHandler)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard, restoreVerifier,
@@ -297,6 +297,9 @@ fun main(args: Array<String>) {
     app.post("/payment/stripe/checkout", stripeHandler::createCheckoutSession)
     app.get("/payment/stripe/public-key", stripeHandler::getPublicKey)
     app.get("/payment/stripe/status", stripeHandler::getPaymentStatus)
+    app.get("/payment/stripe/card-info", stripeHandler::getCardInfo)
+    app.post("/payment/stripe/cancel-subscription", stripeHandler::cancelSubscription)
+    app.post("/payment/stripe/renew", stripeHandler::renewSubscription)
     app.post("/webhooks/stripe", stripeHandler::handleWebhook)
     app.before("/admin/gift-codes", jwtFilter)
     app.get("/admin/gift-codes", giftCodeHandler::listGiftCodes)
