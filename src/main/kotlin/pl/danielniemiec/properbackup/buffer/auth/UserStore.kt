@@ -22,11 +22,12 @@ class UserStore(private val db: Database) {
         val lastTrialNotification: String?,
         val emailVerified: Boolean = false,
         val stripeCustomerId: String? = null,
+        val stripeSubscriptionId: String? = null,
         val subscriptionCancelAtPeriodEnd: Boolean = false,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, subscription_cancel_at_period_end"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -87,7 +88,7 @@ class UserStore(private val db: Database) {
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null)
+        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null)
     }
 
     fun verifyEmail(token: String): Boolean {
@@ -152,6 +153,55 @@ class UserStore(private val db: Database) {
                 ps.setLong(3, storageLimitBytes)
                 ps.setString(4, userId)
                 ps.executeUpdate()
+            }
+        }
+    }
+
+    fun updateStripeSubscriptionId(userId: String, subscriptionId: String?) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET stripe_subscription_id = ? WHERE id = ?",
+            ).use { ps ->
+                if (subscriptionId != null) ps.setString(1, subscriptionId) else ps.setNull(1, java.sql.Types.VARCHAR)
+                ps.setString(2, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun deactivateSubscription(userId: String) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET subscription_plan = NULL, subscription_expires_at = NULL, stripe_subscription_id = NULL, subscription_cancel_at_period_end = FALSE WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun findByStripeSubscriptionId(subscriptionId: String): Optional<User> {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT $SELECT_COLS FROM users WHERE stripe_subscription_id = ?",
+            ).use { ps ->
+                ps.setString(1, subscriptionId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) Optional.of(map(rs)) else Optional.empty()
+                }
+            }
+        }
+    }
+
+    fun findByStripeCustomerId(customerId: String): Optional<User> {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT $SELECT_COLS FROM users WHERE stripe_customer_id = ?",
+            ).use { ps ->
+                ps.setString(1, customerId)
+                ps.executeQuery().use { rs ->
+                    return if (rs.next()) Optional.of(map(rs)) else Optional.empty()
+                }
             }
         }
     }
@@ -224,6 +274,7 @@ class UserStore(private val db: Database) {
         rs.getString("last_trial_notification"),
         rs.getBoolean("email_verified"),
         rs.getString("stripe_customer_id"),
+        rs.getString("stripe_subscription_id"),
         rs.getBoolean("subscription_cancel_at_period_end"),
     )
 }

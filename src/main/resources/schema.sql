@@ -275,6 +275,7 @@ CREATE INDEX IF NOT EXISTS idx_gift_code_redeemed ON gift_code(redeemed_by);
 
 -- Stripe payment integration
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(64);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(64);
 
 CREATE TABLE IF NOT EXISTS stripe_event (
   id                BIGSERIAL PRIMARY KEY,
@@ -336,3 +337,10 @@ CREATE TABLE IF NOT EXISTS subscription_audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_sub_audit_user ON subscription_audit_log(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sub_audit_action ON subscription_audit_log(action, created_at DESC);
+
+-- Stripe recurring price IDs (auto-created or manually configured)
+CREATE TABLE IF NOT EXISTS stripe_price_config (
+  plan_key      VARCHAR(32) PRIMARY KEY,
+  stripe_price_id VARCHAR(128) NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
