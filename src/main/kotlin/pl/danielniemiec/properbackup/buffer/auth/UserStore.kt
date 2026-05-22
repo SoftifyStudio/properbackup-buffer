@@ -22,10 +22,11 @@ class UserStore(private val db: Database) {
         val lastTrialNotification: String?,
         val emailVerified: Boolean = false,
         val stripeCustomerId: String? = null,
+        val subscriptionCancelAtPeriodEnd: Boolean = false,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, subscription_cancel_at_period_end"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -144,12 +145,24 @@ class UserStore(private val db: Database) {
     fun updateSubscription(userId: String, plan: String, expiresAt: Instant, storageLimitBytes: Long) {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "UPDATE users SET subscription_plan = ?, subscription_expires_at = ?, storage_limit_bytes = ? WHERE id = ?",
+                "UPDATE users SET subscription_plan = ?, subscription_expires_at = ?, storage_limit_bytes = ?, subscription_cancel_at_period_end = FALSE WHERE id = ?",
             ).use { ps ->
                 ps.setString(1, plan)
                 ps.setTimestamp(2, Timestamp.from(expiresAt))
                 ps.setLong(3, storageLimitBytes)
                 ps.setString(4, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun setCancelAtPeriodEnd(userId: String, cancel: Boolean) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET subscription_cancel_at_period_end = ? WHERE id = ?",
+            ).use { ps ->
+                ps.setBoolean(1, cancel)
+                ps.setString(2, userId)
                 ps.executeUpdate()
             }
         }
@@ -211,5 +224,6 @@ class UserStore(private val db: Database) {
         rs.getString("last_trial_notification"),
         rs.getBoolean("email_verified"),
         rs.getString("stripe_customer_id"),
+        rs.getBoolean("subscription_cancel_at_period_end"),
     )
 }

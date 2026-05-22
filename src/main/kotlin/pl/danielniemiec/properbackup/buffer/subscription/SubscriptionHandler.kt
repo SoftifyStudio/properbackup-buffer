@@ -76,11 +76,11 @@ class SubscriptionHandler(
         val annualPriceGrosze = StripeHandler.ANNUAL_PRICE_PLN
 
         val monthlyProratedGrosze = if (daysRemaining > 0) {
-            (monthlyPriceGrosze * daysRemaining / 31)
+            minOf(monthlyPriceGrosze, monthlyPriceGrosze * daysRemaining / 31)
         } else 0L
 
         val annualProratedGrosze = if (daysRemaining > 0) {
-            (annualPriceGrosze * daysRemaining / 365)
+            minOf(annualPriceGrosze, annualPriceGrosze * daysRemaining / 365)
         } else 0L
 
         ctx.contentType("application/json").result(
@@ -90,6 +90,7 @@ class SubscriptionHandler(
                     "plan" to (user.subscriptionPlan ?: "trial"),
                     "daysRemaining" to daysRemaining,
                     "active" to active,
+                    "cancelAtPeriodEnd" to user.subscriptionCancelAtPeriodEnd,
                     "trialExpiresAt" to user.trialExpiresAt,
                     "subscriptionExpiresAt" to user.subscriptionExpiresAt,
                     "storageLimitBytes" to user.storageLimitBytes,

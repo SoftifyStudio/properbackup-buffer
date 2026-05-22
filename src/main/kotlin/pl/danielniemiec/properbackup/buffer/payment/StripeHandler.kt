@@ -32,7 +32,7 @@ class StripeHandler(
         else -> System.getenv("STRIPE_TEST_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
     }
     private val stripeWebhookSecret = System.getenv("STRIPE_WEBHOOK_SECRET") ?: ""
-    private val panelUrl = System.getenv("PROPERBACKUP_PANEL_URL") ?: "https://panel.properbackup.com"
+    private val panelUrl = System.getenv("PROPERBACKUP_PANEL_URL") ?: "http://localhost:5175"
 
     companion object {
         const val MONTHLY_PLAN = "monthly"
@@ -83,7 +83,7 @@ class StripeHandler(
         val totalDays = if (plan == ANNUAL_PLAN) 365L else 31L
 
         val daysRemaining = calculateDaysRemaining(user)
-        val proratedDiscount = if (daysRemaining > 0) (basePriceGrosze * daysRemaining / totalDays) else 0L
+        val proratedDiscount = if (daysRemaining > 0) minOf(basePriceGrosze, basePriceGrosze * daysRemaining / totalDays) else 0L
 
         var promoDiscount = 0L
         if (!promoCode.isNullOrBlank() && promoCodeHandler != null) {
@@ -108,8 +108,8 @@ class StripeHandler(
 
             val sessionBuilder = SessionCreateParams.builder()
                 .setCustomer(customerId)
-                .setSuccessUrl("$panelUrl/subscription?stripe=success&session_id={CHECKOUT_SESSION_ID}")
-                .setCancelUrl("$panelUrl/subscription?stripe=cancelled")
+                .setSuccessUrl("$panelUrl/account/subscription?stripe=success&session_id={CHECKOUT_SESSION_ID}")
+                .setCancelUrl("$panelUrl/account/subscription?stripe=cancelled")
                 .putMetadata("userId", userId)
                 .putMetadata("plan", plan)
                 .putMetadata("basePriceGrosze", basePriceGrosze.toString())
@@ -121,10 +121,16 @@ class StripeHandler(
                 sessionBuilder.putMetadata("promoCode", promoCode)
             }
 
-            if (finalAmount > 0) {
+            val stripeMinGrosze = 200L // Stripe minimum for PLN is 2.00 PLN
+            if (finalAmount >= stripeMinGrosze) {
                 val planLabel = if (plan == ANNUAL_PLAN) "ProperBackup Roczny" else "ProperBackup Miesięczny"
                 sessionBuilder
                     .setMode(SessionCreateParams.Mode.PAYMENT)
+                    .setPaymentIntentData(
+                        SessionCreateParams.PaymentIntentData.builder()
+                            .setSetupFutureUsage(SessionCreateParams.PaymentIntentData.SetupFutureUsage.OFF_SESSION)
+                            .build(),
+                    )
                     .addLineItem(
                         SessionCreateParams.LineItem.builder()
                             .setQuantity(1)
@@ -423,20 +429,9 @@ class StripeHandler(
 
         logAudit(userId, "cancel_requested", mapOf("plan" to (user.subscriptionPlan ?: "")))
 
-        // For now, mark in our DB as cancelled (Stripe recurring subscriptions not yet set up).
-        // When Stripe Subscriptions are configured, this will call Subscription.cancel() instead.
-        val subscriptionExpiresAt = user.subscriptionExpiresAt?.let { java.time.Instant.parse(it) }
-        log.info("Subscription cancellation: userId={} plan={} expiresAt={}", userId, user.subscriptionPlan, subscriptionExpiresAt)
+        log.info("Subscription cancellation: userId={} plan={} expiresAt={}", userId, user.subscriptionPlan, user.subscriptionExpiresAt)
 
-        // Don't remove time — let the plan run until expiry, but mark as not renewing
-        db.getConnection().use { conn ->
-            conn.prepareStatement(
-                "UPDATE users SET subscription_plan = NULL WHERE id = ?",
-            ).use { ps ->
-                ps.setString(1, userId)
-                ps.executeUpdate()
-            }
-        }
+        userStore.setCancelAtPeriodEnd(userId, true)
 
         logAudit(userId, "plan_cancelled", mapOf("plan" to (user.subscriptionPlan ?: "")))
 
@@ -458,6 +453,99 @@ class StripeHandler(
 
         logAudit(userId, "renew_requested", emptyMap())
         createCheckoutSession(ctx)
+    }
+
+    /**
+     * POST /payment/stripe/reactivate
+     * Undoes the cancel-at-period-end flag (re-enables auto-renewal).
+     */
+    fun reactivateSubscription(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        val user = userStore.findById(userId).orElse(null)
+        if (user == null || user.subscriptionPlan == null) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "no_active_subscription")),
+            )
+            return
+        }
+
+        userStore.setCancelAtPeriodEnd(userId, false)
+        logAudit(userId, "subscription_reactivated", mapOf("plan" to (user.subscriptionPlan ?: "")))
+
+        ctx.contentType("application/json").result(
+            gson.toJson(mapOf("status" to "reactivated")),
+        )
+    }
+
+    /**
+     * POST /payment/stripe/verify-session
+     * Verifies a Checkout Session after redirect and activates the plan if paid.
+     * This is a fallback for when webhooks are not reachable (e.g., localhost dev).
+     */
+    fun verifySession(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        val body = try { gson.fromJson(ctx.body(), Map::class.java) } catch (_: Exception) { null }
+        val sessionId = (body?.get("sessionId") as? String)?.trim()
+        if (sessionId.isNullOrBlank()) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "missing sessionId")),
+            )
+            return
+        }
+
+        try {
+            val session = Session.retrieve(sessionId)
+            val metaUserId = session.metadata?.get("userId")
+            if (metaUserId != userId) {
+                log.warn("verify-session: userId mismatch meta={} auth={}", metaUserId, userId)
+                ctx.status(403).contentType("application/json").result(
+                    gson.toJson(mapOf("error" to "session does not belong to this user")),
+                )
+                return
+            }
+
+            val plan = session.metadata?.get("plan") ?: MONTHLY_PLAN
+            val promoCode = session.metadata?.get("promoCode")
+            val paid = session.paymentStatus == "paid" || session.mode == "setup"
+
+            if (paid) {
+                // Idempotent: check if already activated
+                val user = userStore.findById(userId).orElse(null)
+                val alreadyActive = user?.subscriptionPlan == plan
+
+                if (!alreadyActive) {
+                    activateSubscription(userId, plan)
+                    if (!promoCode.isNullOrBlank() && promoCodeHandler != null) {
+                        promoCodeHandler.markPromoCodeUsed(promoCode, userId, sessionId)
+                    }
+                    saveStripeEvent(userId, "checkout_verified", sessionId, plan)
+                    logAudit(userId, "checkout_verified", mapOf("plan" to plan, "sessionId" to sessionId))
+                }
+
+                ctx.contentType("application/json").result(
+                    gson.toJson(mapOf("status" to "active", "plan" to plan)),
+                )
+            } else {
+                ctx.contentType("application/json").result(
+                    gson.toJson(mapOf("status" to "unpaid", "paymentStatus" to session.paymentStatus)),
+                )
+            }
+        } catch (e: Exception) {
+            log.error("verify-session failed: sessionId={} userId={}", sessionId, userId, e)
+            ctx.status(500).contentType("application/json").result(
+                gson.toJson(mapOf("error" to (e.message ?: "Failed to verify session"))),
+            )
+        }
     }
 
     /** Get VAT rate from subscription_config table. */
