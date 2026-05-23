@@ -242,9 +242,6 @@ class StripeHandler(
         try {
             val customerId = getOrCreateStripeCustomer(userId, user.email)
 
-            // If user already has a Stripe subscription, cancel it before creating a new one
-            cancelExistingStripeSubscription(user)
-
             val sessionBuilder = SessionCreateParams.builder()
                 .setCustomer(customerId)
                 .setMode(SessionCreateParams.Mode.SUBSCRIPTION)
@@ -373,9 +370,14 @@ class StripeHandler(
     }
 
     fun getPublicKey(ctx: Context) {
-        val publicKey = System.getenv("STRIPE_PUBLIC_KEY")
-            ?: System.getenv("STRIPE_TEST_PUBLIC_KEY")
-            ?: ""
+        val publicKey = when (stripeMode) {
+            "live" -> System.getenv("STRIPE_LIVE_PUBLIC_KEY")
+                ?: System.getenv("STRIPE_PUBLIC_KEY")
+                ?: ""
+            else -> System.getenv("STRIPE_TEST_PUBLIC_KEY")
+                ?: System.getenv("STRIPE_PUBLIC_KEY")
+                ?: ""
+        }
         ctx.contentType("application/json").result(
             gson.toJson(mapOf("publicKey" to publicKey)),
         )
@@ -445,7 +447,12 @@ class StripeHandler(
         )
 
         if (session.mode == "subscription" && !subscriptionId.isNullOrBlank()) {
-            // Save the Stripe subscription ID
+            // Cancel previous Stripe subscription only after new one is confirmed
+            val existingUser = userStore.findById(userId).orElse(null)
+            if (existingUser != null) {
+                cancelExistingStripeSubscription(existingUser)
+            }
+            // Save the new Stripe subscription ID
             userStore.updateStripeSubscriptionId(userId, subscriptionId)
             // Activate plan in our DB
             activateSubscription(userId, plan)
