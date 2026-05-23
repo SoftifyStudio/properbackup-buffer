@@ -30,26 +30,76 @@ class StripeHandler(
     private val db: Database,
     private val userStore: UserStore,
     private val promoCodeHandler: PromoCodeHandler? = null,
+    stripeModeOverride: String? = null,
+    stripeSecretKeyOverride: String? = null,
+    stripeWebhookSecretOverride: String? = null,
+    panelUrlOverride: String? = null,
 ) {
     private val log = LoggerFactory.getLogger(StripeHandler::class.java)
     private val gson = Gson()
 
-    private val stripeMode = System.getenv("STRIPE_MODE") ?: "test"
-    private val stripeSecretKey = when (stripeMode) {
+    private val stripeMode = stripeModeOverride ?: System.getenv("STRIPE_MODE") ?: "test"
+    private val stripeSecretKey = stripeSecretKeyOverride ?: when (stripeMode) {
         "live" -> System.getenv("STRIPE_LIVE_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
         else -> System.getenv("STRIPE_TEST_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
     }
-    private val stripeWebhookSecret = System.getenv("STRIPE_WEBHOOK_SECRET") ?: ""
-    private val panelUrl = System.getenv("PROPERBACKUP_PANEL_URL") ?: "http://localhost:5175"
+    private val stripeWebhookSecret = stripeWebhookSecretOverride ?: System.getenv("STRIPE_WEBHOOK_SECRET") ?: ""
+    private val panelUrl = panelUrlOverride ?: System.getenv("PROPERBACKUP_PANEL_URL") ?: "http://localhost:5175"
 
     companion object {
         const val MONTHLY_PLAN = "monthly"
         const val ANNUAL_PLAN = "annual"
-        const val MONTHLY_PRICE_PLN = 1900L   // 19.00 PLN in grosz
-        const val ANNUAL_PRICE_PLN = 19000L   // 190.00 PLN in grosz
+        // Prices are GROSS (brutto, VAT-inclusive). Stripe charges this exact amount.
+        // VAT is decomposed downstream for display/invoice purposes (see decomposeGross).
+        const val MONTHLY_PRICE_PLN = 1900L   // 19.00 PLN brutto in grosz
+        const val ANNUAL_PRICE_PLN = 19000L   // 190.00 PLN brutto in grosz
+        const val MONTHLY_TOTAL_DAYS = 31L
+        const val ANNUAL_TOTAL_DAYS = 365L
         const val TRIAL_DAYS = 30L
         const val STORAGE_LIMIT_BYTES = 2199023255552L // 2TB
         const val PRODUCT_NAME = "ProperBackup"
+
+        /**
+         * Decompose a gross (brutto) price into net + VAT using rounded reverse calculation.
+         * The displayed gross MUST equal what Stripe actually charges — that's the invariant.
+         * Returns Pair(netGrosze, vatGrosze) where netGrosze + vatGrosze == grossGrosze.
+         */
+        fun decomposeGross(grossGrosze: Long, vatRate: Double): Pair<Long, Long> {
+            if (grossGrosze <= 0L || vatRate <= 0.0) return grossGrosze to 0L
+            val net = Math.round(grossGrosze.toDouble() / (1.0 + vatRate))
+            val vat = grossGrosze - net
+            return net to vat
+        }
+
+        /**
+         * Compute the prorated discount when transitioning to a new plan.
+         *
+         * Rules:
+         * - Trial-only user (no paid plan): proration uses NEW plan's per-day price as a "fair
+         *   trial credit" toward the first invoice. Capped at the new plan's base.
+         * - Paid plan user: proration preserves the VALUE of remaining paid days from the
+         *   CURRENT plan. This is what guarantees a downgrade (annual→monthly) doesn't silently
+         *   forfeit value. Anything in excess of newPlanBase is returned as `overflowCreditGrosze`,
+         *   which callers credit to the Stripe customer.balance.
+         *
+         * Returns Pair(discountToApplyAsCouponGrosze, overflowCreditGrosze).
+         */
+        fun calculateProratedDiscount(
+            currentPlan: String?,
+            daysRemaining: Long,
+            newPlanBaseGrosze: Long,
+            newPlanTotalDays: Long,
+        ): Pair<Long, Long> {
+            if (daysRemaining <= 0L) return 0L to 0L
+            val remainingValueGrosze: Long = when (currentPlan) {
+                ANNUAL_PLAN -> ANNUAL_PRICE_PLN * daysRemaining / ANNUAL_TOTAL_DAYS
+                MONTHLY_PLAN -> MONTHLY_PRICE_PLN * daysRemaining / MONTHLY_TOTAL_DAYS
+                else -> newPlanBaseGrosze * daysRemaining / newPlanTotalDays
+            }
+            val capped = minOf(newPlanBaseGrosze, remainingValueGrosze)
+            val overflow = if (remainingValueGrosze > newPlanBaseGrosze) remainingValueGrosze - newPlanBaseGrosze else 0L
+            return capped to overflow
+        }
     }
 
     private var monthlyPriceId: String? = null
@@ -215,10 +265,12 @@ class StripeHandler(
             }
 
         val basePriceGrosze = if (plan == ANNUAL_PLAN) ANNUAL_PRICE_PLN else MONTHLY_PRICE_PLN
-        val totalDays = if (plan == ANNUAL_PLAN) 365L else 31L
+        val totalDays = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS else MONTHLY_TOTAL_DAYS
 
         val daysRemaining = calculateDaysRemaining(user)
-        val proratedDiscount = if (daysRemaining > 0) minOf(basePriceGrosze, basePriceGrosze * daysRemaining / totalDays) else 0L
+        val (proratedDiscount, overflowCredit) = calculateProratedDiscount(
+            user.subscriptionPlan, daysRemaining, basePriceGrosze, totalDays,
+        )
 
         var promoDiscount = 0L
         if (!promoCode.isNullOrBlank() && promoCodeHandler != null) {
@@ -228,19 +280,52 @@ class StripeHandler(
         val totalDiscount = minOf(basePriceGrosze, proratedDiscount + promoDiscount)
 
         log.info(
-            "Stripe subscription checkout: userId={} plan={} base={} prorated=-{} promo=-{} totalDiscount={} promoCode={}",
-            userId, plan, basePriceGrosze, proratedDiscount, promoDiscount, totalDiscount, promoCode,
+            "Stripe subscription checkout: userId={} plan={} base={} prorated=-{} promo=-{} totalDiscount={} overflowCredit={} promoCode={}",
+            userId, plan, basePriceGrosze, proratedDiscount, promoDiscount, totalDiscount, overflowCredit, promoCode,
         )
 
         logAudit(userId, "checkout_started", mapOf(
             "plan" to plan, "basePriceGrosze" to basePriceGrosze,
             "proratedDiscount" to proratedDiscount, "promoDiscount" to promoDiscount,
-            "totalDiscount" to totalDiscount, "promoCode" to (promoCode ?: ""),
+            "totalDiscount" to totalDiscount, "overflowCredit" to overflowCredit,
+            "promoCode" to (promoCode ?: ""),
             "mode" to "subscription",
         ))
 
         try {
             val customerId = getOrCreateStripeCustomer(userId, user.email)
+
+            // If the user is downgrading (e.g. annual→monthly) and remaining value exceeds the new
+            // plan's base, persist the excess as a credit on the Stripe customer balance. Stripe
+            // automatically applies negative balances to subsequent invoices.
+            if (overflowCredit > 0) {
+                try {
+                    val customer = Customer.retrieve(customerId)
+                    customer.balanceTransactions().create(
+                        com.stripe.param.CustomerBalanceTransactionCollectionCreateParams.builder()
+                            .setAmount(-overflowCredit)
+                            .setCurrency("pln")
+                            .setDescription("ProperBackup downgrade credit (preserved value)")
+                            .putMetadata("userId", userId)
+                            .putMetadata("reason", "downgrade_overflow")
+                            .putMetadata("daysRemaining", daysRemaining.toString())
+                            .putMetadata("fromPlan", user.subscriptionPlan ?: "none")
+                            .putMetadata("toPlan", plan)
+                            .build(),
+                    )
+                    log.info(
+                        "Stripe customer balance credited: customerId={} amount=-{} (downgrade overflow)",
+                        customerId, overflowCredit,
+                    )
+                    logAudit(userId, "downgrade_credit_applied", mapOf(
+                        "customerId" to customerId, "overflowCredit" to overflowCredit,
+                        "fromPlan" to (user.subscriptionPlan ?: "none"), "toPlan" to plan,
+                        "daysRemaining" to daysRemaining,
+                    ))
+                } catch (e: Exception) {
+                    log.warn("Failed to apply downgrade credit: userId={} amount={}: {}", userId, overflowCredit, e.message)
+                }
+            }
 
             val sessionBuilder = SessionCreateParams.builder()
                 .setCustomer(customerId)
@@ -252,6 +337,7 @@ class StripeHandler(
                 .putMetadata("basePriceGrosze", basePriceGrosze.toString())
                 .putMetadata("proratedDiscount", proratedDiscount.toString())
                 .putMetadata("promoDiscount", promoDiscount.toString())
+                .putMetadata("overflowCredit", overflowCredit.toString())
                 .addPaymentMethodType(SessionCreateParams.PaymentMethodType.CARD)
 
             if (!promoCode.isNullOrBlank()) {
@@ -328,6 +414,14 @@ class StripeHandler(
     }
 
     fun handleWebhook(ctx: Context) {
+        // Fail-closed: refuse to process webhooks if signing secret isn't configured.
+        // Allowing unsigned webhooks would let anyone activate a subscription by POSTing a JSON body.
+        if (stripeWebhookSecret.isBlank()) {
+            log.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET not configured")
+            ctx.status(503).result("Webhook secret not configured")
+            return
+        }
+
         val payload = ctx.body()
         val sigHeader = ctx.header("Stripe-Signature")
 
@@ -337,14 +431,8 @@ class StripeHandler(
             return
         }
 
-        val event: Event
-        try {
-            if (stripeWebhookSecret.isNotBlank()) {
-                event = Webhook.constructEvent(payload, sigHeader, stripeWebhookSecret)
-            } else {
-                log.warn("Stripe webhook: STRIPE_WEBHOOK_SECRET not set, parsing without verification")
-                event = Event.GSON.fromJson(payload, Event::class.java)
-            }
+        val event: Event = try {
+            Webhook.constructEvent(payload, sigHeader, stripeWebhookSecret)
         } catch (e: SignatureVerificationException) {
             log.warn("Stripe webhook: signature verification failed", e)
             ctx.status(400).result("Invalid signature")
@@ -357,6 +445,15 @@ class StripeHandler(
 
         log.info("Stripe webhook received: type={} id={}", event.type, event.id)
 
+        // Idempotency: Stripe retries webhooks on any non-2xx (and on network failures). Claim the
+        // event.id atomically before running any handler. If we've already processed it, return 200
+        // so Stripe stops retrying — do NOT re-run handlers (would double-extend subscription, etc.).
+        if (!tryClaimStripeEventId(event.id, event.type)) {
+            log.info("Stripe webhook duplicate (already processed): type={} id={}", event.type, event.id)
+            ctx.status(200).result("OK (duplicate)")
+            return
+        }
+
         when (event.type) {
             "checkout.session.completed" -> handleCheckoutCompleted(event)
             "invoice.paid" -> handleInvoicePaid(event)
@@ -367,6 +464,32 @@ class StripeHandler(
         }
 
         ctx.status(200).result("OK")
+    }
+
+    /**
+     * Claim a Stripe event.id atomically. Returns true if this is the first time we see this
+     * event, false if it was already processed. Used to guarantee at-most-once webhook handling.
+     */
+    fun tryClaimStripeEventId(eventId: String?, eventType: String? = null): Boolean {
+        if (eventId.isNullOrBlank()) return true // can't dedupe without an id; let handler proceed
+        return try {
+            db.getConnection().use { conn ->
+                conn.prepareStatement(
+                    """INSERT INTO stripe_event_idempotency (stripe_event_id, event_type)
+                       VALUES (?, ?)
+                       ON CONFLICT (stripe_event_id) DO NOTHING""",
+                ).use { ps ->
+                    ps.setString(1, eventId)
+                    if (eventType != null) ps.setString(2, eventType) else ps.setNull(2, java.sql.Types.VARCHAR)
+                    val rows = ps.executeUpdate()
+                    rows > 0
+                }
+            }
+        } catch (e: Exception) {
+            log.warn("Failed to claim stripe event id={}: {}", eventId, e.message)
+            // On DB failure, refuse to process — better to retry than to double-apply.
+            false
+        }
     }
 
     fun getPublicKey(ctx: Context) {
@@ -674,8 +797,8 @@ class StripeHandler(
     // Subscription management endpoints
     // ============================================================================
 
-    private fun activateSubscription(userId: String, plan: String) {
-        val durationSeconds = if (plan == ANNUAL_PLAN) 365L * 24 * 60 * 60 else 31L * 24 * 60 * 60
+    fun activateSubscription(userId: String, plan: String) {
+        val durationSeconds = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS * 24 * 60 * 60 else MONTHLY_TOTAL_DAYS * 24 * 60 * 60
         val now = Instant.now()
 
         val user = userStore.findById(userId).orElse(null)
@@ -686,6 +809,7 @@ class StripeHandler(
         val expiresAt = baseTime.plusSeconds(durationSeconds)
 
         userStore.updateSubscription(userId, plan, expiresAt, STORAGE_LIMIT_BYTES)
+        userStore.markEverSubscribed(userId)
         log.info(
             "Subscription activated: userId={} plan={} baseTime={} expiresAt={} (preserved {} remaining days)",
             userId, plan, baseTime, expiresAt,

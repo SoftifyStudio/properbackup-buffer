@@ -24,10 +24,11 @@ class UserStore(private val db: Database) {
         val stripeCustomerId: String? = null,
         val stripeSubscriptionId: String? = null,
         val subscriptionCancelAtPeriodEnd: Boolean = false,
+        val everSubscribed: Boolean = false,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -88,7 +89,7 @@ class UserStore(private val db: Database) {
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null)
+        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false)
     }
 
     fun verifyEmail(token: String): Boolean {
@@ -261,6 +262,17 @@ class UserStore(private val db: Database) {
         }
     }
 
+    fun markEverSubscribed(userId: String) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET ever_subscribed = TRUE WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
     private fun map(rs: java.sql.ResultSet): User = User(
         rs.getString("id"),
         rs.getString("email"),
@@ -276,5 +288,6 @@ class UserStore(private val db: Database) {
         rs.getString("stripe_customer_id"),
         rs.getString("stripe_subscription_id"),
         rs.getBoolean("subscription_cancel_at_period_end"),
+        rs.getBoolean("ever_subscribed"),
     )
 }

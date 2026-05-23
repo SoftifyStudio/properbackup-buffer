@@ -288,6 +288,16 @@ CREATE TABLE IF NOT EXISTS stripe_event (
 
 CREATE INDEX IF NOT EXISTS idx_stripe_event_user ON stripe_event(user_id, created_at DESC);
 
+-- Idempotency ledger for Stripe webhook event IDs. Stripe retries webhooks on any
+-- non-2xx response (and on network failure) so we MUST treat handlers as
+-- at-most-once: the first INSERT claims the event, subsequent retries return 200
+-- without re-running the handler.
+CREATE TABLE IF NOT EXISTS stripe_event_idempotency (
+  stripe_event_id VARCHAR(64) PRIMARY KEY,
+  event_type      VARCHAR(64),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Promo codes (coupon system — validate-then-charge flow)
 CREATE TABLE IF NOT EXISTS promo_code (
   id                BIGSERIAL PRIMARY KEY,
@@ -315,6 +325,10 @@ CREATE TABLE IF NOT EXISTS promo_code_usage (
 
 CREATE INDEX IF NOT EXISTS idx_promo_usage_code ON promo_code_usage(promo_code_id);
 CREATE INDEX IF NOT EXISTS idx_promo_usage_user ON promo_code_usage(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_promo_usage_per_user ON promo_code_usage(promo_code_id, user_id);
+
+-- Track whether a user has ever subscribed (for first_order promo eligibility)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ever_subscribed BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Subscription configuration (VAT rate, etc.)
 CREATE TABLE IF NOT EXISTS subscription_config (

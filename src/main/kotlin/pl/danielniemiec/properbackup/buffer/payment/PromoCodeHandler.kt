@@ -99,32 +99,65 @@ class PromoCodeHandler(
 
     /**
      * Mark a promo code as used (called after successful Stripe payment).
+     *
+     * Atomically: (1) increments used_count only if still under max_uses (CAS in SQL),
+     * (2) inserts the per-user usage row protected by UNIQUE(promo_code_id, user_id).
+     * Returns true if the code was claimed by this call, false if it was already used by this
+     * user OR the max_uses limit has been reached. Safe under concurrent checkouts.
      */
-    fun markPromoCodeUsed(code: String, userId: String, stripeSession: String?) {
+    fun markPromoCodeUsed(code: String, userId: String, stripeSession: String?): Boolean {
         db.getConnection().use { conn ->
-            val promoId = conn.prepareStatement("SELECT id FROM promo_code WHERE code = ?").use { ps ->
-                ps.setString(1, code.uppercase())
-                ps.executeQuery().use { rs -> if (rs.next()) rs.getLong("id") else null }
-            } ?: return
+            conn.autoCommit = false
+            try {
+                val promoId = conn.prepareStatement("SELECT id FROM promo_code WHERE code = ?").use { ps ->
+                    ps.setString(1, code.uppercase())
+                    ps.executeQuery().use { rs -> if (rs.next()) rs.getLong("id") else null }
+                }
+                if (promoId == null) {
+                    log.info("Promo code mark-used: code={} not found", code)
+                    return false
+                }
 
-            conn.prepareStatement(
-                "INSERT INTO promo_code_usage (promo_code_id, user_id, stripe_session, used_at) VALUES (?, ?, ?, ?)",
-            ).use { ps ->
-                ps.setLong(1, promoId)
-                ps.setString(2, userId)
-                ps.setString(3, stripeSession)
-                ps.setTimestamp(4, Timestamp.from(Instant.now()))
-                ps.executeUpdate()
+                // Atomic check + increment: only succeeds if there is still capacity.
+                val updated = conn.prepareStatement(
+                    "UPDATE promo_code SET used_count = used_count + 1 WHERE id = ? AND used_count < max_uses",
+                ).use { ps ->
+                    ps.setLong(1, promoId)
+                    ps.executeUpdate()
+                }
+                if (updated == 0) {
+                    log.info("Promo code mark-used REJECTED (max_uses reached): code={} userId={}", code, userId)
+                    conn.rollback()
+                    return false
+                }
+
+                // Per-user uniqueness is enforced by UNIQUE(promo_code_id, user_id).
+                try {
+                    conn.prepareStatement(
+                        "INSERT INTO promo_code_usage (promo_code_id, user_id, stripe_session, used_at) VALUES (?, ?, ?, ?)",
+                    ).use { ps ->
+                        ps.setLong(1, promoId)
+                        ps.setString(2, userId)
+                        ps.setString(3, stripeSession)
+                        ps.setTimestamp(4, Timestamp.from(Instant.now()))
+                        ps.executeUpdate()
+                    }
+                } catch (e: java.sql.SQLException) {
+                    log.info("Promo code mark-used REJECTED (already used by user): code={} userId={}", code, userId)
+                    conn.rollback()
+                    return false
+                }
+
+                conn.commit()
+                log.info("Promo code USED: code={} userId={} stripeSession={}", code, userId, stripeSession)
+                return true
+            } catch (e: Exception) {
+                conn.rollback()
+                log.warn("Promo code mark-used failed: code={} userId={}: {}", code, userId, e.message)
+                return false
+            } finally {
+                conn.autoCommit = true
             }
-
-            conn.prepareStatement(
-                "UPDATE promo_code SET used_count = used_count + 1 WHERE id = ?",
-            ).use { ps ->
-                ps.setLong(1, promoId)
-                ps.executeUpdate()
-            }
-
-            log.info("Promo code USED: code={} userId={} stripeSession={}", code, userId, stripeSession)
         }
     }
 
@@ -310,8 +343,11 @@ class PromoCodeHandler(
     }
 
     private fun userHadSubscription(userId: String): Boolean {
+        // Use `ever_subscribed` flag rather than the current subscription_plan: after a user
+        // cancels and the period ends, subscription_plan is NULL but they're not eligible for a
+        // "first order" promo any more. ever_subscribed is set on first activateSubscription().
         val user = userStore.findById(userId).orElse(null) ?: return false
-        return user.subscriptionPlan != null
+        return user.everSubscribed || user.subscriptionPlan != null
     }
 
     private fun userAlreadyUsedCode(promoCodeId: Long, userId: String): Boolean {

@@ -74,14 +74,24 @@ class SubscriptionHandler(
 
         val monthlyPriceGrosze = StripeHandler.MONTHLY_PRICE_PLN
         val annualPriceGrosze = StripeHandler.ANNUAL_PRICE_PLN
+        val vatRate = stripeHandler?.getVatRate() ?: 0.23
 
-        val monthlyProratedGrosze = if (daysRemaining > 0) {
-            minOf(monthlyPriceGrosze, monthlyPriceGrosze * daysRemaining / 31)
-        } else 0L
+        // Prorated discount uses the CURRENT plan's per-day value so that switching plans
+        // doesn't silently forfeit money the customer already paid for. See
+        // StripeHandler.calculateProratedDiscount for the canonical rules. We expose the
+        // overflow credit separately so the UI can warn the user about a credit being applied
+        // to subsequent invoices (instead of a refund).
+        val (monthlyProratedGrosze, monthlyOverflowGrosze) = StripeHandler.calculateProratedDiscount(
+            user.subscriptionPlan, daysRemaining, monthlyPriceGrosze, StripeHandler.MONTHLY_TOTAL_DAYS,
+        )
+        val (annualProratedGrosze, annualOverflowGrosze) = StripeHandler.calculateProratedDiscount(
+            user.subscriptionPlan, daysRemaining, annualPriceGrosze, StripeHandler.ANNUAL_TOTAL_DAYS,
+        )
 
-        val annualProratedGrosze = if (daysRemaining > 0) {
-            minOf(annualPriceGrosze, annualPriceGrosze * daysRemaining / 365)
-        } else 0L
+        // Decompose gross into net + VAT so the UI shows what Stripe actually charges
+        // (gross) and the legally required VAT breakdown.
+        val (monthlyNetGrosze, monthlyVatGrosze) = StripeHandler.decomposeGross(monthlyPriceGrosze, vatRate)
+        val (annualNetGrosze, annualVatGrosze) = StripeHandler.decomposeGross(annualPriceGrosze, vatRate)
 
         ctx.contentType("application/json").result(
             gson.toJson(
@@ -100,18 +110,24 @@ class SubscriptionHandler(
                     "storageUsedLabel" to formatStorageLimit(quotaStatus?.usedBytes ?: 0L),
                     "storageUsedPercent" to (quotaStatus?.usedPercent ?: 0.0),
                     "storageExceeded" to (quotaStatus?.exceeded ?: false),
-                    "vatRate" to (stripeHandler?.getVatRate() ?: 0.23),
+                    "vatRate" to vatRate,
                     "stripeMode" to (stripeHandler?.getStripeMode() ?: "test"),
                     "pricing" to mapOf(
                         "monthly" to mapOf(
                             "basePriceGrosze" to monthlyPriceGrosze,
+                            "netPriceGrosze" to monthlyNetGrosze,
+                            "vatGrosze" to monthlyVatGrosze,
                             "proratedDiscountGrosze" to monthlyProratedGrosze,
-                            "totalDays" to 31,
+                            "overflowCreditGrosze" to monthlyOverflowGrosze,
+                            "totalDays" to StripeHandler.MONTHLY_TOTAL_DAYS,
                         ),
                         "annual" to mapOf(
                             "basePriceGrosze" to annualPriceGrosze,
+                            "netPriceGrosze" to annualNetGrosze,
+                            "vatGrosze" to annualVatGrosze,
                             "proratedDiscountGrosze" to annualProratedGrosze,
-                            "totalDays" to 365,
+                            "overflowCreditGrosze" to annualOverflowGrosze,
+                            "totalDays" to StripeHandler.ANNUAL_TOTAL_DAYS,
                         ),
                     ),
                     "plans" to listOf(
