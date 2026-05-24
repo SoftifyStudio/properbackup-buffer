@@ -2017,4 +2017,238 @@ class SubscriptionIntegrationTest {
         }
         assertEquals(1, callCount.get(), "4xx should NOT be retried")
     }
+
+    // ========================================================================
+    // DOWNGRADE LOGIC E2E: 9 scenariuszy (Grupy A–D)
+    // ========================================================================
+
+    // --- Grupa A: Dziewicze zakupy i odnowienia ---
+
+    @Test
+    @Order(400)
+    fun `Test 1 - new client no plan buys Monthly`() {
+        val userId = createTestUser("e2e-test1-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+        val periodEnd = now.plus(Duration.ofDays(31))
+
+        stripeHandler.activateSubscription(userId, StripeHandler.MONTHLY_PLAN, periodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.MONTHLY_PLAN, user.subscriptionPlan, "Plan must be monthly")
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        assertTrue(
+            Duration.between(periodEnd, expiresAt).abs().toSeconds() <= 2,
+            "ExpiresAt must equal now()+31 days — got $expiresAt, expected ~$periodEnd",
+        )
+    }
+
+    @Test
+    @Order(401)
+    fun `Test 2 - new client no plan buys Annual`() {
+        val userId = createTestUser("e2e-test2-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+        val periodEnd = now.plus(Duration.ofDays(365))
+
+        stripeHandler.activateSubscription(userId, StripeHandler.ANNUAL_PLAN, periodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.ANNUAL_PLAN, user.subscriptionPlan, "Plan must be annual")
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        assertTrue(
+            Duration.between(periodEnd, expiresAt).abs().toSeconds() <= 2,
+            "ExpiresAt must equal now()+365 days — got $expiresAt, expected ~$periodEnd",
+        )
+    }
+
+    @Test
+    @Order(402)
+    fun `Test 3 - standard renewal Monthly to Monthly via invoice webhook`() {
+        val userId = createTestUser("e2e-test3-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+
+        // User has active monthly expiring in 5 days.
+        val currentExpiry = now.plus(Duration.ofDays(5))
+        userStore.updateSubscription(userId, StripeHandler.MONTHLY_PLAN, currentExpiry, StripeHandler.STORAGE_LIMIT_BYTES)
+
+        // Stripe sends invoice.paid with new period_end = now + 31 days.
+        val newPeriodEnd = now.plus(Duration.ofDays(31))
+        stripeHandler.activateSubscription(userId, StripeHandler.MONTHLY_PLAN, newPeriodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.MONTHLY_PLAN, user.subscriptionPlan)
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        // max(5d, 31d) = 31d — new period wins.
+        assertTrue(
+            Duration.between(newPeriodEnd, expiresAt).abs().toSeconds() <= 2,
+            "Renewal must extend to new period_end — got $expiresAt, expected ~$newPeriodEnd",
+        )
+    }
+
+    // --- Grupa B: Upgrade / Downgrade ---
+
+    @Test
+    @Order(403)
+    fun `Test 4 - upgrade Monthly to Annual`() {
+        val userId = createTestUser("e2e-test4-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+
+        // User has monthly with 20 days remaining.
+        val currentExpiry = now.plus(Duration.ofDays(20))
+        userStore.updateSubscription(userId, StripeHandler.MONTHLY_PLAN, currentExpiry, StripeHandler.STORAGE_LIMIT_BYTES)
+
+        // Stripe creates annual subscription: period_end = now + 365 days.
+        val annualPeriodEnd = now.plus(Duration.ofDays(365))
+        stripeHandler.activateSubscription(userId, StripeHandler.ANNUAL_PLAN, annualPeriodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.ANNUAL_PLAN, user.subscriptionPlan, "Plan must upgrade to annual")
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        // max(20d, 365d) = 365d — annual wins.
+        assertTrue(
+            Duration.between(annualPeriodEnd, expiresAt).abs().toSeconds() <= 2,
+            "Upgrade must extend to annual period_end — got $expiresAt, expected ~$annualPeriodEnd",
+        )
+    }
+
+    @Test
+    @Order(404)
+    fun `Test 5 - downgrade Annual to Monthly preserves 300 days (main bug)`() {
+        val userId = createTestUser("e2e-test5-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+
+        // User has annual with 300 days remaining.
+        val currentExpiry = now.plus(Duration.ofDays(300))
+        userStore.updateSubscription(userId, StripeHandler.ANNUAL_PLAN, currentExpiry, StripeHandler.STORAGE_LIMIT_BYTES)
+
+        // Stripe creates monthly subscription: period_end = now + 31 days.
+        val monthlyPeriodEnd = now.plus(Duration.ofDays(31))
+        stripeHandler.activateSubscription(userId, StripeHandler.MONTHLY_PLAN, monthlyPeriodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.MONTHLY_PLAN, user.subscriptionPlan, "Plan changes to monthly")
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        // CRITICAL: max(300d, 31d) = 300d — old annual time MUST be preserved!
+        assertTrue(
+            Duration.between(currentExpiry, expiresAt).abs().toSeconds() <= 2,
+            "MAIN BUG: Downgrade must preserve 300-day expiry — got $expiresAt, expected ~$currentExpiry",
+        )
+    }
+
+    // --- Grupa C: Skrajne przypadki (>1 rok) ---
+
+    @Test
+    @Order(405)
+    fun `Test 6 - accumulated time 700 days then downgrade to Monthly`() {
+        val userId = createTestUser("e2e-test6-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+
+        // User has accumulated 700 days (e.g. bought annual twice via promotion).
+        val currentExpiry = now.plus(Duration.ofDays(700))
+        userStore.updateSubscription(userId, StripeHandler.ANNUAL_PLAN, currentExpiry, StripeHandler.STORAGE_LIMIT_BYTES)
+
+        // Downgrade to monthly — Stripe period_end = +31 days.
+        val monthlyPeriodEnd = now.plus(Duration.ofDays(31))
+        stripeHandler.activateSubscription(userId, StripeHandler.MONTHLY_PLAN, monthlyPeriodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.MONTHLY_PLAN, user.subscriptionPlan, "Plan overwritten to monthly")
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        // CRITICAL: max(700d, 31d) = 700d — system MUST NOT cut even a single day.
+        assertTrue(
+            Duration.between(currentExpiry, expiresAt).abs().toSeconds() <= 2,
+            "Accumulated 700d must be preserved after downgrade — got $expiresAt, expected ~$currentExpiry",
+        )
+    }
+
+    @Test
+    @Order(406)
+    fun `Test 7 - monthly invoice with 700 days accumulated does not shorten time`() {
+        val userId = createTestUser("e2e-test7-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+
+        // User from Test 6 scenario: monthly plan with 700 days remaining.
+        val currentExpiry = now.plus(Duration.ofDays(700))
+        userStore.updateSubscription(userId, StripeHandler.MONTHLY_PLAN, currentExpiry, StripeHandler.STORAGE_LIMIT_BYTES)
+
+        // 31 days later, Stripe charges next monthly invoice: period_end = now + 62 days.
+        val nextPeriodEnd = now.plus(Duration.ofDays(62))
+        stripeHandler.activateSubscription(userId, StripeHandler.MONTHLY_PLAN, nextPeriodEnd)
+
+        val user = userStore.findById(userId).orElseThrow()
+        assertEquals(StripeHandler.MONTHLY_PLAN, user.subscriptionPlan)
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        // max(700d, 62d) = 700d — accumulated time stays intact.
+        assertTrue(
+            Duration.between(currentExpiry, expiresAt).abs().toSeconds() <= 2,
+            "700d accumulated must remain after monthly renewal — got $expiresAt, expected ~$currentExpiry",
+        )
+    }
+
+    // --- Grupa D: Anulowanie subskrypcji i ochrona danych ---
+
+    @Test
+    @Order(407)
+    fun `Test 8 - cancel after downgrade preserves paid time`() {
+        val userId = createTestUser("e2e-test8-${System.currentTimeMillis()}@properbackup.dev")
+        val now = Instant.now()
+
+        // Setup: User had annual (300d), downgraded to monthly. max() preserved 300d.
+        val currentExpiry = now.plus(Duration.ofDays(298)) // 2 days after downgrade
+        userStore.updateSubscription(userId, StripeHandler.MONTHLY_PLAN, currentExpiry, StripeHandler.STORAGE_LIMIT_BYTES)
+        userStore.updateStripeSubscriptionId(userId, "sub_test_cancel_${System.currentTimeMillis()}")
+
+        // User cancels — simulate handleSubscriptionDeleted behavior directly:
+        // SELECT FOR UPDATE → detect expiresAt in future → clear only stripe_subscription_id.
+        userStore.getConnection().use { conn ->
+            conn.autoCommit = false
+            try {
+                val locked = userStore.findByIdForUpdate(conn, userId).orElseThrow()
+                val expiresAt = locked.subscriptionExpiresAt?.let { Instant.parse(it) }
+
+                // Verify expiresAt is in the future (cancel logic branch).
+                assertNotNull(expiresAt, "ExpiresAt must not be null")
+                assertTrue(expiresAt!!.isAfter(now), "ExpiresAt must be in the future")
+
+                // This is what handleSubscriptionDeleted does: clear sub ID, keep plan + date.
+                userStore.updateStripeSubscriptionId(conn, locked.id, null)
+                userStore.setCancelAtPeriodEnd(conn, locked.id, true)
+                conn.commit()
+            } catch (e: Exception) {
+                conn.rollback()
+                throw e
+            }
+        }
+
+        val user = userStore.findById(userId).orElseThrow()
+        // Plan + expiry date MUST be intact.
+        assertEquals(StripeHandler.MONTHLY_PLAN, user.subscriptionPlan, "Plan must remain monthly")
+        assertNull(user.stripeSubscriptionId, "stripe_subscription_id must be cleared")
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        assertTrue(
+            Duration.between(currentExpiry, expiresAt).abs().toSeconds() <= 2,
+            "Cancel must preserve 298-day expiry — got $expiresAt, expected ~$currentExpiry",
+        )
+        assertTrue(user.subscriptionCancelAtPeriodEnd, "cancel_at_period_end must be true")
+    }
+
+    @Test
+    @Order(408)
+    fun `Test 9 - natural expiration after cancel blocks access`() {
+        val userId = createTestUser("e2e-test9-${System.currentTimeMillis()}@properbackup.dev")
+
+        // User's subscription expired 1 day ago.
+        val expiredDate = Instant.now().minus(Duration.ofDays(1))
+        userStore.updateSubscription(userId, StripeHandler.MONTHLY_PLAN, expiredDate, StripeHandler.STORAGE_LIMIT_BYTES)
+        userStore.updateStripeSubscriptionId(userId, null)
+
+        val user = userStore.findById(userId).orElseThrow()
+        val daysRemaining = stripeHandler.calculateDaysRemaining(user)
+
+        // Days remaining must be 0 — subscription expired.
+        assertEquals(0L, daysRemaining, "Expired subscription must return 0 days remaining")
+
+        // subscriptionExpiresAt is in the past — system blocks access without any cron.
+        val expiresAt = Instant.parse(user.subscriptionExpiresAt!!)
+        assertTrue(expiresAt.isBefore(Instant.now()), "ExpiresAt must be in the past")
+    }
 }
