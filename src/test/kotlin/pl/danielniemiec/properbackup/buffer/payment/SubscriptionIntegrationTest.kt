@@ -20,6 +20,10 @@ import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Integration tests for the Subscription module.
@@ -478,8 +482,10 @@ class SubscriptionIntegrationTest {
 
     @Test
     @Order(38)
-    fun `mark promo code used enforces max_uses across distinct users (P1-5 race)`() {
+    fun `mark promo code used enforces max_uses across distinct users sequentially (P1-5)`() {
         // Code limited to max_uses=2. Three distinct users try to claim — only first two succeed.
+        // This is the deterministic, sequential version. The TRUE concurrent variant lives in
+        // `markPromoCodeUsed under TRUE parallel race…` below.
         db.getConnection().use { conn ->
             conn.prepareStatement(
                 """INSERT INTO promo_code (code, type, discount_percent, max_uses, used_count, active, created_at)
@@ -499,6 +505,63 @@ class SubscriptionIntegrationTest {
 
         val usedCount = currentUsedCount("LIMITED2")
         assertEquals(2, usedCount, "used_count must reflect exactly the number of successful claims")
+    }
+
+    @Test
+    @Order(40)
+    fun `markPromoCodeUsed under TRUE parallel race rejects everyone past max_uses (audit)`() {
+        // Sequential success/reject only proves the math. To prove the atomic
+        // UPDATE…WHERE used_count<max_uses is actually race-free we need real concurrency:
+        // N threads ALL parked on a CountDownLatch, released simultaneously, racing for the
+        // same promo. Expectation: exactly max_uses successes, the rest must come back FALSE,
+        // and the DB row's used_count must equal max_uses (never overshoot).
+        val code = "RACE-${System.currentTimeMillis()}"
+        val maxUses = 3
+        val threadCount = 10
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO promo_code (code, type, discount_percent, max_uses, used_count, active, created_at)
+                   VALUES (?, 'percentage', 25, ?, 0, TRUE, NOW())""",
+            ).use { ps ->
+                ps.setString(1, code)
+                ps.setInt(2, maxUses)
+                ps.executeUpdate()
+            }
+        }
+
+        val users = (1..threadCount).map { createTestUser("race-u$it-${System.currentTimeMillis()}@properbackup.dev") }
+        val start = CountDownLatch(1)
+        val done = CountDownLatch(threadCount)
+        val successes = AtomicInteger(0)
+        val rejections = AtomicInteger(0)
+        val pool = Executors.newFixedThreadPool(threadCount)
+        try {
+            users.forEachIndexed { idx, uid ->
+                pool.submit {
+                    try {
+                        // Block until the latch fires — gives JIT & DB time to warm so all
+                        // threads contend for the row as close to simultaneously as possible.
+                        start.await()
+                        val ok = promoCodeHandler.markPromoCodeUsed(code, uid, "cs_race_$idx")
+                        if (ok) successes.incrementAndGet() else rejections.incrementAndGet()
+                    } finally {
+                        done.countDown()
+                    }
+                }
+            }
+            // Release all threads at once.
+            start.countDown()
+            assertTrue(done.await(15, TimeUnit.SECONDS), "race test threads did not finish in 15s")
+        } finally {
+            pool.shutdownNow()
+        }
+
+        assertEquals(maxUses, successes.get(),
+            "exactly maxUses ($maxUses) threads must succeed; got ${successes.get()}")
+        assertEquals(threadCount - maxUses, rejections.get(),
+            "all remaining threads must be rejected atomically; got ${rejections.get()}")
+        assertEquals(maxUses, currentUsedCount(code),
+            "DB used_count must equal maxUses — no overshoot allowed under contention")
     }
 
     @Test
@@ -1247,6 +1310,69 @@ class SubscriptionIntegrationTest {
         val daysLeft = Duration.between(Instant.now(), Instant.parse(after.subscriptionExpiresAt!!)).toDays()
         // 10 existing + 30 new = 40 days (with rounding tolerance).
         assertTrue(daysLeft in 39..40, "gift duration must STACK, got $daysLeft (expected ~40)")
+    }
+
+    @Test
+    @Order(162)
+    fun `gift redeem on cancel_at_period_end=true sub is accepted and preserves cancel flag (audit)`() {
+        val freshUser = createTestUser("gift-cape-${System.currentTimeMillis()}@properbackup.dev")
+        // Active Stripe sub with 20 days remaining, but user has flagged cancel_at_period_end.
+        userStore.updateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, Instant.now().plus(Duration.ofDays(20)), 2199023255552L)
+        userStore.updateStripeSubscriptionId(freshUser, "sub_cancel_pending_${System.currentTimeMillis()}")
+        userStore.setCancelAtPeriodEnd(freshUser, true)
+
+        val giftCode = "GIFT-CAPE-${System.currentTimeMillis()}"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO gift_code (code, plan, duration_days, created_at)
+                   VALUES (?, 'monthly', 30, NOW())""",
+            ).use { ps -> ps.setString(1, giftCode); ps.executeUpdate() }
+        }
+
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"code": "$giftCode"}""")
+        giftCodeHandler.redeemGiftCode(ctx)
+
+        assertEquals(200, recorder.statusCode, "gift on cancel-at-period-end sub MUST be accepted")
+        val after = userStore.findById(freshUser).orElseThrow()
+        // Stripe sub id is left intact — Stripe will end the sub at its own period_end.
+        assertNotNull(after.stripeSubscriptionId, "Stripe subscription must not be cleared by gift redeem")
+        // Cancel flag MUST be preserved — otherwise Stripe would silently auto-renew & charge.
+        assertTrue(after.subscriptionCancelAtPeriodEnd,
+            "cancel_at_period_end MUST stay TRUE after gift redeem — otherwise Stripe would auto-renew & double-charge")
+        val daysLeft = Duration.between(Instant.now(), Instant.parse(after.subscriptionExpiresAt!!)).toDays()
+        // 20 (remaining Stripe period) + 30 (gift) = 50 days.
+        assertTrue(daysLeft in 49..50, "expiry must stack from current Stripe period, got $daysLeft (expected ~50)")
+    }
+
+    @Test
+    @Order(163)
+    fun `gift redeem on expired sub (stripeSubscriptionId leftover) treats as no-sub (audit)`() {
+        val freshUser = createTestUser("gift-expired-${System.currentTimeMillis()}@properbackup.dev")
+        // Orphan case: stripe sub id still on the row but Stripe period_end has already passed
+        // (DB out of sync — webhook lost, manual cleanup, etc.). Subscription is technically
+        // dead, so gift should land like a brand-new redeem.
+        userStore.updateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, Instant.now().minus(Duration.ofDays(3)), 2199023255552L)
+        userStore.updateStripeSubscriptionId(freshUser, "sub_dead_${System.currentTimeMillis()}")
+
+        val giftCode = "GIFT-DEAD-${System.currentTimeMillis()}"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO gift_code (code, plan, duration_days, created_at)
+                   VALUES (?, 'monthly', 30, NOW())""",
+            ).use { ps -> ps.setString(1, giftCode); ps.executeUpdate() }
+        }
+
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"code": "$giftCode"}""")
+        giftCodeHandler.redeemGiftCode(ctx)
+
+        assertEquals(200, recorder.statusCode, "expired sub must be treated as no-sub — gift accepted")
+        val after = userStore.findById(freshUser).orElseThrow()
+        val daysLeft = Duration.between(Instant.now(), Instant.parse(after.subscriptionExpiresAt!!)).toDays()
+        // Base = now (because expiry was in the past), + 30 day gift. NOT 30 - 3 = 27.
+        assertTrue(daysLeft in 29..30,
+            "expired stripe row must NOT extend backwards — gift counts from now, got $daysLeft (expected ~30)")
     }
 
     // ─────────────────────────────────────────────────────────────────────────

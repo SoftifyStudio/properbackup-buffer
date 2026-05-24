@@ -63,14 +63,34 @@ class GiftCodeHandler(
         val durationDays = (giftCode["duration_days"] as Number).toInt()
         val codeId = (giftCode["id"] as Number).toLong()
 
-        // Collision guard: refuse the gift if the user already has an ACTIVE Stripe
-        // subscription. Otherwise updateSubscription below would silently clobber the paid
-        // expiry/plan and the user would lose value (e.g. annual sub with 200 days → gift sub
-        // with 30 days). Forcing the user to first cancel their paid subscription keeps the
-        // accounting clean. NOTE: a trial (`subscription_plan == null`) is fine to replace,
-        // as it is free.
-        if (!u.stripeSubscriptionId.isNullOrBlank()) {
-            log.warn("Gift code redeem REJECTED: userId={} already has Stripe sub={} — must cancel first", userId, u.stripeSubscriptionId)
+        // Collision guard against Stripe-managed subscriptions. We have to triage by the
+        // subscription state, not just by `stripeSubscriptionId != null`, because the user may
+        // be in one of three meaningfully different states:
+        //
+        //   (a) Active + auto-renew on (`cancel_at_period_end == false`) → refuse 409. Letting
+        //       the gift land here would clobber `subscription_cancel_at_period_end` to FALSE
+        //       (per updateSubscription SQL) which silently re-activates a sub the user may
+        //       have just toggled off; worse, it overwrites a paid annual expiry with the
+        //       shorter gift expiry, losing value.
+        //
+        //   (b) Active + cancel-at-period-end (`cancel_at_period_end == true`) → ALLOW. The
+        //       user has already told us "do not renew on Stripe", they just want to keep
+        //       access past the Stripe period via gift. Stack the gift duration from
+        //       MAX(local_expiry, now) and preserve the cancel flag so Stripe is not
+        //       reactivated by the side-effect of updateSubscription.
+        //
+        //   (c) Expired (subscription_expires_at < now), even if stripeSubscriptionId is still
+        //       set on the row → treat as "no subscription". This handles the orphan case
+        //       where Stripe has already ended the period but our DB still holds the stale
+        //       sub id (Stripe webhook lost, manual cleanup, etc.). The gift stacks from now.
+        val now = Instant.now()
+        val currentExpiry = u.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        val localSubActive = currentExpiry?.isAfter(now) == true
+        val hasStripeSub = !u.stripeSubscriptionId.isNullOrBlank()
+        val cancelAtPeriodEnd = u.subscriptionCancelAtPeriodEnd
+
+        if (hasStripeSub && localSubActive && !cancelAtPeriodEnd) {
+            log.warn("Gift code redeem REJECTED: userId={} has ACTIVE auto-renewing Stripe sub={} — must cancel first", userId, u.stripeSubscriptionId)
             ctx.status(409).contentType("application/json").result(
                 gson.toJson(mapOf(
                     "error" to "active_paid_subscription",
@@ -90,16 +110,22 @@ class GiftCodeHandler(
             return
         }
 
-        // Stack the gift duration on top of any REMAINING gift/manual subscription window.
-        // The previous behaviour replaced the entire expiry which silently swallowed leftover
-        // days from earlier gift redemptions. Now: if current expiry is still in the future
-        // and not Stripe-managed (already gated above), extend from there.
-        val now = Instant.now()
+        // Stack the gift duration. Base = future local expiry if any, otherwise now. This
+        // works for (b) cancel-at-period-end and (c) expired alike.
         val durationSeconds = durationDays.toLong() * 24 * 60 * 60
-        val currentExpiry = u.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        val baseTime = if (currentExpiry != null && currentExpiry.isAfter(now)) currentExpiry else now
+        val baseTime = if (localSubActive) currentExpiry!! else now
         val expiresAt = baseTime.plusSeconds(durationSeconds)
         userStore.updateSubscription(userId, plan, expiresAt, STORAGE_LIMIT_BYTES)
+
+        // updateSubscription always sets subscription_cancel_at_period_end = FALSE. In case
+        // (b) we must reinstate the cancel flag immediately so Stripe is NOT silently
+        // reactivated by the gift redeem side-effect — the user explicitly opted out of
+        // auto-renew. Stripe subscription itself is left untouched (it will end at its own
+        // period_end as the user already configured); the gift simply extends our local
+        // access boundary.
+        if (hasStripeSub && cancelAtPeriodEnd) {
+            userStore.setCancelAtPeriodEnd(userId, true)
+        }
 
         log.info(
             "Gift code REDEEMED: code={} userId={} email={} plan={} durationDays={} subscriptionExpiresAt={}",
