@@ -51,10 +51,14 @@ class StorageQuotaGuardIntegrationTest {
         }
     }
 
+    // Storage quota math is the focus of this suite; subscription gating is exercised by
+    // SubscriptionIntegrationTest. Each test user is created with an active 30-day trial so
+    // the new `subscriptionInactive` short-circuit in StorageQuotaGuard does not interfere
+    // with the math we care about here.
     private fun createUser(userId: String, storageLimitBytes: Long) {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO users (id, email, bcrypt_hash, created_at, storage_limit_bytes) VALUES (?, ?, 'hash', NOW(), ?)",
+                "INSERT INTO users (id, email, bcrypt_hash, created_at, storage_limit_bytes, trial_expires_at) VALUES (?, ?, 'hash', NOW(), ?, NOW() + INTERVAL '30 days')",
             ).use { ps ->
                 ps.setString(1, userId)
                 ps.setString(2, "$userId@test.com")

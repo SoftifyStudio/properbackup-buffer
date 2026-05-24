@@ -176,6 +176,24 @@ class PromoCodeHandler(
         }
     }
 
+    /**
+     * Re-validates a promo code at checkout time (server-side guard against the validate→checkout
+     * race). Returns `null` when the code is still valid for this user, otherwise a structured
+     * reason string the API can pass through to the UI.
+     *
+     * Caller is expected to abort the checkout with HTTP 410 + the reason, so the user re-applies
+     * a fresh promo instead of getting silently charged full price.
+     */
+    fun validateForCheckout(code: String, userId: String): String? {
+        val normalized = code.trim().uppercase()
+        if (normalized.isBlank()) return "code_required"
+        val promo = findValidPromoCode(normalized) ?: return "not_found_or_expired"
+        val type = promo["type"] as String
+        if (type == "first_order" && userHadSubscription(userId)) return "not_eligible_first_order"
+        if (type == "one_time" && userAlreadyUsedCode(promo["id"] as Long, userId)) return "already_used_by_user"
+        return null
+    }
+
     // ---- Admin CRUD ----
 
     fun listPromoCodes(ctx: Context) {
@@ -265,21 +283,37 @@ class PromoCodeHandler(
         val maxUses = (body["maxUses"] as? Number)?.toInt()
         val expiresAt = (body["expiresAt"] as? String)?.let { Instant.parse(it) }
 
+        // Parameterized UPDATE — see P3-13 in the audit. Previously the SET fragments were built
+        // via string interpolation (e.g. "active = $active"). Even though the values came through
+        // typed parsing (Boolean/Int/Instant), mixing data into SQL text is a bad-habit smell;
+        // any future refactor that loosens the parsing would create an SQL-injection sink.
+        // Build the fragments with placeholders and bind everything via PreparedStatement.
+        val fragments = mutableListOf<String>()
+        val binders = mutableListOf<(java.sql.PreparedStatement, Int) -> Unit>()
+        if (active != null) {
+            fragments.add("active = ?")
+            binders.add { ps, i -> ps.setBoolean(i, active) }
+        }
+        if (maxUses != null) {
+            fragments.add("max_uses = ?")
+            binders.add { ps, i -> ps.setInt(i, maxUses) }
+        }
+        if (expiresAt != null) {
+            fragments.add("expires_at = ?")
+            binders.add { ps, i -> ps.setTimestamp(i, Timestamp.from(expiresAt)) }
+        }
+
+        if (fragments.isEmpty()) {
+            ctx.status(400).result("Nothing to update")
+            return
+        }
+
         db.getConnection().use { conn ->
-            val updates = mutableListOf<String>()
-            if (active != null) updates.add("active = $active")
-            if (maxUses != null) updates.add("max_uses = $maxUses")
-            if (expiresAt != null) updates.add("expires_at = '${Timestamp.from(expiresAt)}'")
-
-            if (updates.isEmpty()) {
-                ctx.status(400).result("Nothing to update")
-                return
-            }
-
             conn.prepareStatement(
-                "UPDATE promo_code SET ${updates.joinToString(", ")} WHERE id = ?",
+                "UPDATE promo_code SET ${fragments.joinToString(", ")} WHERE id = ?",
             ).use { ps ->
-                ps.setLong(1, id)
+                binders.forEachIndexed { idx, bind -> bind(ps, idx + 1) }
+                ps.setLong(fragments.size + 1, id)
                 val rows = ps.executeUpdate()
                 if (rows == 0) {
                     ctx.status(404).result("Not found")

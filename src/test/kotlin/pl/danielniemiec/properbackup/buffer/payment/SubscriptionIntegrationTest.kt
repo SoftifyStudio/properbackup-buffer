@@ -1,5 +1,8 @@
 package pl.danielniemiec.properbackup.buffer.payment
 
+import io.javalin.http.Context
+import io.mockk.every
+import io.mockk.mockk
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeAll
@@ -13,6 +16,7 @@ import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
+import pl.danielniemiec.properbackup.buffer.flush.StorageQuotaGuard
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
@@ -43,6 +47,7 @@ class SubscriptionIntegrationTest {
         private lateinit var userStore: UserStore
         private lateinit var promoCodeHandler: PromoCodeHandler
         private lateinit var stripeHandler: StripeHandler
+        private lateinit var giftCodeHandler: GiftCodeHandler
 
         private val testUserId = UUID.randomUUID().toString()
         private const val TEST_EMAIL = "test-sub@properbackup.dev"
@@ -63,6 +68,7 @@ class SubscriptionIntegrationTest {
                 stripeWebhookSecretOverride = "",
                 panelUrlOverride = "http://localhost:5175",
             )
+            giftCodeHandler = GiftCodeHandler(db, userStore)
         }
 
         @AfterAll
@@ -892,5 +898,596 @@ class SubscriptionIntegrationTest {
         val after = userStore.findById(freshUser).orElseThrow()
         assertTrue(after.everSubscribed, "activateSubscription must persist ever_subscribed=TRUE")
         assertEquals(StripeHandler.MONTHLY_PLAN, after.subscriptionPlan)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2-7: idempotency-key on createCheckoutSession
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(100)
+    fun `checkout idempotency-key is deterministic within a time bucket (P2-7)`() {
+        val now = 1_700_000_000L
+        val a = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1900L, null, now, 30L)
+        val b = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1900L, null, now + 5, 30L)
+        assertEquals(a, b, "same bucket must produce same key — Stripe needs this to dedupe sessions")
+    }
+
+    @Test
+    @Order(101)
+    fun `checkout idempotency-key differs across users plans promo amounts (P2-7)`() {
+        val now = 1_700_000_000L
+        val base = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1900L, null, now)
+        val differentUser = StripeHandler.checkoutIdempotencyKey("u2", "monthly", 1900L, null, now)
+        val differentPlan = StripeHandler.checkoutIdempotencyKey("u1", "annual", 1900L, null, now)
+        val differentPrice = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1500L, null, now)
+        val differentPromo = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1900L, "SAVE20", now)
+
+        assertNotEquals(base, differentUser, "different user must produce different key")
+        assertNotEquals(base, differentPlan, "different plan must produce different key")
+        assertNotEquals(base, differentPrice, "different base price must produce different key")
+        assertNotEquals(base, differentPromo, "different promo must produce different key")
+    }
+
+    @Test
+    @Order(102)
+    fun `checkout idempotency-key differs across time buckets (P2-7)`() {
+        val now = 1_700_000_000L
+        val a = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1900L, null, now, 30L)
+        val b = StripeHandler.checkoutIdempotencyKey("u1", "monthly", 1900L, null, now + 60, 30L)
+        assertNotEquals(a, b, "next time bucket must produce a different key — user retries after a minute should not be blocked")
+    }
+
+    @Test
+    @Order(103)
+    fun `checkout idempotency-key is short enough for Stripe header (P2-7)`() {
+        val key = StripeHandler.checkoutIdempotencyKey("user-uuid-1234567890-very-long", "monthly", 1900L, "BLACKFRIDAY50", 1_700_000_000L)
+        // Stripe limits Idempotency-Key header values to 255 chars; we generate <= 64.
+        assertTrue(key.length in 8..64, "idempotency key length must be in (8, 64), got ${key.length}")
+        assertTrue(key.matches(Regex("[a-f0-9]+")), "must be hex digest, got '$key'")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2-9: activateSubscription uses Stripe current_period_end (not 31/365)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(110)
+    fun `activateSubscription uses provided stripePeriodEnd exactly (P2-9)`() {
+        val freshUser = createTestUser("period-end-${System.currentTimeMillis()}@properbackup.dev")
+        // Pick an odd timestamp that does NOT correspond to either 31 days or 365 days from now.
+        // This way if the old hardcoded fallback ran, we'd see a very different value.
+        val stripePeriodEnd = Instant.parse("2099-06-15T12:34:56Z")
+
+        stripeHandler.activateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, stripePeriodEnd)
+
+        val after = userStore.findById(freshUser).orElseThrow()
+        val recorded = Instant.parse(after.subscriptionExpiresAt!!)
+        // PostgreSQL TIMESTAMP truncates at microseconds; tolerate ≤1s drift in either direction.
+        val drift = Duration.between(stripePeriodEnd, recorded).abs().toSeconds()
+        assertTrue(drift <= 1, "DB expiry must equal Stripe period_end (drift=${drift}s, got $recorded)")
+    }
+
+    @Test
+    @Order(111)
+    fun `activateSubscription without stripePeriodEnd falls back to 31 day stack (P2-9)`() {
+        val freshUser = createTestUser("fallback-${System.currentTimeMillis()}@properbackup.dev")
+        val before = Instant.now()
+        stripeHandler.activateSubscription(freshUser, StripeHandler.MONTHLY_PLAN)
+
+        val after = userStore.findById(freshUser).orElseThrow()
+        val recorded = Instant.parse(after.subscriptionExpiresAt!!)
+        val daysAdded = Duration.between(before, recorded).toDays()
+        assertTrue(daysAdded in 30..31, "fallback must add ~31 days, got $daysAdded")
+    }
+
+    @Test
+    @Order(112)
+    fun `activateSubscription annual fallback adds 365 days (P2-9)`() {
+        val freshUser = createTestUser("annual-fallback-${System.currentTimeMillis()}@properbackup.dev")
+        val before = Instant.now()
+        stripeHandler.activateSubscription(freshUser, StripeHandler.ANNUAL_PLAN)
+
+        val after = userStore.findById(freshUser).orElseThrow()
+        val recorded = Instant.parse(after.subscriptionExpiresAt!!)
+        val daysAdded = Duration.between(before, recorded).toDays()
+        assertTrue(daysAdded in 364..365, "annual fallback must add ~365 days, got $daysAdded")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2-12: reactivate fallback when subscription has already expired
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(120)
+    fun `reactivate on locally-expired DB row returns 409 expired_must_recheckout (P2-12)`() {
+        val freshUser = createTestUser("expired-reactivate-${System.currentTimeMillis()}@properbackup.dev")
+        // Plant an EXPIRED subscription row in DB.
+        val expiredAt = Instant.now().minus(Duration.ofDays(1))
+        userStore.updateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, expiredAt, 2199023255552L)
+        userStore.updateStripeSubscriptionId(freshUser, "sub_already_dead")
+
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser)
+        stripeHandler.reactivateSubscription(ctx)
+
+        assertEquals(409, recorder.statusCode, "expired subscription must return 409 so the frontend redirects to checkout")
+        val body = recorder.bodyAsMap()
+        assertEquals("expired_must_recheckout", body["error"])
+    }
+
+    @Test
+    @Order(121)
+    fun `reactivate without any subscription returns no_active_subscription (P2-12)`() {
+        val freshUser = createTestUser("no-sub-reactivate-${System.currentTimeMillis()}@properbackup.dev")
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser)
+        stripeHandler.reactivateSubscription(ctx)
+        assertEquals(400, recorder.statusCode)
+        assertEquals("no_active_subscription", recorder.bodyAsMap()["error"])
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P3-13: PromoCodeHandler.updatePromoCode uses prepared statements only
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(130)
+    fun `updatePromoCode binds active maxUses expiresAt as parameters (P3-13)`() {
+        // Insert a promo we'll update by id.
+        val initialMaxUses = 5
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO promo_code (code, type, discount_percent, max_uses, used_count, active, created_at)
+                   VALUES ('UPDATEME', 'percentage', 10, $initialMaxUses, 0, TRUE, NOW())
+                   ON CONFLICT (code) DO UPDATE SET max_uses = $initialMaxUses, active = TRUE""",
+            ).use { it.executeUpdate() }
+        }
+        val id = db.getConnection().use { conn ->
+            conn.prepareStatement("SELECT id FROM promo_code WHERE code = 'UPDATEME'").use { ps ->
+                ps.executeQuery().use { rs -> if (rs.next()) rs.getLong("id") else error("missing promo") }
+            }
+        }
+
+        // Inputs include characters that would have escaped a string-concatenated SQL fragment.
+        val newExpiresAt = Instant.parse("2099-12-31T23:59:59Z")
+        val body = mapOf(
+            "active" to false,
+            "maxUses" to 99,
+            "expiresAt" to newExpiresAt.toString(),
+        )
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(
+            recorder,
+            userId = "admin-user",
+            body = com.google.gson.Gson().toJson(body),
+            pathParams = mapOf("id" to id.toString()),
+            isAdmin = true,
+        )
+        promoCodeHandler.updatePromoCode(ctx)
+        assertEquals(200, recorder.statusCode)
+
+        // Verify the bound values landed and no SQL injection happened.
+        val (active, maxUses, expiresAt) = db.getConnection().use { conn ->
+            conn.prepareStatement("SELECT active, max_uses, expires_at FROM promo_code WHERE id = ?").use { ps ->
+                ps.setLong(1, id)
+                ps.executeQuery().use { rs ->
+                    rs.next()
+                    Triple(rs.getBoolean("active"), rs.getInt("max_uses"), rs.getTimestamp("expires_at").toInstant())
+                }
+            }
+        }
+        assertFalse(active, "active must be set to false via prepared statement")
+        assertEquals(99, maxUses)
+        assertEquals(newExpiresAt, expiresAt.truncatedTo(java.time.temporal.ChronoUnit.SECONDS))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // NEW: customer.balance surfacing in /account/subscription
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(140)
+    fun `getCustomerBalanceCreditGrosze returns 0 when stripe not configured (NEW)`() {
+        // Our test handler is instantiated with stripeSecretKeyOverride="", so any call must
+        // short-circuit to 0 rather than throw or hit Stripe.
+        val credit = stripeHandler.getCustomerBalanceCreditGrosze(testUserId)
+        assertEquals(0L, credit, "blank Stripe key must yield 0 credit (informational field, never blocking)")
+    }
+
+    @Test
+    @Order(141)
+    fun `getCustomerBalanceCreditGrosze returns 0 when user has no stripe customer (NEW)`() {
+        val freshUser = createTestUser("no-stripe-customer-${System.currentTimeMillis()}@properbackup.dev")
+        val credit = stripeHandler.getCustomerBalanceCreditGrosze(freshUser)
+        assertEquals(0L, credit, "user with no stripe_customer_id must yield 0 credit")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2-8: cancelSubscriptionImmediate (proportional refund)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(150)
+    fun `cancelImmediate without confirm flag returns confirmation_required (P2-8)`() {
+        val freshUser = createTestUser("cancel-immediate-noconfirm-${System.currentTimeMillis()}@properbackup.dev")
+        userStore.updateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, Instant.now().plus(Duration.ofDays(15)), 2199023255552L)
+
+        val recorder = ResponseRecorder()
+        // No "confirm" key in body.
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"confirm": false}""")
+        stripeHandler.cancelSubscriptionImmediate(ctx)
+
+        assertEquals(400, recorder.statusCode)
+        assertEquals("confirmation_required", recorder.bodyAsMap()["error"])
+
+        // DB must NOT have been mutated.
+        val after = userStore.findById(freshUser).orElseThrow()
+        assertEquals(StripeHandler.MONTHLY_PLAN, after.subscriptionPlan, "no confirm → no deactivation")
+    }
+
+    @Test
+    @Order(151)
+    fun `cancelImmediate without active subscription returns no_active_subscription (P2-8)`() {
+        val freshUser = createTestUser("cancel-immediate-nosub-${System.currentTimeMillis()}@properbackup.dev")
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"confirm": true}""")
+        stripeHandler.cancelSubscriptionImmediate(ctx)
+        assertEquals(400, recorder.statusCode)
+        assertEquals("no_active_subscription", recorder.bodyAsMap()["error"])
+    }
+
+    @Test
+    @Order(152)
+    fun `cancelImmediate deactivates subscription and returns prorated refund amount (P2-8)`() {
+        val freshUser = createTestUser("cancel-immediate-ok-${System.currentTimeMillis()}@properbackup.dev")
+        val daysRemaining = 15L
+        // 15 days remaining on the monthly plan → expected refund = 1900 * 15 / 31 = 919 grosze
+        val expiresAt = Instant.now().plus(Duration.ofDays(daysRemaining))
+        userStore.updateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, expiresAt, 2199023255552L)
+
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"confirm": true}""")
+        stripeHandler.cancelSubscriptionImmediate(ctx)
+
+        assertEquals(200, recorder.statusCode)
+        val body = recorder.bodyAsMap()
+        assertEquals("cancelled_immediate", body["status"])
+        // Stripe path is skipped (no key), so refund/balance pieces are 0 — but the user MUST
+        // still be deactivated locally and the response MUST report the would-be refund value
+        // for accounting/audit. We assert daysRemaining is in (14, 15).
+        val days = (body["daysRemaining"] as Number).toLong()
+        assertTrue(days in 14L..15L, "expected daysRemaining ≈ 15, got $days")
+
+        // DB-side deactivation.
+        val after = userStore.findById(freshUser).orElseThrow()
+        assertNull(after.subscriptionPlan, "subscription_plan must be cleared")
+        assertNull(after.subscriptionExpiresAt, "subscription_expires_at must be cleared")
+    }
+
+    @Test
+    @Order(153)
+    fun `cancelImmediate refund formula matches calculateProratedDiscount (P2-8)`() {
+        // Math sanity: the refund we promise == the prorated value of the unused window.
+        // For annual plan with 200 days remaining:
+        //   remainingValue = 19000 * 200 / 365 = 10410 grosze (104.10 PLN)
+        val (refund, overflow) = StripeHandler.calculateProratedDiscount(
+            currentPlan = StripeHandler.ANNUAL_PLAN,
+            daysRemaining = 200L,
+            newPlanBaseGrosze = Long.MAX_VALUE,
+            newPlanTotalDays = StripeHandler.ANNUAL_TOTAL_DAYS,
+        )
+        assertEquals(0L, overflow, "with MAX_VALUE cap there must be no overflow — refund == full remaining value")
+        // 19000 * 200 / 365 = 10410
+        assertEquals(10410L, refund, "annual 200d refund formula drifted: got $refund grosze")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GiftCode collision with paid Stripe subscription (audit finding)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(160)
+    fun `gift code redeem on stripe-subscribed user is rejected (audit)`() {
+        val freshUser = createTestUser("gift-collision-${System.currentTimeMillis()}@properbackup.dev")
+        // Pretend the user already has a paid Stripe sub with 200 days remaining.
+        userStore.updateSubscription(freshUser, StripeHandler.ANNUAL_PLAN, Instant.now().plus(Duration.ofDays(200)), 2199023255552L)
+        userStore.updateStripeSubscriptionId(freshUser, "sub_active_annual")
+
+        // Seed a gift code.
+        val giftCode = "GIFT-${System.currentTimeMillis()}"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO gift_code (code, plan, duration_days, created_at)
+                   VALUES (?, 'monthly', 30, NOW())""",
+            ).use { ps ->
+                ps.setString(1, giftCode)
+                ps.executeUpdate()
+            }
+        }
+
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"code": "$giftCode"}""")
+        giftCodeHandler.redeemGiftCode(ctx)
+
+        assertEquals(409, recorder.statusCode, "must refuse to clobber paid Stripe sub with gift")
+        assertEquals("active_paid_subscription", recorder.bodyAsMap()["error"])
+
+        // Original Stripe sub is intact.
+        val after = userStore.findById(freshUser).orElseThrow()
+        assertEquals(StripeHandler.ANNUAL_PLAN, after.subscriptionPlan, "paid plan must NOT be overwritten")
+        val daysLeft = Duration.between(Instant.now(), Instant.parse(after.subscriptionExpiresAt!!)).toDays()
+        assertTrue(daysLeft in 199..200, "annual sub expiry must be untouched (got $daysLeft days)")
+    }
+
+    @Test
+    @Order(161)
+    fun `gift code redeem stacks on existing gift expiry (audit)`() {
+        val freshUser = createTestUser("gift-stack-${System.currentTimeMillis()}@properbackup.dev")
+        // Plant an existing gift-style subscription (no Stripe ID) with 10 days left.
+        userStore.updateSubscription(freshUser, "monthly", Instant.now().plus(Duration.ofDays(10)), 2199023255552L)
+
+        val giftCode = "GIFT-${System.currentTimeMillis()}-STACK"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO gift_code (code, plan, duration_days, created_at)
+                   VALUES (?, 'monthly', 30, NOW())""",
+            ).use { ps ->
+                ps.setString(1, giftCode)
+                ps.executeUpdate()
+            }
+        }
+
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, userId = freshUser, body = """{"code": "$giftCode"}""")
+        giftCodeHandler.redeemGiftCode(ctx)
+
+        assertEquals(200, recorder.statusCode)
+        val after = userStore.findById(freshUser).orElseThrow()
+        val daysLeft = Duration.between(Instant.now(), Instant.parse(after.subscriptionExpiresAt!!)).toDays()
+        // 10 existing + 30 new = 40 days (with rounding tolerance).
+        assertTrue(daysLeft in 39..40, "gift duration must STACK, got $daysLeft (expected ~40)")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PromoCodeHandler.validateForCheckout (audit — race fix)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(170)
+    fun `validateForCheckout returns reason for non-existent code (audit)`() {
+        val r = promoCodeHandler.validateForCheckout("DOES-NOT-EXIST", testUserId)
+        assertEquals("not_found_or_expired", r)
+    }
+
+    @Test
+    @Order(171)
+    fun `validateForCheckout returns reason for expired code (audit)`() {
+        // Seed an expired promo.
+        val code = "EXPIRED-${System.currentTimeMillis()}"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO promo_code (code, type, discount_percent, max_uses, used_count, active, expires_at, created_at)
+                   VALUES (?, 'percentage', 10, 100, 0, TRUE, NOW() - INTERVAL '1 day', NOW())""",
+            ).use { ps -> ps.setString(1, code); ps.executeUpdate() }
+        }
+        val r = promoCodeHandler.validateForCheckout(code, testUserId)
+        assertEquals("not_found_or_expired", r)
+    }
+
+    @Test
+    @Order(172)
+    fun `validateForCheckout returns reason when first_order user already subscribed (audit)`() {
+        val freshUser = createTestUser("promo-firstorder-${System.currentTimeMillis()}@properbackup.dev")
+        userStore.markEverSubscribed(freshUser)
+
+        val code = "FIRSTORDER-${System.currentTimeMillis()}"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO promo_code (code, type, discount_percent, max_uses, used_count, active, created_at)
+                   VALUES (?, 'first_order', 20, 1000, 0, TRUE, NOW())""",
+            ).use { ps -> ps.setString(1, code); ps.executeUpdate() }
+        }
+
+        val r = promoCodeHandler.validateForCheckout(code, freshUser)
+        assertEquals("not_eligible_first_order", r)
+    }
+
+    @Test
+    @Order(173)
+    fun `validateForCheckout returns null for valid percentage code (audit)`() {
+        val freshUser = createTestUser("promo-valid-${System.currentTimeMillis()}@properbackup.dev")
+        val code = "VALID-${System.currentTimeMillis()}"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO promo_code (code, type, discount_percent, max_uses, used_count, active, created_at)
+                   VALUES (?, 'percentage', 25, 1000, 0, TRUE, NOW())""",
+            ).use { ps -> ps.setString(1, code); ps.executeUpdate() }
+        }
+
+        val r = promoCodeHandler.validateForCheckout(code, freshUser)
+        assertNull(r, "valid promo for this user must return null reason")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test helpers — minimal Javalin Context mock and response recorder so we can
+    // exercise endpoint methods that take a real Context without spinning up Jetty.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private class ResponseRecorder {
+        var statusCode: Int = 200
+        var body: String = ""
+        var contentType: String? = null
+
+        fun bodyAsMap(): Map<String, Any?> {
+            @Suppress("UNCHECKED_CAST")
+            return com.google.gson.Gson().fromJson(body, Map::class.java) as Map<String, Any?>
+        }
+    }
+
+    private fun mockCtx(
+        recorder: ResponseRecorder,
+        userId: String? = null,
+        body: String = "",
+        pathParams: Map<String, String> = emptyMap(),
+        isAdmin: Boolean = false,
+        headers: Map<String, String?> = emptyMap(),
+    ): Context {
+        val ctx = mockk<Context>(relaxed = true)
+        every { ctx.attribute<String>("userId") } returns userId
+        every { ctx.attribute<Boolean>("isSystemAdmin") } returns isAdmin
+        every { ctx.body() } returns body
+        every { ctx.pathParam(any()) } answers { pathParams[firstArg<String>()] ?: "" }
+        every { ctx.header(any()) } answers { headers[firstArg<String>()] }
+        every { ctx.status(any<Int>()) } answers {
+            recorder.statusCode = firstArg()
+            ctx
+        }
+        every { ctx.result(any<String>()) } answers {
+            recorder.body = firstArg()
+            ctx
+        }
+        every { ctx.contentType(any<String>()) } answers {
+            recorder.contentType = firstArg()
+            ctx
+        }
+        every { ctx.header(any<String>(), any<String>()) } answers { ctx }
+        return ctx
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P1-2 / audit: HTTP-level handleWebhook signature checks
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(180)
+    fun `webhook with blank secret returns 503 fail-closed (P1-2)`() {
+        // The default test stripeHandler is created with stripeWebhookSecret = "".
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, body = """{"id":"evt_test","type":"checkout.session.completed"}""")
+        stripeHandler.handleWebhook(ctx)
+        assertEquals(503, recorder.statusCode, "must fail-closed when STRIPE_WEBHOOK_SECRET is not configured")
+    }
+
+    @Test
+    @Order(181)
+    fun `webhook missing Stripe-Signature header returns 400 (audit)`() {
+        // New handler with a non-blank secret so we hit the signature path.
+        val handler = StripeHandler(
+            db, userStore, promoCodeHandler,
+            stripeModeOverride = "test",
+            stripeSecretKeyOverride = "",
+            stripeWebhookSecretOverride = "whsec_test_secret_${System.currentTimeMillis()}",
+            panelUrlOverride = "http://localhost:5175",
+        )
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, body = """{"id":"evt_test","type":"checkout.session.completed"}""")
+        handler.handleWebhook(ctx)
+        assertEquals(400, recorder.statusCode)
+    }
+
+    @Test
+    @Order(182)
+    fun `webhook with tampered signature returns 400 (audit)`() {
+        val secret = "whsec_test_${System.currentTimeMillis()}"
+        val handler = StripeHandler(
+            db, userStore, promoCodeHandler,
+            stripeModeOverride = "test",
+            stripeSecretKeyOverride = "",
+            stripeWebhookSecretOverride = secret,
+            panelUrlOverride = "http://localhost:5175",
+        )
+        val payload = """{"id":"evt_tampered","type":"checkout.session.completed"}"""
+        // Compute a signature with the WRONG secret to simulate an attacker.
+        val sig = stripeSignatureHeader(payload, "different_secret_${System.currentTimeMillis()}", System.currentTimeMillis() / 1000)
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, body = payload, headers = mapOf("Stripe-Signature" to sig))
+        handler.handleWebhook(ctx)
+        assertEquals(400, recorder.statusCode, "tampered signature must yield 400")
+    }
+
+    @Test
+    @Order(183)
+    fun `webhook with valid signature is accepted (audit)`() {
+        val secret = "whsec_test_valid_${System.currentTimeMillis()}"
+        val handler = StripeHandler(
+            db, userStore, promoCodeHandler,
+            stripeModeOverride = "test",
+            stripeSecretKeyOverride = "",
+            stripeWebhookSecretOverride = secret,
+            panelUrlOverride = "http://localhost:5175",
+        )
+        // Build a minimal but parseable Stripe event payload.
+        val eventId = "evt_valid_${System.currentTimeMillis()}"
+        val payload = """{"id":"$eventId","object":"event","type":"customer.subscription.updated","data":{"object":{}}}"""
+        val ts = System.currentTimeMillis() / 1000
+        val sig = stripeSignatureHeader(payload, secret, ts)
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, body = payload, headers = mapOf("Stripe-Signature" to sig))
+        handler.handleWebhook(ctx)
+        assertEquals(200, recorder.statusCode, "valid signature must yield 200, got body=${recorder.body}")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // StorageQuotaGuard vs expired subscription (audit)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @Order(190)
+    fun `StorageQuotaGuard blocks upload when both subscription AND trial expired (audit)`() {
+        val freshUser = createTestUser("storage-expired-${System.currentTimeMillis()}@properbackup.dev")
+        // Trial already over.
+        db.getConnection().use { conn ->
+            conn.prepareStatement("UPDATE users SET trial_expires_at = NOW() - INTERVAL '7 days' WHERE id = ?")
+                .use { ps -> ps.setString(1, freshUser); ps.executeUpdate() }
+        }
+        // Subscription clear (no plan, no expiry).
+        userStore.deactivateSubscription(freshUser)
+
+        val guard = StorageQuotaGuard(db, userStore)
+        val q = guard.checkQuota(freshUser)
+        assertTrue(q.subscriptionInactive, "expired-user state must flag subscriptionInactive=true")
+        assertFalse(guard.canUpload(freshUser, 1024L), "expired-user upload must be REFUSED")
+    }
+
+    @Test
+    @Order(191)
+    fun `StorageQuotaGuard permits upload while trial is still active (audit)`() {
+        val freshUser = createTestUser("storage-trial-${System.currentTimeMillis()}@properbackup.dev")
+        // Active trial (30 days from now).
+        db.getConnection().use { conn ->
+            conn.prepareStatement("UPDATE users SET trial_expires_at = NOW() + INTERVAL '30 days' WHERE id = ?")
+                .use { ps -> ps.setString(1, freshUser); ps.executeUpdate() }
+        }
+        val guard = StorageQuotaGuard(db, userStore)
+        val q = guard.checkQuota(freshUser)
+        assertFalse(q.subscriptionInactive)
+        assertTrue(guard.canUpload(freshUser, 1024L))
+    }
+
+    @Test
+    @Order(192)
+    fun `StorageQuotaGuard permits upload with active paid subscription (audit)`() {
+        val freshUser = createTestUser("storage-paid-${System.currentTimeMillis()}@properbackup.dev")
+        // Active paid subscription, but trial already expired.
+        userStore.updateSubscription(freshUser, StripeHandler.MONTHLY_PLAN, Instant.now().plus(Duration.ofDays(30)), 2199023255552L)
+        db.getConnection().use { conn ->
+            conn.prepareStatement("UPDATE users SET trial_expires_at = NOW() - INTERVAL '30 days' WHERE id = ?")
+                .use { ps -> ps.setString(1, freshUser); ps.executeUpdate() }
+        }
+        val guard = StorageQuotaGuard(db, userStore)
+        val q = guard.checkQuota(freshUser)
+        assertFalse(q.subscriptionInactive)
+        assertTrue(guard.canUpload(freshUser, 1024L))
+    }
+
+    /** Build a Stripe-Signature header value with `t=<ts>,v1=<hmac>`. */
+    private fun stripeSignatureHeader(payload: String, secret: String, ts: Long): String {
+        val signedPayload = "$ts.$payload"
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        val hex = mac.doFinal(signedPayload.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return "t=$ts,v1=$hex"
     }
 }

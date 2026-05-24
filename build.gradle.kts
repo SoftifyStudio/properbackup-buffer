@@ -30,6 +30,7 @@ dependencies {
     testImplementation("org.testcontainers:testcontainers:1.19.8")
     testImplementation("org.testcontainers:junit-jupiter:1.19.8")
     testImplementation("org.testcontainers:postgresql:1.19.8")
+    testImplementation("io.mockk:mockk:1.13.10")
 }
 
 tasks.test {

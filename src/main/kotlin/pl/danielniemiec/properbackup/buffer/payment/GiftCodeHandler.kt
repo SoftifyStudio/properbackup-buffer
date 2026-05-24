@@ -57,10 +57,29 @@ class GiftCodeHandler(
             return
         }
 
-        val email = user.get().email
+        val u = user.get()
+        val email = u.email
         val plan = giftCode["plan"] as String
         val durationDays = (giftCode["duration_days"] as Number).toInt()
         val codeId = (giftCode["id"] as Number).toLong()
+
+        // Collision guard: refuse the gift if the user already has an ACTIVE Stripe
+        // subscription. Otherwise updateSubscription below would silently clobber the paid
+        // expiry/plan and the user would lose value (e.g. annual sub with 200 days → gift sub
+        // with 30 days). Forcing the user to first cancel their paid subscription keeps the
+        // accounting clean. NOTE: a trial (`subscription_plan == null`) is fine to replace,
+        // as it is free.
+        if (!u.stripeSubscriptionId.isNullOrBlank()) {
+            log.warn("Gift code redeem REJECTED: userId={} already has Stripe sub={} — must cancel first", userId, u.stripeSubscriptionId)
+            ctx.status(409).contentType("application/json").result(
+                gson.toJson(mapOf(
+                    "error" to "active_paid_subscription",
+                    "message" to "You already have an active paid subscription. Cancel it first to redeem this gift code.",
+                    "stripeSubscriptionId" to u.stripeSubscriptionId,
+                )),
+            )
+            return
+        }
 
         val redeemed = markCodeRedeemed(codeId, userId, email)
         if (!redeemed) {
@@ -71,8 +90,15 @@ class GiftCodeHandler(
             return
         }
 
+        // Stack the gift duration on top of any REMAINING gift/manual subscription window.
+        // The previous behaviour replaced the entire expiry which silently swallowed leftover
+        // days from earlier gift redemptions. Now: if current expiry is still in the future
+        // and not Stripe-managed (already gated above), extend from there.
+        val now = Instant.now()
         val durationSeconds = durationDays.toLong() * 24 * 60 * 60
-        val expiresAt = Instant.now().plusSeconds(durationSeconds)
+        val currentExpiry = u.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        val baseTime = if (currentExpiry != null && currentExpiry.isAfter(now)) currentExpiry else now
+        val expiresAt = baseTime.plusSeconds(durationSeconds)
         userStore.updateSubscription(userId, plan, expiresAt, STORAGE_LIMIT_BYTES)
 
         log.info(

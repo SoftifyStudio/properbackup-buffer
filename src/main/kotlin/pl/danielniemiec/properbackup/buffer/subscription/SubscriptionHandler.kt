@@ -16,12 +16,15 @@ class SubscriptionHandler(
     private val gson = Gson()
 
     companion object {
+        // Legacy LemonSqueezy plans (no longer surfaced in /account/subscription — see
+        // P3-14 in the audit). The constants remain because LemonSqueezyHandler still
+        // references them for backwards-compatible webhook processing of any pre-Stripe
+        // customers. New customers always go through Stripe (monthly/annual).
         const val PLAN_HOBBY = "hobby"
         const val PLAN_PRO = "pro"
-        const val HOBBY_PRICE_USD = 49
-        const val PRO_PRICE_USD = 129
         const val HOBBY_STORAGE_BYTES = 2199023255552L   // 2 TB
         const val PRO_STORAGE_BYTES = 5497558138880L     // 5 TB
+
         const val TRIAL_DAYS = 30
         val NOTIFICATION_THRESHOLDS = listOf(14, 7, 2, 1)
     }
@@ -33,6 +36,11 @@ class SubscriptionHandler(
             ctx.status(401).result("User not found")
             return
         }
+
+        // No HTTP-level caching — this endpoint is the source-of-truth UI sees for current
+        // plan/balance/days-remaining; any cached response could mislead the user (P2-10).
+        ctx.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        ctx.header("Pragma", "no-cache")
 
         val now = Instant.now()
         val trialExpiresAt = user.trialExpiresAt?.let { Instant.parse(it) }
@@ -93,6 +101,12 @@ class SubscriptionHandler(
         val (monthlyNetGrosze, monthlyVatGrosze) = StripeHandler.decomposeGross(monthlyPriceGrosze, vatRate)
         val (annualNetGrosze, annualVatGrosze) = StripeHandler.decomposeGross(annualPriceGrosze, vatRate)
 
+        // Stripe customer.balance — credit accumulated from earlier downgrades or manual
+        // adjustments in the dashboard. Stripe auto-applies this to the next invoice; we expose
+        // it so the UI can show "Twój kredyt: X PLN" instead of the user finding out via the
+        // Stripe-hosted invoice. Resolved out of Stripe; 0 if not available.
+        val customerBalanceCreditGrosze = stripeHandler?.getCustomerBalanceCreditGrosze(userId) ?: 0L
+
         ctx.contentType("application/json").result(
             gson.toJson(
                 mapOf(
@@ -112,6 +126,7 @@ class SubscriptionHandler(
                     "storageExceeded" to (quotaStatus?.exceeded ?: false),
                     "vatRate" to vatRate,
                     "stripeMode" to (stripeHandler?.getStripeMode() ?: "test"),
+                    "customerBalanceCreditGrosze" to customerBalanceCreditGrosze,
                     "pricing" to mapOf(
                         "monthly" to mapOf(
                             "basePriceGrosze" to monthlyPriceGrosze,
@@ -128,22 +143,6 @@ class SubscriptionHandler(
                             "proratedDiscountGrosze" to annualProratedGrosze,
                             "overflowCreditGrosze" to annualOverflowGrosze,
                             "totalDays" to StripeHandler.ANNUAL_TOTAL_DAYS,
-                        ),
-                    ),
-                    "plans" to listOf(
-                        mapOf(
-                            "id" to PLAN_HOBBY,
-                            "name" to "Hobby",
-                            "priceUsd" to HOBBY_PRICE_USD,
-                            "storageLimitBytes" to HOBBY_STORAGE_BYTES,
-                            "storageLimitLabel" to "2 TB",
-                        ),
-                        mapOf(
-                            "id" to PLAN_PRO,
-                            "name" to "Pro",
-                            "priceUsd" to PRO_PRICE_USD,
-                            "storageLimitBytes" to PRO_STORAGE_BYTES,
-                            "storageLimitLabel" to "5 TB",
                         ),
                     ),
                 ),

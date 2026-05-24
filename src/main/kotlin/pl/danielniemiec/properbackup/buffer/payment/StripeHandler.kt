@@ -8,15 +8,19 @@ import com.stripe.model.Event
 import com.stripe.model.Invoice
 import com.stripe.model.Price
 import com.stripe.model.Product
+import com.stripe.model.Refund
 import com.stripe.model.Subscription
 import com.stripe.model.checkout.Session
+import com.stripe.net.RequestOptions
 import com.stripe.net.Webhook
 import com.stripe.param.CustomerCreateParams
 import com.stripe.param.CustomerListPaymentMethodsParams
+import com.stripe.param.InvoiceListParams
 import com.stripe.param.PriceCreateParams
 import com.stripe.param.PriceListParams
 import com.stripe.param.ProductCreateParams
 import com.stripe.param.ProductListParams
+import com.stripe.param.RefundCreateParams
 import com.stripe.param.SubscriptionUpdateParams
 import com.stripe.param.checkout.SessionCreateParams
 import io.javalin.http.Context
@@ -99,6 +103,33 @@ class StripeHandler(
             val capped = minOf(newPlanBaseGrosze, remainingValueGrosze)
             val overflow = if (remainingValueGrosze > newPlanBaseGrosze) remainingValueGrosze - newPlanBaseGrosze else 0L
             return capped to overflow
+        }
+
+        /**
+         * Generate a deterministic Stripe idempotency key for a checkout session.
+         *
+         * Two requests from the same user, for the same plan + promo + base price, within
+         * the same time bucket return the SAME key. Stripe then guarantees only one Checkout
+         * Session is created (subsequent requests retrieve the original). This kills the
+         * double-click double-billing class of bug. Cross-bucket the keys differ, so a user
+         * intentionally retrying after a minute is not blocked.
+         *
+         * Default window is 30 seconds — long enough to absorb network retries and
+         * accidental double-clicks, short enough not to block a deliberate retry.
+         */
+        fun checkoutIdempotencyKey(
+            userId: String,
+            plan: String,
+            basePriceGrosze: Long,
+            promoCode: String?,
+            nowEpochSeconds: Long,
+            windowSeconds: Long = 30L,
+        ): String {
+            val bucket = nowEpochSeconds / windowSeconds
+            val promoFragment = (promoCode ?: "none").uppercase()
+            val raw = "checkout|$userId|$plan|$basePriceGrosze|$promoFragment|$bucket"
+            val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
+            return digest.joinToString("") { "%02x".format(it) }.take(40)
         }
     }
 
@@ -274,6 +305,24 @@ class StripeHandler(
 
         var promoDiscount = 0L
         if (!promoCode.isNullOrBlank() && promoCodeHandler != null) {
+            // Re-validate the promo at checkout time. If the validate→checkout window stretched
+            // long enough for the promo to expire / be deactivated / hit max_uses / lose its
+            // first-order eligibility for this user, we must refuse — otherwise calculateDiscount
+            // would silently return 0 and the user would be charged the full price after they
+            // clicked "Pay" believing the promo applied.
+            val reason = promoCodeHandler.validateForCheckout(promoCode, userId)
+            if (reason != null) {
+                log.info("Stripe checkout REJECTED — promo no longer valid: userId={} code={} reason={}", userId, promoCode, reason)
+                logAudit(userId, "checkout_rejected_promo", mapOf("code" to promoCode, "reason" to reason))
+                ctx.status(410).contentType("application/json").result(
+                    gson.toJson(mapOf(
+                        "error" to "promo_no_longer_valid",
+                        "reason" to reason,
+                        "message" to "The promo code is no longer valid — please remove it or apply a different one.",
+                    )),
+                )
+                return
+            }
             promoDiscount = promoCodeHandler.calculateDiscount(promoCode, basePriceGrosze)
         }
 
@@ -359,9 +408,26 @@ class StripeHandler(
                 )
             }
 
-            val session = Session.create(sessionBuilder.build())
+            // Stripe idempotency: if the user double-clicks "Pay" we MUST NOT create
+            // two checkout sessions. Stripe returns the original session for the same
+            // idempotency-key, so the user lands on the same checkout URL instead of
+            // being billed twice. See P2-7 in the audit.
+            val idempotencyKey = checkoutIdempotencyKey(
+                userId = userId,
+                plan = plan,
+                basePriceGrosze = basePriceGrosze,
+                promoCode = promoCode,
+                nowEpochSeconds = Instant.now().epochSecond,
+            )
+            val requestOptions = RequestOptions.builder()
+                .setIdempotencyKey(idempotencyKey)
+                .build()
+            val session = Session.create(sessionBuilder.build(), requestOptions)
 
-            log.info("Stripe Subscription Checkout created: sessionId={} userId={} plan={} priceId={}", session.id, userId, plan, resolvedPriceId)
+            log.info(
+                "Stripe Subscription Checkout created: sessionId={} userId={} plan={} priceId={} idempKey={}",
+                session.id, userId, plan, resolvedPriceId, idempotencyKey,
+            )
 
             ctx.contentType("application/json").result(
                 gson.toJson(
@@ -403,6 +469,12 @@ class StripeHandler(
         try {
             val sub = Subscription.retrieve(subId)
             if (sub.status == "active" || sub.status == "trialing" || sub.status == "past_due") {
+                // Refund-on-replace: if the user just paid for THIS subscription (e.g. concurrent
+                // checkout from two tabs, or a plan switch within the same billing window) we
+                // would otherwise cancel a paid subscription with NO refund — double-billing the
+                // user. Look up the most recent invoice on this sub and, if it was paid within
+                // the last 24h, issue a full refund against its charge.
+                refundRecentInvoiceIfAny(subId, user.id)
                 sub.cancel()
                 log.info("Cancelled existing Stripe subscription: subId={} userId={}", subId, user.id)
             }
@@ -411,6 +483,46 @@ class StripeHandler(
         }
 
         userStore.updateStripeSubscriptionId(user.id, null)
+    }
+
+    /**
+     * If the given subscription has an invoice paid in the last `windowSeconds`, refund the full
+     * charge to the user's card. Used by [cancelExistingStripeSubscription] to prevent
+     * double-billing when a user creates a second checkout session for an already-paid plan
+     * (e.g. concurrent tabs, rapid plan switch). 24h window is wide enough to cover human-scale
+     * mistakes without grabbing genuinely old invoices.
+     */
+    private fun refundRecentInvoiceIfAny(subscriptionId: String, userId: String, windowSeconds: Long = 86_400L) {
+        try {
+            val invoices = Invoice.list(
+                InvoiceListParams.builder()
+                    .setSubscription(subscriptionId)
+                    .setLimit(1L)
+                    .build(),
+            )
+            val invoice = invoices.data.firstOrNull() ?: return
+            val chargeId = invoice.charge ?: return
+            val amountPaid = invoice.amountPaid ?: return
+            val paidAtEpoch = invoice.statusTransitions?.paidAt ?: invoice.created ?: return
+            val nowEpoch = Instant.now().epochSecond
+            if (amountPaid > 0 && (nowEpoch - paidAtEpoch) <= windowSeconds) {
+                log.info(
+                    "Refunding superseded subscription invoice: userId={} subId={} invoiceId={} charge={} amount={}",
+                    userId, subscriptionId, invoice.id, chargeId, amountPaid,
+                )
+                Refund.create(
+                    RefundCreateParams.builder()
+                        .setCharge(chargeId)
+                        .setAmount(amountPaid)
+                        .putMetadata("userId", userId)
+                        .putMetadata("reason", "superseded_by_new_subscription")
+                        .putMetadata("originalSubscriptionId", subscriptionId)
+                        .build(),
+                )
+            }
+        } catch (e: Exception) {
+            log.warn("refundRecentInvoiceIfAny failed: subId={} userId={}: {}", subscriptionId, userId, e.message)
+        }
     }
 
     fun handleWebhook(ctx: Context) {
@@ -577,10 +689,11 @@ class StripeHandler(
             }
             // Save the new Stripe subscription ID
             userStore.updateStripeSubscriptionId(userId, subscriptionId)
-            // Activate plan in our DB
-            activateSubscription(userId, plan)
+            // Pull the canonical period_end from Stripe so our DB never drifts (P2-9).
+            val stripePeriodEnd = fetchStripeCurrentPeriodEnd(subscriptionId)
+            activateSubscription(userId, plan, stripePeriodEnd)
         } else if (session.mode == "payment" || session.mode == "setup") {
-            // Fallback for legacy one-time payments
+            // Fallback for legacy one-time payments (no recurring period_end available).
             activateSubscription(userId, plan)
         }
 
@@ -639,8 +752,11 @@ class StripeHandler(
             user.id, subscriptionId, plan, invoice.amountPaid,
         )
 
-        // Extend subscription
-        activateSubscription(user.id, plan)
+        // Extend subscription to the exact next period_end from Stripe (P2-9). Falls back to
+        // 31/365-day stacking only if we can't resolve the canonical timestamp.
+        val periodEnd = invoice.lines?.data?.firstOrNull()?.period?.end?.let { Instant.ofEpochSecond(it) }
+            ?: fetchStripeCurrentPeriodEnd(subscriptionId)
+        activateSubscription(user.id, plan, periodEnd)
         userStore.updateStripeSubscriptionId(user.id, subscriptionId)
         userStore.setCancelAtPeriodEnd(user.id, false)
 
@@ -797,23 +913,42 @@ class StripeHandler(
     // Subscription management endpoints
     // ============================================================================
 
-    fun activateSubscription(userId: String, plan: String) {
-        val durationSeconds = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS * 24 * 60 * 60 else MONTHLY_TOTAL_DAYS * 24 * 60 * 60
+    /**
+     * Activate (or extend) a paid plan for the user.
+     *
+     * If [stripePeriodEnd] is provided (from Stripe's `subscription.current_period_end` or
+     * `invoice.period_end`), DB expiry is set to that exact instant so the local record never
+     * drifts from Stripe's billing cycle. This matters because trial-to-pay or any out-of-band
+     * activation can happen mid-month — adding a hardcoded 31/365 days would silently desynchronize
+     * the DB from Stripe and the user could be charged again before our DB thinks the period ended.
+     *
+     * Fallback (when [stripePeriodEnd] is null, e.g. during legacy LemonSqueezy webhooks or
+     * manual reactivation paths): preserve any remaining trial/subscription days by stacking
+     * the new plan's nominal duration on top of the current expiry. This is a best-effort
+     * fallback and should not be relied on for Stripe billing accuracy.
+     *
+     * See P2-9 in the audit (`audyt-platnosci-i-testow.md`).
+     */
+    fun activateSubscription(userId: String, plan: String, stripePeriodEnd: Instant? = null) {
         val now = Instant.now()
 
-        val user = userStore.findById(userId).orElse(null)
-        val currentExpiry = user?.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            ?: user?.trialExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-
-        val baseTime = if (currentExpiry != null && currentExpiry.isAfter(now)) currentExpiry else now
-        val expiresAt = baseTime.plusSeconds(durationSeconds)
+        val expiresAt = if (stripePeriodEnd != null) {
+            stripePeriodEnd
+        } else {
+            val durationSeconds = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS * 24 * 60 * 60 else MONTHLY_TOTAL_DAYS * 24 * 60 * 60
+            val user = userStore.findById(userId).orElse(null)
+            val currentExpiry = user?.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                ?: user?.trialExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+            val baseTime = if (currentExpiry != null && currentExpiry.isAfter(now)) currentExpiry else now
+            baseTime.plusSeconds(durationSeconds)
+        }
 
         userStore.updateSubscription(userId, plan, expiresAt, STORAGE_LIMIT_BYTES)
         userStore.markEverSubscribed(userId)
         log.info(
-            "Subscription activated: userId={} plan={} baseTime={} expiresAt={} (preserved {} remaining days)",
-            userId, plan, baseTime, expiresAt,
-            if (currentExpiry != null && currentExpiry.isAfter(now)) Duration.between(now, currentExpiry).toDays() else 0,
+            "Subscription activated: userId={} plan={} expiresAt={} source={}",
+            userId, plan, expiresAt,
+            if (stripePeriodEnd != null) "stripe_period_end" else "local_fallback",
         )
     }
 
@@ -867,12 +1002,44 @@ class StripeHandler(
         }
     }
 
+    /**
+     * Returns the current Stripe customer balance for the user, in grosze.
+     *
+     * Stripe's `customer.balance` is signed:
+     *   - **negative** = credit owed to the customer (auto-applied to next invoice)
+     *   - **positive** = customer owes Stripe (e.g. from a failed invoice)
+     *   - **zero**     = no credit/debit
+     *
+     * We return the absolute value of NEGATIVE balances as positive grosze so the UI can
+     * display "Twój kredyt: X PLN". Returns 0 for zero/positive balances (positive means the
+     * customer is in arrears — that's surfaced via invoice.payment_failed, not the balance line).
+     *
+     * Errors (no Stripe customer, blank API key, network failure) are mapped to 0 — the
+     * balance field is informational, never a blocker for checkout flow.
+     */
+    fun getCustomerBalanceCreditGrosze(userId: String): Long {
+        if (stripeSecretKey.isBlank()) return 0L
+        val customerId = getStripeCustomerId(userId) ?: return 0L
+        return try {
+            val balance = Customer.retrieve(customerId).balance ?: 0L
+            if (balance < 0L) -balance else 0L
+        } catch (e: Exception) {
+            log.warn("Stripe getCustomerBalance failed: userId={} err={}", userId, e.message)
+            0L
+        }
+    }
+
     fun getCardInfo(ctx: Context) {
         val userId = ctx.attribute<String>("userId")
         if (userId == null) {
             ctx.status(401).result("Unauthorized")
             return
         }
+
+        // Disable HTTP caching so a browser-level cache never shows a stale card after the
+        // user updates their payment method via Stripe Checkout (P2-10).
+        ctx.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        ctx.header("Pragma", "no-cache")
 
         val customerId = getStripeCustomerId(userId)
         if (customerId == null || stripeSecretKey.isBlank()) {
@@ -954,6 +1121,151 @@ class StripeHandler(
     }
 
     /**
+     * POST /payment/stripe/cancel-immediate
+     *
+     * Immediate cancellation with a prorated refund (P2-8). The user explicitly elects to
+     * terminate now rather than at period end — EU consumer law ("right of withdrawal") gives
+     * users 14 days from purchase to back out and recover funds, so we must support this path.
+     *
+     * Behaviour:
+     *   1. Cancel the Stripe subscription immediately (status → `canceled`).
+     *   2. Compute the prorated refund = remaining_days / total_days × paid amount (gross).
+     *   3. Issue a real `Refund` against the latest invoice's charge so the money returns to the
+     *      same card. If the refund call fails, fall back to crediting `customer.balance` so we
+     *      never silently swallow the value — the user can still claim it via support.
+     *   4. Deactivate locally.
+     *
+     * Body: `{ "confirm": true }` — required so a stray POST cannot blow up someone's billing.
+     */
+    fun cancelSubscriptionImmediate(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")
+        if (userId == null) {
+            ctx.status(401).result("Unauthorized")
+            return
+        }
+
+        val body = try { gson.fromJson(ctx.body(), Map::class.java) } catch (_: Exception) { null }
+        if (body?.get("confirm") != true) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "confirmation_required",
+                    "hint" to "POST { confirm: true } — explicit acknowledgement required")),
+            )
+            return
+        }
+
+        val user = userStore.findById(userId).orElse(null)
+        if (user == null || user.subscriptionPlan == null) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "no_active_subscription")),
+            )
+            return
+        }
+        val plan = user.subscriptionPlan!!
+        val subId = user.stripeSubscriptionId
+        val daysRemaining = calculateDaysRemaining(user)
+
+        logAudit(userId, "cancel_immediate_requested", mapOf("plan" to plan, "daysRemaining" to daysRemaining))
+
+        // Compute the prorated refund using the SAME math as proration on plan switch — keeps
+        // the value-preservation invariant intact across cancel/switch boundaries.
+        val (refundGrosze, _) = calculateProratedDiscount(
+            currentPlan = plan,
+            daysRemaining = daysRemaining,
+            // Pass a sentinel huge "new plan base" so the cap doesn't truncate; we want the full
+            // value of remaining days.
+            newPlanBaseGrosze = Long.MAX_VALUE,
+            newPlanTotalDays = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS else MONTHLY_TOTAL_DAYS,
+        )
+
+        var stripeStatus = "skipped"
+        var refundIssued = 0L
+        var creditedToBalance = 0L
+
+        if (!subId.isNullOrBlank() && stripeSecretKey.isNotBlank()) {
+            // Step 1: cancel Stripe subscription immediately.
+            try {
+                Subscription.retrieve(subId).cancel()
+                stripeStatus = "cancelled"
+                log.info("Stripe subscription cancelled immediately: userId={} subId={}", userId, subId)
+            } catch (e: Exception) {
+                log.warn("Stripe cancel(immediate) failed: subId={} err={}", subId, e.message)
+                stripeStatus = "cancel_failed: ${e.message}"
+            }
+
+            // Step 2: refund prorated amount onto the original card (preferred) OR credit balance.
+            if (refundGrosze > 0) {
+                val refundedViaCharge = try {
+                    val invoices = Invoice.list(
+                        InvoiceListParams.builder()
+                            .setSubscription(subId)
+                            .setLimit(1L)
+                            .build(),
+                    )
+                    val chargeId = invoices.data.firstOrNull()?.charge
+                    if (!chargeId.isNullOrBlank()) {
+                        Refund.create(
+                            RefundCreateParams.builder()
+                                .setCharge(chargeId)
+                                .setAmount(refundGrosze)
+                                .putMetadata("userId", userId)
+                                .putMetadata("reason", "immediate_cancellation_proration")
+                                .putMetadata("plan", plan)
+                                .putMetadata("daysRemaining", daysRemaining.toString())
+                                .build(),
+                        )
+                        refundGrosze
+                    } else 0L
+                } catch (e: Exception) {
+                    log.warn("Stripe refund failed: userId={} amount={}: {}", userId, refundGrosze, e.message)
+                    0L
+                }
+                refundIssued = refundedViaCharge
+                if (refundedViaCharge == 0L) {
+                    // Fallback: credit customer.balance so the value is not silently lost.
+                    val customerId = getStripeCustomerId(userId)
+                    if (!customerId.isNullOrBlank()) {
+                        try {
+                            Customer.retrieve(customerId).balanceTransactions().create(
+                                com.stripe.param.CustomerBalanceTransactionCollectionCreateParams.builder()
+                                    .setAmount(-refundGrosze)
+                                    .setCurrency("pln")
+                                    .setDescription("ProperBackup immediate-cancel refund (fallback to balance)")
+                                    .putMetadata("userId", userId)
+                                    .putMetadata("reason", "immediate_cancellation_proration_fallback")
+                                    .putMetadata("daysRemaining", daysRemaining.toString())
+                                    .build(),
+                            )
+                            creditedToBalance = refundGrosze
+                        } catch (e: Exception) {
+                            log.error("CRITICAL: Refund AND balance credit both failed: userId={} amount={}: {}", userId, refundGrosze, e.message)
+                        }
+                    }
+                }
+            }
+        }
+
+        userStore.deactivateSubscription(userId)
+        logAudit(userId, "cancel_immediate_completed", mapOf(
+            "plan" to plan,
+            "daysRemaining" to daysRemaining,
+            "refundGrosze" to refundIssued,
+            "creditedToBalance" to creditedToBalance,
+            "stripeStatus" to stripeStatus,
+        ))
+
+        ctx.contentType("application/json").result(
+            gson.toJson(mapOf(
+                "status" to "cancelled_immediate",
+                "plan" to plan,
+                "daysRemaining" to daysRemaining,
+                "refundGrosze" to refundIssued,
+                "creditedToBalance" to creditedToBalance,
+                "stripeStatus" to stripeStatus,
+            )),
+        )
+    }
+
+    /**
      * POST /payment/stripe/renew
      * Re-activates renewal for a cancelled subscription (redirect to Stripe Checkout).
      */
@@ -970,7 +1282,13 @@ class StripeHandler(
 
     /**
      * POST /payment/stripe/reactivate
-     * Undoes cancel_at_period_end via Stripe API.
+     *
+     * Reactivation only makes sense when the subscription is **still active** in Stripe and merely
+     * marked `cancel_at_period_end=true`. If Stripe has already canceled the subscription (status
+     * `canceled` / `incomplete_expired`) or our local expiry has passed, we cannot just flip a
+     * flag — there's no Stripe subscription to flip the flag on. In that case we report
+     * `409 expired_must_recheckout` so the frontend can redirect the user back through
+     * /payment/stripe/checkout to create a fresh subscription. See P2-12 in the audit.
      */
     fun reactivateSubscription(ctx: Context) {
         val userId = ctx.attribute<String>("userId")
@@ -987,16 +1305,57 @@ class StripeHandler(
             return
         }
 
+        // DB-level expiry check first — cheap and authoritative if we believe our records.
+        val localExpiry = user.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        if (localExpiry != null && !localExpiry.isAfter(Instant.now())) {
+            log.info("Reactivate rejected (locally expired): userId={} expiredAt={}", userId, localExpiry)
+            ctx.status(409).contentType("application/json").result(
+                gson.toJson(mapOf(
+                    "error" to "expired_must_recheckout",
+                    "expiredAt" to user.subscriptionExpiresAt,
+                    "message" to "Subscription has already expired — please start a new checkout.",
+                )),
+            )
+            return
+        }
+
         val subId = user.stripeSubscriptionId
-        if (!subId.isNullOrBlank()) {
+        if (!subId.isNullOrBlank() && stripeSecretKey.isNotBlank()) {
             try {
+                val sub = Subscription.retrieve(subId)
+                val status = sub.status ?: ""
+                val reactivatable = status == "active" || status == "trialing" || status == "past_due"
+                if (!reactivatable) {
+                    log.info("Reactivate rejected (Stripe status={} not reactivatable): userId={} subId={}", status, userId, subId)
+                    ctx.status(409).contentType("application/json").result(
+                        gson.toJson(mapOf(
+                            "error" to "expired_must_recheckout",
+                            "stripeStatus" to status,
+                            "message" to "Stripe subscription is $status — start a new checkout to resume.",
+                        )),
+                    )
+                    return
+                }
+
                 val params = SubscriptionUpdateParams.builder()
                     .setCancelAtPeriodEnd(false)
                     .build()
-                Subscription.retrieve(subId).update(params)
+                sub.update(params)
                 log.info("Stripe subscription cancel_at_period_end=false (reactivated): userId={} subId={}", userId, subId)
+            } catch (e: com.stripe.exception.StripeException) {
+                // Stripe says it doesn't exist or can't be modified — fall through to recheckout.
+                log.warn("Stripe reactivate failed: subId={} code={} msg={}", subId, e.code, e.message)
+                ctx.status(409).contentType("application/json").result(
+                    gson.toJson(mapOf(
+                        "error" to "expired_must_recheckout",
+                        "stripeError" to (e.code ?: ""),
+                        "message" to "Stripe could not modify the subscription — start a new checkout.",
+                    )),
+                )
+                return
             } catch (e: Exception) {
                 log.warn("Failed to reactivate Stripe subscription: subId={} err={}", subId, e.message)
+                // Transient: degrade gracefully to local flag flip — webhook will sync later.
             }
         }
 
@@ -1050,7 +1409,10 @@ class StripeHandler(
                 val alreadyActive = user?.subscriptionPlan == plan && user.stripeSubscriptionId == subscriptionId
 
                 if (!alreadyActive) {
-                    activateSubscription(userId, plan)
+                    // Resolve the canonical Stripe period_end (P2-9) so the verify path is
+                    // consistent with the webhook path.
+                    val periodEnd = if (!subscriptionId.isNullOrBlank()) fetchStripeCurrentPeriodEnd(subscriptionId) else null
+                    activateSubscription(userId, plan, periodEnd)
                     if (!subscriptionId.isNullOrBlank()) {
                         userStore.updateStripeSubscriptionId(userId, subscriptionId)
                     }
@@ -1077,6 +1439,29 @@ class StripeHandler(
             ctx.status(500).contentType("application/json").result(
                 gson.toJson(mapOf("error" to (e.message ?: "Failed to verify session"))),
             )
+        }
+    }
+
+    /**
+     * Retrieve the canonical `current_period_end` from a Stripe Subscription.
+     *
+     * Returns null when:
+     *   - Stripe API is not configured (blank key)
+     *   - The subscription doesn't exist
+     *   - The Stripe call fails (network, throttle, etc.)
+     *
+     * Callers should treat a null result as "use the local fallback duration" — never fail
+     * the whole webhook because of a transient Stripe lookup hiccup; the next invoice.paid
+     * webhook will heal the drift.
+     */
+    private fun fetchStripeCurrentPeriodEnd(subscriptionId: String): Instant? {
+        if (stripeSecretKey.isBlank()) return null
+        return try {
+            val sub = Subscription.retrieve(subscriptionId)
+            sub.currentPeriodEnd?.let { Instant.ofEpochSecond(it) }
+        } catch (e: Exception) {
+            log.warn("Could not fetch Stripe current_period_end: subId={} err={}", subscriptionId, e.message)
+            null
         }
     }
 

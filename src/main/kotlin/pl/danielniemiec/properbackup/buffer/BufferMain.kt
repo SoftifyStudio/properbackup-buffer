@@ -299,6 +299,7 @@ fun main(args: Array<String>) {
     app.get("/payment/stripe/status", stripeHandler::getPaymentStatus)
     app.get("/payment/stripe/card-info", stripeHandler::getCardInfo)
     app.post("/payment/stripe/cancel-subscription", stripeHandler::cancelSubscription)
+    app.post("/payment/stripe/cancel-immediate", stripeHandler::cancelSubscriptionImmediate)
     app.post("/payment/stripe/renew", stripeHandler::renewSubscription)
     app.post("/payment/stripe/reactivate", stripeHandler::reactivateSubscription)
     app.post("/payment/stripe/verify-session", stripeHandler::verifySession)
