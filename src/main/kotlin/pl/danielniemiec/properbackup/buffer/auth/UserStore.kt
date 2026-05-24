@@ -10,6 +10,10 @@ import java.util.UUID
 
 class UserStore(private val db: Database) {
 
+    companion object {
+        const val TRIAL_DAYS = 30
+    }
+
     data class User(
         val id: String,
         val email: String,
@@ -95,11 +99,12 @@ class UserStore(private val db: Database) {
         val hash = BCrypt.withDefaults().hashToString(12, plainPassword.toCharArray())
         val id = UUID.randomUUID().toString()
         val now = Instant.now()
+        val trialExpires = now.plus(java.time.Duration.ofDays(TRIAL_DAYS.toLong()))
         val verifyToken = UUID.randomUUID().toString().replace("-", "")
         val verifyExpires = now.plusSeconds(24 * 60 * 60)
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO users (id, email, bcrypt_hash, created_at, is_system_admin, storage_limit_bytes, email_verified, email_verify_token, email_verify_expires_at) VALUES (?, ?, ?, ?, FALSE, 2199023255552, FALSE, ?, ?)",
+                "INSERT INTO users (id, email, bcrypt_hash, created_at, is_system_admin, storage_limit_bytes, email_verified, email_verify_token, email_verify_expires_at, trial_expires_at) VALUES (?, ?, ?, ?, FALSE, 2199023255552, FALSE, ?, ?, ?)",
             ).use { ps ->
                 ps.setString(1, id)
                 ps.setString(2, email.lowercase())
@@ -107,10 +112,11 @@ class UserStore(private val db: Database) {
                 ps.setTimestamp(4, Timestamp.from(now))
                 ps.setString(5, verifyToken)
                 ps.setTimestamp(6, Timestamp.from(verifyExpires))
+                ps.setTimestamp(7, Timestamp.from(trialExpires))
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false, true, null, null)
+        return User(id, email.lowercase(), hash, now.toString(), false, trialExpires.toString(), null, null, 2199023255552L, null, false, null, null, false, false, true, null, null)
     }
 
     fun verifyEmail(token: String): Boolean {
