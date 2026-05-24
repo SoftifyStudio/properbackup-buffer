@@ -356,6 +356,13 @@ CREATE INDEX IF NOT EXISTS idx_sub_audit_action ON subscription_audit_log(action
 -- Operator flips this in the DB to promote a user to production billing.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_test_mode BOOLEAN NOT NULL DEFAULT TRUE;
 
+-- Separate Stripe customer IDs for test and live environments.
+-- stripe_customer_id (existing) is treated as the test-mode customer ID.
+-- stripe_live_customer_id stores the live-mode customer ID (created when user
+-- is first promoted to live billing). Stripe IDs are environment-scoped — a
+-- test customer_id will NOT work with live keys and vice-versa.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_live_customer_id VARCHAR(64);
+
 -- Stripe recurring price IDs (auto-created or manually configured)
 CREATE TABLE IF NOT EXISTS stripe_price_config (
   plan_key      VARCHAR(32) PRIMARY KEY,

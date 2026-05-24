@@ -989,19 +989,23 @@ class StripeHandler(
     }
 
     private fun getStripeCustomerId(userId: String): String? {
+        val testMode = keyProvider.isTestMode(userId)
+        val col = if (testMode) "stripe_customer_id" else "stripe_live_customer_id"
         db.getConnection().use { conn ->
-            conn.prepareStatement("SELECT stripe_customer_id FROM users WHERE id = ? AND stripe_customer_id IS NOT NULL").use { ps ->
+            conn.prepareStatement("SELECT $col FROM users WHERE id = ? AND $col IS NOT NULL").use { ps ->
                 ps.setString(1, userId)
                 ps.executeQuery().use { rs ->
-                    return if (rs.next()) rs.getString("stripe_customer_id") else null
+                    return if (rs.next()) rs.getString(col) else null
                 }
             }
         }
     }
 
     private fun saveStripeCustomerId(userId: String, customerId: String) {
+        val testMode = keyProvider.isTestMode(userId)
+        val col = if (testMode) "stripe_customer_id" else "stripe_live_customer_id"
         db.getConnection().use { conn ->
-            conn.prepareStatement("UPDATE users SET stripe_customer_id = ? WHERE id = ?").use { ps ->
+            conn.prepareStatement("UPDATE users SET $col = ? WHERE id = ?").use { ps ->
                 ps.setString(1, customerId)
                 ps.setString(2, userId)
                 ps.executeUpdate()
