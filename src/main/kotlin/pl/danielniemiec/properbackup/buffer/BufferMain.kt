@@ -160,7 +160,8 @@ fun main(args: Array<String>) {
     val hotPayHandler = HotPayHandler(db, userStore)
     val giftCodeHandler = GiftCodeHandler(db, userStore)
     val promoCodeHandler = PromoCodeHandler(db, userStore)
-    val stripeHandler = StripeHandler(db, userStore, promoCodeHandler)
+    val stripeKeyProvider = pl.danielniemiec.properbackup.buffer.payment.StripeKeyProvider(db)
+    val stripeHandler = StripeHandler(db, userStore, promoCodeHandler, stripeKeyProvider)
     val subscriptionHandler = SubscriptionHandler(userStore, storageQuotaGuard, stripeHandler)
 
     val auditReportHandler = AuditReportHandler(

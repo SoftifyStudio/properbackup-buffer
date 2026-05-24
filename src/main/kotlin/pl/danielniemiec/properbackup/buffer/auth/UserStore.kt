@@ -25,10 +25,11 @@ class UserStore(private val db: Database) {
         val stripeSubscriptionId: String? = null,
         val subscriptionCancelAtPeriodEnd: Boolean = false,
         val everSubscribed: Boolean = false,
+        val stripeTestMode: Boolean = true,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed, stripe_test_mode"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -89,7 +90,7 @@ class UserStore(private val db: Database) {
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false)
+        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false, true)
     }
 
     fun verifyEmail(token: String): Boolean {
@@ -289,5 +290,6 @@ class UserStore(private val db: Database) {
         rs.getString("stripe_subscription_id"),
         rs.getBoolean("subscription_cancel_at_period_end"),
         rs.getBoolean("ever_subscribed"),
+        rs.getBoolean("stripe_test_mode"),
     )
 }

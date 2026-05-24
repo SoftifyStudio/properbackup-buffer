@@ -352,6 +352,10 @@ CREATE TABLE IF NOT EXISTS subscription_audit_log (
 CREATE INDEX IF NOT EXISTS idx_sub_audit_user ON subscription_audit_log(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sub_audit_action ON subscription_audit_log(action, created_at DESC);
 
+-- Per-user Stripe test/live mode flag. TRUE = test keys, FALSE = live keys.
+-- Operator flips this in the DB to promote a user to production billing.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_test_mode BOOLEAN NOT NULL DEFAULT TRUE;
+
 -- Stripe recurring price IDs (auto-created or manually configured)
 CREATE TABLE IF NOT EXISTS stripe_price_config (
   plan_key      VARCHAR(32) PRIMARY KEY,

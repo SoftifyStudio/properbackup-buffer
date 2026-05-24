@@ -125,7 +125,8 @@ class SubscriptionHandler(
                     "storageUsedPercent" to (quotaStatus?.usedPercent ?: 0.0),
                     "storageExceeded" to (quotaStatus?.exceeded ?: false),
                     "vatRate" to vatRate,
-                    "stripeMode" to (stripeHandler?.getStripeMode() ?: "test"),
+                    "stripeMode" to (stripeHandler?.getStripeModeForUser(userId) ?: "test"),
+                    "stripeTestMode" to user.stripeTestMode,
                     "customerBalanceCreditGrosze" to customerBalanceCreditGrosze,
                     "pricing" to mapOf(
                         "monthly" to mapOf(

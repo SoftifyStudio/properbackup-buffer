@@ -34,20 +34,12 @@ class StripeHandler(
     private val db: Database,
     private val userStore: UserStore,
     private val promoCodeHandler: PromoCodeHandler? = null,
-    stripeModeOverride: String? = null,
-    stripeSecretKeyOverride: String? = null,
-    stripeWebhookSecretOverride: String? = null,
+    val keyProvider: StripeKeyProvider,
     panelUrlOverride: String? = null,
 ) {
     private val log = LoggerFactory.getLogger(StripeHandler::class.java)
     private val gson = Gson()
 
-    private val stripeMode = stripeModeOverride ?: System.getenv("STRIPE_MODE") ?: "test"
-    private val stripeSecretKey = stripeSecretKeyOverride ?: when (stripeMode) {
-        "live" -> System.getenv("STRIPE_LIVE_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
-        else -> System.getenv("STRIPE_TEST_SECRET_KEY") ?: System.getenv("STRIPE_SECRET_KEY") ?: ""
-    }
-    private val stripeWebhookSecret = stripeWebhookSecretOverride ?: System.getenv("STRIPE_WEBHOOK_SECRET") ?: ""
     private val panelUrl = panelUrlOverride ?: System.getenv("PROPERBACKUP_PANEL_URL") ?: "http://localhost:5175"
 
     companion object {
@@ -137,12 +129,11 @@ class StripeHandler(
     private var annualPriceId: String? = null
 
     init {
-        if (stripeSecretKey.isNotBlank()) {
-            Stripe.apiKey = stripeSecretKey
-            log.info("Stripe initialized: mode={} key={}...", stripeMode, stripeSecretKey.take(12))
+        if (keyProvider.hasAnyKey()) {
+            log.info("Stripe initialized via StripeKeyProvider (per-user key isolation active)")
             initPriceIds()
         } else {
-            log.warn("STRIPE_SECRET_KEY not set — Stripe payments disabled")
+            log.warn("No Stripe keys configured — Stripe payments disabled")
         }
     }
 
@@ -189,22 +180,25 @@ class StripeHandler(
         }
     }
 
+    private fun defaultRequestOptions(): RequestOptions = keyProvider.requestOptionsForMode(true)
+
     private fun ensureStripePrices() {
-        val productId = findOrCreateProduct()
+        val opts = defaultRequestOptions()
+        val productId = findOrCreateProduct(opts)
 
         if (monthlyPriceId == null) {
-            monthlyPriceId = findOrCreatePrice(productId, MONTHLY_PLAN, MONTHLY_PRICE_PLN, PriceCreateParams.Recurring.Interval.MONTH)
+            monthlyPriceId = findOrCreatePrice(productId, MONTHLY_PLAN, MONTHLY_PRICE_PLN, PriceCreateParams.Recurring.Interval.MONTH, opts)
             savePriceId(MONTHLY_PLAN, monthlyPriceId!!)
         }
 
         if (annualPriceId == null) {
-            annualPriceId = findOrCreatePrice(productId, ANNUAL_PLAN, ANNUAL_PRICE_PLN, PriceCreateParams.Recurring.Interval.YEAR)
+            annualPriceId = findOrCreatePrice(productId, ANNUAL_PLAN, ANNUAL_PRICE_PLN, PriceCreateParams.Recurring.Interval.YEAR, opts)
             savePriceId(ANNUAL_PLAN, annualPriceId!!)
         }
     }
 
-    private fun findOrCreateProduct(): String {
-        val existing = Product.list(ProductListParams.builder().setLimit(100).build())
+    private fun findOrCreateProduct(opts: RequestOptions): String {
+        val existing = Product.list(ProductListParams.builder().setLimit(100).build(), opts)
         val found = existing.data.firstOrNull { it.name == PRODUCT_NAME && it.active }
         if (found != null) return found.id
 
@@ -212,7 +206,7 @@ class StripeHandler(
             .setName(PRODUCT_NAME)
             .setDescription("ProperBackup subscription — encrypted cloud backup service")
             .build()
-        val product = Product.create(params)
+        val product = Product.create(params, opts)
         log.info("Created Stripe Product: id={} name={}", product.id, product.name)
         return product.id
     }
@@ -222,6 +216,7 @@ class StripeHandler(
         planKey: String,
         amountGrosze: Long,
         interval: PriceCreateParams.Recurring.Interval,
+        opts: RequestOptions,
     ): String {
         val existing = Price.list(
             PriceListParams.builder()
@@ -229,6 +224,7 @@ class StripeHandler(
                 .setActive(true)
                 .setLimit(100)
                 .build(),
+            opts,
         )
         val found = existing.data.firstOrNull { price ->
             price.unitAmount == amountGrosze &&
@@ -251,7 +247,7 @@ class StripeHandler(
             )
             .putMetadata("planKey", planKey)
             .build()
-        val price = Price.create(params)
+        val price = Price.create(params, opts)
         log.info("Created Stripe Price: id={} plan={} amount={} interval={}", price.id, planKey, amountGrosze, interval)
         return price.id
     }
@@ -268,7 +264,7 @@ class StripeHandler(
             return
         }
 
-        if (stripeSecretKey.isBlank()) {
+        if (!keyProvider.hasAnyKey()) {
             ctx.status(503).result("Stripe not configured")
             return
         }
@@ -342,14 +338,15 @@ class StripeHandler(
         ))
 
         try {
-            val customerId = getOrCreateStripeCustomer(userId, user.email)
+            val userOpts = keyProvider.requestOptionsFor(userId)
+            val customerId = getOrCreateStripeCustomer(userId, user.email, userOpts)
 
             // If the user is downgrading (e.g. annual→monthly) and remaining value exceeds the new
             // plan's base, persist the excess as a credit on the Stripe customer balance. Stripe
             // automatically applies negative balances to subsequent invoices.
             if (overflowCredit > 0) {
                 try {
-                    val customer = Customer.retrieve(customerId)
+                    val customer = Customer.retrieve(customerId, userOpts)
                     customer.balanceTransactions().create(
                         com.stripe.param.CustomerBalanceTransactionCollectionCreateParams.builder()
                             .setAmount(-overflowCredit)
@@ -361,6 +358,7 @@ class StripeHandler(
                             .putMetadata("fromPlan", user.subscriptionPlan ?: "none")
                             .putMetadata("toPlan", plan)
                             .build(),
+                        userOpts,
                     )
                     log.info(
                         "Stripe customer balance credited: customerId={} amount=-{} (downgrade overflow)",
@@ -400,7 +398,7 @@ class StripeHandler(
 
             // Apply discount as coupon on the subscription
             if (totalDiscount > 0) {
-                val couponId = createOneTimeCoupon(totalDiscount, basePriceGrosze, plan, userId)
+                val couponId = createOneTimeCoupon(totalDiscount, basePriceGrosze, plan, userId, userOpts)
                 sessionBuilder.addDiscount(
                     SessionCreateParams.Discount.builder()
                         .setCoupon(couponId)
@@ -420,6 +418,7 @@ class StripeHandler(
                 nowEpochSeconds = Instant.now().epochSecond,
             )
             val requestOptions = RequestOptions.builder()
+                .setApiKey(keyProvider.secretKeyFor(userId))
                 .setIdempotencyKey(idempotencyKey)
                 .build()
             val session = Session.create(sessionBuilder.build(), requestOptions)
@@ -446,7 +445,7 @@ class StripeHandler(
         }
     }
 
-    private fun createOneTimeCoupon(discountGrosze: Long, basePriceGrosze: Long, plan: String, userId: String): String {
+    private fun createOneTimeCoupon(discountGrosze: Long, basePriceGrosze: Long, plan: String, userId: String, opts: RequestOptions): String {
         val params = com.stripe.param.CouponCreateParams.builder()
             .setAmountOff(discountGrosze)
             .setCurrency("pln")
@@ -457,7 +456,7 @@ class StripeHandler(
             .putMetadata("type", "prorated_and_promo")
             .build()
 
-        val coupon = com.stripe.model.Coupon.create(params)
+        val coupon = com.stripe.model.Coupon.create(params, opts)
         log.info("Created one-time coupon: id={} amountOff={} for userId={}", coupon.id, discountGrosze, userId)
         return coupon.id
     }
@@ -466,16 +465,12 @@ class StripeHandler(
         val subId = user.stripeSubscriptionId
         if (subId.isNullOrBlank()) return
 
+        val opts = keyProvider.requestOptionsFor(user.id)
         try {
-            val sub = Subscription.retrieve(subId)
+            val sub = Subscription.retrieve(subId, opts)
             if (sub.status == "active" || sub.status == "trialing" || sub.status == "past_due") {
-                // Refund-on-replace: if the user just paid for THIS subscription (e.g. concurrent
-                // checkout from two tabs, or a plan switch within the same billing window) we
-                // would otherwise cancel a paid subscription with NO refund — double-billing the
-                // user. Look up the most recent invoice on this sub and, if it was paid within
-                // the last 24h, issue a full refund against its charge.
-                refundRecentInvoiceIfAny(subId, user.id)
-                sub.cancel()
+                refundRecentInvoiceIfAny(subId, user.id, opts)
+                sub.cancel(com.stripe.param.SubscriptionCancelParams.builder().build(), opts)
                 log.info("Cancelled existing Stripe subscription: subId={} userId={}", subId, user.id)
             }
         } catch (e: Exception) {
@@ -492,13 +487,14 @@ class StripeHandler(
      * (e.g. concurrent tabs, rapid plan switch). 24h window is wide enough to cover human-scale
      * mistakes without grabbing genuinely old invoices.
      */
-    private fun refundRecentInvoiceIfAny(subscriptionId: String, userId: String, windowSeconds: Long = 86_400L) {
+    private fun refundRecentInvoiceIfAny(subscriptionId: String, userId: String, opts: RequestOptions, windowSeconds: Long = 86_400L) {
         try {
             val invoices = Invoice.list(
                 InvoiceListParams.builder()
                     .setSubscription(subscriptionId)
                     .setLimit(1L)
                     .build(),
+                opts,
             )
             val invoice = invoices.data.firstOrNull() ?: return
             val chargeId = invoice.charge ?: return
@@ -518,6 +514,7 @@ class StripeHandler(
                         .putMetadata("reason", "superseded_by_new_subscription")
                         .putMetadata("originalSubscriptionId", subscriptionId)
                         .build(),
+                    opts,
                 )
             }
         } catch (e: Exception) {
@@ -526,10 +523,10 @@ class StripeHandler(
     }
 
     fun handleWebhook(ctx: Context) {
-        // Fail-closed: refuse to process webhooks if signing secret isn't configured.
-        // Allowing unsigned webhooks would let anyone activate a subscription by POSTing a JSON body.
-        if (stripeWebhookSecret.isBlank()) {
-            log.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET not configured")
+        // Fail-closed: refuse to process webhooks if no signing secret is configured.
+        val candidates = keyProvider.webhookSecretCandidates()
+        if (candidates.isEmpty()) {
+            log.error("Stripe webhook rejected: no webhook secret configured")
             ctx.status(503).result("Webhook secret not configured")
             return
         }
@@ -543,19 +540,30 @@ class StripeHandler(
             return
         }
 
-        val event: Event = try {
-            Webhook.constructEvent(payload, sigHeader, stripeWebhookSecret)
-        } catch (e: SignatureVerificationException) {
-            log.warn("Stripe webhook: signature verification failed", e)
+        // Try each configured webhook secret. Test mode is attempted first.
+        var event: Event? = null
+        var resolvedTestMode = true
+        for ((testMode, secret) in candidates) {
+            try {
+                event = Webhook.constructEvent(payload, sigHeader, secret)
+                resolvedTestMode = testMode
+                break
+            } catch (_: SignatureVerificationException) {
+                // Try next candidate
+            } catch (e: Exception) {
+                log.error("Stripe webhook: failed to parse event", e)
+                ctx.status(400).result("Invalid payload")
+                return
+            }
+        }
+
+        if (event == null) {
+            log.warn("Stripe webhook: signature verification failed against all configured secrets")
             ctx.status(400).result("Invalid signature")
-            return
-        } catch (e: Exception) {
-            log.error("Stripe webhook: failed to parse event", e)
-            ctx.status(400).result("Invalid payload")
             return
         }
 
-        log.info("Stripe webhook received: type={} id={}", event.type, event.id)
+        log.info("Stripe webhook received: type={} id={} mode={}", event.type, event.id, keyProvider.modeLabelForMode(resolvedTestMode))
 
         // Idempotency: Stripe retries webhooks on any non-2xx (and on network failures). Claim the
         // event.id atomically before running any handler. If we've already processed it, return 200
@@ -566,12 +574,13 @@ class StripeHandler(
             return
         }
 
+        val webhookOpts = keyProvider.requestOptionsForMode(resolvedTestMode)
         when (event.type) {
-            "checkout.session.completed" -> handleCheckoutCompleted(event)
-            "invoice.paid" -> handleInvoicePaid(event)
+            "checkout.session.completed" -> handleCheckoutCompleted(event, webhookOpts)
+            "invoice.paid" -> handleInvoicePaid(event, webhookOpts)
             "invoice.payment_failed" -> handleInvoicePaymentFailed(event)
             "customer.subscription.deleted" -> handleSubscriptionDeleted(event)
-            "customer.subscription.updated" -> handleSubscriptionUpdated(event)
+            "customer.subscription.updated" -> handleSubscriptionUpdated(event, webhookOpts)
             else -> log.debug("Stripe webhook: unhandled event type={}", event.type)
         }
 
@@ -605,13 +614,11 @@ class StripeHandler(
     }
 
     fun getPublicKey(ctx: Context) {
-        val publicKey = when (stripeMode) {
-            "live" -> System.getenv("STRIPE_LIVE_PUBLIC_KEY")
-                ?: System.getenv("STRIPE_PUBLIC_KEY")
-                ?: ""
-            else -> System.getenv("STRIPE_TEST_PUBLIC_KEY")
-                ?: System.getenv("STRIPE_PUBLIC_KEY")
-                ?: ""
+        val userId = ctx.attribute<String>("userId")
+        val publicKey = if (userId != null) {
+            keyProvider.publicKeyFor(userId)
+        } else {
+            keyProvider.publicKeyForMode(true)
         }
         ctx.contentType("application/json").result(
             gson.toJson(mapOf("publicKey" to publicKey)),
@@ -652,7 +659,7 @@ class StripeHandler(
     // Webhook handlers
     // ============================================================================
 
-    private fun handleCheckoutCompleted(event: Event) {
+    private fun handleCheckoutCompleted(event: Event, opts: RequestOptions) {
         val deserializer = event.dataObjectDeserializer
         val dataObj = try {
             deserializer.`object`.orElseGet { deserializer.deserializeUnsafe() }
@@ -690,7 +697,7 @@ class StripeHandler(
             // Save the new Stripe subscription ID
             userStore.updateStripeSubscriptionId(userId, subscriptionId)
             // Pull the canonical period_end from Stripe so our DB never drifts (P2-9).
-            val stripePeriodEnd = fetchStripeCurrentPeriodEnd(subscriptionId)
+            val stripePeriodEnd = fetchStripeCurrentPeriodEnd(subscriptionId, opts)
             activateSubscription(userId, plan, stripePeriodEnd)
         } else if (session.mode == "payment" || session.mode == "setup") {
             // Fallback for legacy one-time payments (no recurring period_end available).
@@ -714,7 +721,7 @@ class StripeHandler(
      * invoice.paid — Stripe confirms recurring payment succeeded.
      * Extends the subscription for the next billing period.
      */
-    private fun handleInvoicePaid(event: Event) {
+    private fun handleInvoicePaid(event: Event, opts: RequestOptions) {
         val deserializer = event.dataObjectDeserializer
         val dataObj = try {
             deserializer.`object`.orElseGet { deserializer.deserializeUnsafe() }
@@ -745,7 +752,7 @@ class StripeHandler(
         }
 
         // Determine plan from the subscription's price
-        val plan = determinePlanFromSubscription(subscriptionId)
+        val plan = determinePlanFromSubscription(subscriptionId, opts)
 
         log.info(
             "Stripe invoice.paid: userId={} subscriptionId={} plan={} amountPaid={}",
@@ -755,7 +762,7 @@ class StripeHandler(
         // Extend subscription to the exact next period_end from Stripe (P2-9). Falls back to
         // 31/365-day stacking only if we can't resolve the canonical timestamp.
         val periodEnd = invoice.lines?.data?.firstOrNull()?.period?.end?.let { Instant.ofEpochSecond(it) }
-            ?: fetchStripeCurrentPeriodEnd(subscriptionId)
+            ?: fetchStripeCurrentPeriodEnd(subscriptionId, opts)
         activateSubscription(user.id, plan, periodEnd)
         userStore.updateStripeSubscriptionId(user.id, subscriptionId)
         userStore.setCancelAtPeriodEnd(user.id, false)
@@ -848,7 +855,7 @@ class StripeHandler(
      * customer.subscription.updated — subscription changed (e.g., cancel_at_period_end toggled).
      * Sync cancel_at_period_end state to our DB.
      */
-    private fun handleSubscriptionUpdated(event: Event) {
+    private fun handleSubscriptionUpdated(event: Event, opts: RequestOptions) {
         val deserializer = event.dataObjectDeserializer
         val dataObj = try {
             deserializer.`object`.orElseGet { deserializer.deserializeUnsafe() }
@@ -879,7 +886,7 @@ class StripeHandler(
             val periodEnd = subscription.currentPeriodEnd
             if (periodEnd != null) {
                 val expiresAt = Instant.ofEpochSecond(periodEnd)
-                val plan = determinePlanFromSubscription(subscription.id)
+                val plan = determinePlanFromSubscription(subscription.id, opts)
                 userStore.updateSubscription(user.id, plan, expiresAt, STORAGE_LIMIT_BYTES)
             }
         }
@@ -891,9 +898,9 @@ class StripeHandler(
         ))
     }
 
-    private fun determinePlanFromSubscription(subscriptionId: String): String {
+    private fun determinePlanFromSubscription(subscriptionId: String, opts: RequestOptions): String {
         return try {
-            val sub = Subscription.retrieve(subscriptionId)
+            val sub = Subscription.retrieve(subscriptionId, opts)
             val priceId = sub.items?.data?.firstOrNull()?.price?.id
             when (priceId) {
                 annualPriceId -> ANNUAL_PLAN
@@ -966,7 +973,7 @@ class StripeHandler(
         }
     }
 
-    private fun getOrCreateStripeCustomer(userId: String, email: String): String {
+    private fun getOrCreateStripeCustomer(userId: String, email: String, opts: RequestOptions): String {
         val existing = getStripeCustomerId(userId)
         if (existing != null) return existing
 
@@ -975,7 +982,7 @@ class StripeHandler(
             .putMetadata("userId", userId)
             .build()
 
-        val customer = Customer.create(params)
+        val customer = Customer.create(params, opts)
         saveStripeCustomerId(userId, customer.id)
         log.info("Stripe customer created: customerId={} userId={}", customer.id, userId)
         return customer.id
@@ -1018,10 +1025,11 @@ class StripeHandler(
      * balance field is informational, never a blocker for checkout flow.
      */
     fun getCustomerBalanceCreditGrosze(userId: String): Long {
-        if (stripeSecretKey.isBlank()) return 0L
+        if (!keyProvider.hasAnyKey()) return 0L
         val customerId = getStripeCustomerId(userId) ?: return 0L
+        val opts = keyProvider.requestOptionsFor(userId)
         return try {
-            val balance = Customer.retrieve(customerId).balance ?: 0L
+            val balance = Customer.retrieve(customerId, opts).balance ?: 0L
             if (balance < 0L) -balance else 0L
         } catch (e: Exception) {
             log.warn("Stripe getCustomerBalance failed: userId={} err={}", userId, e.message)
@@ -1042,17 +1050,22 @@ class StripeHandler(
         ctx.header("Pragma", "no-cache")
 
         val customerId = getStripeCustomerId(userId)
-        if (customerId == null || stripeSecretKey.isBlank()) {
-            ctx.contentType("application/json").result(gson.toJson(mapOf("hasCard" to false)))
+        val userTestMode = keyProvider.isTestMode(userId)
+        if (customerId == null || !keyProvider.hasAnyKey()) {
+            ctx.contentType("application/json").result(gson.toJson(mapOf(
+                "hasCard" to false,
+                "isTestCard" to userTestMode,
+            )))
             return
         }
 
+        val userOpts = keyProvider.requestOptionsFor(userId)
         try {
             val params = CustomerListPaymentMethodsParams.builder()
                 .setType(CustomerListPaymentMethodsParams.Type.CARD)
                 .setLimit(1)
                 .build()
-            val methods = Customer.retrieve(customerId).listPaymentMethods(params)
+            val methods = Customer.retrieve(customerId, userOpts).listPaymentMethods(params, userOpts)
             val pm = methods.data.firstOrNull()
 
             if (pm?.card != null) {
@@ -1064,15 +1077,22 @@ class StripeHandler(
                             "last4" to (pm.card.last4 ?: "0000"),
                             "expMonth" to pm.card.expMonth,
                             "expYear" to pm.card.expYear,
+                            "isTestCard" to userTestMode,
                         ),
                     ),
                 )
             } else {
-                ctx.contentType("application/json").result(gson.toJson(mapOf("hasCard" to false)))
+                ctx.contentType("application/json").result(gson.toJson(mapOf(
+                    "hasCard" to false,
+                    "isTestCard" to userTestMode,
+                )))
             }
         } catch (e: Exception) {
             log.warn("Failed to get card info for userId={}: {}", userId, e.message)
-            ctx.contentType("application/json").result(gson.toJson(mapOf("hasCard" to false)))
+            ctx.contentType("application/json").result(gson.toJson(mapOf(
+                "hasCard" to false,
+                "isTestCard" to userTestMode,
+            )))
         }
     }
 
@@ -1100,15 +1120,15 @@ class StripeHandler(
 
         val subId = user.stripeSubscriptionId
         if (!subId.isNullOrBlank()) {
+            val userOpts = keyProvider.requestOptionsFor(userId)
             try {
                 val params = SubscriptionUpdateParams.builder()
                     .setCancelAtPeriodEnd(true)
                     .build()
-                Subscription.retrieve(subId).update(params)
+                Subscription.retrieve(subId, userOpts).update(params, userOpts)
                 log.info("Stripe subscription cancel_at_period_end=true: userId={} subId={}", userId, subId)
             } catch (e: Exception) {
                 log.warn("Failed to update Stripe subscription for cancel: subId={} err={}", subId, e.message)
-                // Fall back to local flag
             }
         }
 
@@ -1181,10 +1201,11 @@ class StripeHandler(
         var refundIssued = 0L
         var creditedToBalance = 0L
 
-        if (!subId.isNullOrBlank() && stripeSecretKey.isNotBlank()) {
+        if (!subId.isNullOrBlank() && keyProvider.hasAnyKey()) {
+            val userOpts = keyProvider.requestOptionsFor(userId)
             // Step 1: cancel Stripe subscription immediately.
             try {
-                Subscription.retrieve(subId).cancel()
+                Subscription.retrieve(subId, userOpts).cancel(com.stripe.param.SubscriptionCancelParams.builder().build(), userOpts)
                 stripeStatus = "cancelled"
                 log.info("Stripe subscription cancelled immediately: userId={} subId={}", userId, subId)
             } catch (e: Exception) {
@@ -1200,6 +1221,7 @@ class StripeHandler(
                             .setSubscription(subId)
                             .setLimit(1L)
                             .build(),
+                        userOpts,
                     )
                     val chargeId = invoices.data.firstOrNull()?.charge
                     if (!chargeId.isNullOrBlank()) {
@@ -1212,6 +1234,7 @@ class StripeHandler(
                                 .putMetadata("plan", plan)
                                 .putMetadata("daysRemaining", daysRemaining.toString())
                                 .build(),
+                            userOpts,
                         )
                         refundGrosze
                     } else 0L
@@ -1221,11 +1244,10 @@ class StripeHandler(
                 }
                 refundIssued = refundedViaCharge
                 if (refundedViaCharge == 0L) {
-                    // Fallback: credit customer.balance so the value is not silently lost.
                     val customerId = getStripeCustomerId(userId)
                     if (!customerId.isNullOrBlank()) {
                         try {
-                            Customer.retrieve(customerId).balanceTransactions().create(
+                            Customer.retrieve(customerId, userOpts).balanceTransactions().create(
                                 com.stripe.param.CustomerBalanceTransactionCollectionCreateParams.builder()
                                     .setAmount(-refundGrosze)
                                     .setCurrency("pln")
@@ -1234,6 +1256,7 @@ class StripeHandler(
                                     .putMetadata("reason", "immediate_cancellation_proration_fallback")
                                     .putMetadata("daysRemaining", daysRemaining.toString())
                                     .build(),
+                                userOpts,
                             )
                             creditedToBalance = refundGrosze
                         } catch (e: Exception) {
@@ -1320,9 +1343,10 @@ class StripeHandler(
         }
 
         val subId = user.stripeSubscriptionId
-        if (!subId.isNullOrBlank() && stripeSecretKey.isNotBlank()) {
+        if (!subId.isNullOrBlank() && keyProvider.hasAnyKey()) {
+            val userOpts = keyProvider.requestOptionsFor(userId)
             try {
-                val sub = Subscription.retrieve(subId)
+                val sub = Subscription.retrieve(subId, userOpts)
                 val status = sub.status ?: ""
                 val reactivatable = status == "active" || status == "trialing" || status == "past_due"
                 if (!reactivatable) {
@@ -1340,10 +1364,9 @@ class StripeHandler(
                 val params = SubscriptionUpdateParams.builder()
                     .setCancelAtPeriodEnd(false)
                     .build()
-                sub.update(params)
+                sub.update(params, userOpts)
                 log.info("Stripe subscription cancel_at_period_end=false (reactivated): userId={} subId={}", userId, subId)
             } catch (e: com.stripe.exception.StripeException) {
-                // Stripe says it doesn't exist or can't be modified — fall through to recheckout.
                 log.warn("Stripe reactivate failed: subId={} code={} msg={}", subId, e.code, e.message)
                 ctx.status(409).contentType("application/json").result(
                     gson.toJson(mapOf(
@@ -1355,7 +1378,6 @@ class StripeHandler(
                 return
             } catch (e: Exception) {
                 log.warn("Failed to reactivate Stripe subscription: subId={} err={}", subId, e.message)
-                // Transient: degrade gracefully to local flag flip — webhook will sync later.
             }
         }
 
@@ -1389,7 +1411,8 @@ class StripeHandler(
         }
 
         try {
-            val session = Session.retrieve(sessionId)
+            val userOpts = keyProvider.requestOptionsFor(userId)
+            val session = Session.retrieve(sessionId, userOpts)
             val metaUserId = session.metadata?.get("userId")
             if (metaUserId != userId) {
                 log.warn("verify-session: userId mismatch meta={} auth={}", metaUserId, userId)
@@ -1411,7 +1434,7 @@ class StripeHandler(
                 if (!alreadyActive) {
                     // Resolve the canonical Stripe period_end (P2-9) so the verify path is
                     // consistent with the webhook path.
-                    val periodEnd = if (!subscriptionId.isNullOrBlank()) fetchStripeCurrentPeriodEnd(subscriptionId) else null
+                    val periodEnd = if (!subscriptionId.isNullOrBlank()) fetchStripeCurrentPeriodEnd(subscriptionId, userOpts) else null
                     activateSubscription(userId, plan, periodEnd)
                     if (!subscriptionId.isNullOrBlank()) {
                         userStore.updateStripeSubscriptionId(userId, subscriptionId)
@@ -1454,10 +1477,10 @@ class StripeHandler(
      * the whole webhook because of a transient Stripe lookup hiccup; the next invoice.paid
      * webhook will heal the drift.
      */
-    private fun fetchStripeCurrentPeriodEnd(subscriptionId: String): Instant? {
-        if (stripeSecretKey.isBlank()) return null
+    private fun fetchStripeCurrentPeriodEnd(subscriptionId: String, opts: RequestOptions): Instant? {
+        if (!keyProvider.hasAnyKey()) return null
         return try {
-            val sub = Subscription.retrieve(subscriptionId)
+            val sub = Subscription.retrieve(subscriptionId, opts)
             sub.currentPeriodEnd?.let { Instant.ofEpochSecond(it) }
         } catch (e: Exception) {
             log.warn("Could not fetch Stripe current_period_end: subId={} err={}", subscriptionId, e.message)
@@ -1479,7 +1502,9 @@ class StripeHandler(
         }
     }
 
-    fun getStripeMode(): String = stripeMode
+    fun getStripeModeForUser(userId: String): String = keyProvider.modeLabel(userId)
+
+    fun getStripeMode(): String = "test"
 
     private fun logAudit(userId: String, action: String, details: Map<String, Any>) {
         try {

@@ -63,13 +63,19 @@ class SubscriptionIntegrationTest {
             db = Database(postgres.jdbcUrl, postgres.username, postgres.password)
             userStore = UserStore(db)
             promoCodeHandler = PromoCodeHandler(db, userStore)
-            // Instantiated with explicit overrides so we don't depend on shell env in tests.
-            // stripeSecretKey blank → Stripe SDK not initialised, but db-level helpers still work.
+            // StripeKeyProvider with blank keys → Stripe SDK not initialised, but db-level helpers still work.
+            val keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testPublicKeyOverride = "",
+                livePublicKeyOverride = "",
+                testWebhookSecretOverride = "",
+                liveWebhookSecretOverride = "",
+            )
             stripeHandler = StripeHandler(
                 db, userStore, promoCodeHandler,
-                stripeModeOverride = "test",
-                stripeSecretKeyOverride = "",
-                stripeWebhookSecretOverride = "",
+                keyProvider = keyProvider,
                 panelUrlOverride = "http://localhost:5175",
             )
             giftCodeHandler = GiftCodeHandler(db, userStore)
@@ -934,9 +940,13 @@ class SubscriptionIntegrationTest {
         // we verify the contract by checking that the handler reports itself as not configured.
         val handlerWithoutSecret = StripeHandler(
             db, userStore, promoCodeHandler,
-            stripeModeOverride = "test",
-            stripeSecretKeyOverride = "",
-            stripeWebhookSecretOverride = "",
+            keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testWebhookSecretOverride = "",
+                liveWebhookSecretOverride = "",
+            ),
         )
         // We can’t mock io.javalin.http.Context easily here. The contract we DO verify is that
         // tryClaimStripeEventId still works (idempotency table is independent of webhook secret),
@@ -1499,11 +1509,16 @@ class SubscriptionIntegrationTest {
     @Order(181)
     fun `webhook missing Stripe-Signature header returns 400 (audit)`() {
         // New handler with a non-blank secret so we hit the signature path.
+        val whsec = "whsec_test_secret_${System.currentTimeMillis()}"
         val handler = StripeHandler(
             db, userStore, promoCodeHandler,
-            stripeModeOverride = "test",
-            stripeSecretKeyOverride = "",
-            stripeWebhookSecretOverride = "whsec_test_secret_${System.currentTimeMillis()}",
+            keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testWebhookSecretOverride = whsec,
+                liveWebhookSecretOverride = "",
+            ),
             panelUrlOverride = "http://localhost:5175",
         )
         val recorder = ResponseRecorder()
@@ -1518,9 +1533,13 @@ class SubscriptionIntegrationTest {
         val secret = "whsec_test_${System.currentTimeMillis()}"
         val handler = StripeHandler(
             db, userStore, promoCodeHandler,
-            stripeModeOverride = "test",
-            stripeSecretKeyOverride = "",
-            stripeWebhookSecretOverride = secret,
+            keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testWebhookSecretOverride = secret,
+                liveWebhookSecretOverride = "",
+            ),
             panelUrlOverride = "http://localhost:5175",
         )
         val payload = """{"id":"evt_tampered","type":"checkout.session.completed"}"""
@@ -1538,9 +1557,13 @@ class SubscriptionIntegrationTest {
         val secret = "whsec_test_valid_${System.currentTimeMillis()}"
         val handler = StripeHandler(
             db, userStore, promoCodeHandler,
-            stripeModeOverride = "test",
-            stripeSecretKeyOverride = "",
-            stripeWebhookSecretOverride = secret,
+            keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testWebhookSecretOverride = secret,
+                liveWebhookSecretOverride = "",
+            ),
             panelUrlOverride = "http://localhost:5175",
         )
         // Build a minimal but parseable Stripe event payload.
@@ -1605,6 +1628,219 @@ class SubscriptionIntegrationTest {
         val q = guard.checkQuota(freshUser)
         assertFalse(q.subscriptionInactive)
         assertTrue(guard.canUpload(freshUser, 1024L))
+    }
+
+    // ========================================================================
+    // StripeKeyProvider: per-user key isolation tests
+    // ========================================================================
+
+    @Test
+    @Order(200)
+    fun `StripeKeyProvider returns test keys for new users (default)`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "sk_test_AAAA",
+            liveSecretKeyOverride = "sk_live_BBBB",
+            testPublicKeyOverride = "pk_test_CCCC",
+            livePublicKeyOverride = "pk_live_DDDD",
+        )
+        val user = createTestUser("kp-test-${System.currentTimeMillis()}@properbackup.dev")
+        assertTrue(kp.isTestMode(user))
+        assertEquals("sk_test_AAAA", kp.secretKeyFor(user))
+        assertEquals("pk_test_CCCC", kp.publicKeyFor(user))
+        assertEquals("test", kp.modeLabel(user))
+    }
+
+    @Test
+    @Order(201)
+    fun `StripeKeyProvider switches to live keys after flag flip`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "sk_test_AAA201",
+            liveSecretKeyOverride = "sk_live_BBB201",
+            testPublicKeyOverride = "pk_test_CCC201",
+            livePublicKeyOverride = "pk_live_DDD201",
+        )
+        val user = createTestUser("kp-live-${System.currentTimeMillis()}@properbackup.dev")
+        assertTrue(kp.isTestMode(user))
+
+        kp.setTestMode(user, false)
+
+        assertFalse(kp.isTestMode(user))
+        assertEquals("sk_live_BBB201", kp.secretKeyFor(user))
+        assertEquals("pk_live_DDD201", kp.publicKeyFor(user))
+        assertEquals("live", kp.modeLabel(user))
+    }
+
+    @Test
+    @Order(202)
+    fun `StripeKeyProvider per-user isolation - two users different modes`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "sk_test_202",
+            liveSecretKeyOverride = "sk_live_202",
+        )
+        val testUser = createTestUser("kp-test-a-${System.currentTimeMillis()}@properbackup.dev")
+        val liveUser = createTestUser("kp-live-b-${System.currentTimeMillis()}@properbackup.dev")
+
+        kp.setTestMode(liveUser, false)
+
+        assertEquals("sk_test_202", kp.secretKeyFor(testUser))
+        assertEquals("sk_live_202", kp.secretKeyFor(liveUser))
+        assertEquals("test", kp.modeLabel(testUser))
+        assertEquals("live", kp.modeLabel(liveUser))
+    }
+
+    @Test
+    @Order(203)
+    fun `StripeKeyProvider RequestOptions carry correct key`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "sk_test_203",
+            liveSecretKeyOverride = "sk_live_203",
+        )
+        val user = createTestUser("kp-reqopt-${System.currentTimeMillis()}@properbackup.dev")
+
+        val testOpts = kp.requestOptionsFor(user)
+        assertEquals("sk_test_203", testOpts.apiKey)
+
+        kp.setTestMode(user, false)
+        val liveOpts = kp.requestOptionsFor(user)
+        assertEquals("sk_live_203", liveOpts.apiKey)
+    }
+
+    @Test
+    @Order(204)
+    fun `StripeKeyProvider live keys fallback to test when not configured`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "sk_test_fallback",
+            liveSecretKeyOverride = null,
+            testPublicKeyOverride = "pk_test_fallback",
+            livePublicKeyOverride = null,
+        )
+        val user = createTestUser("kp-fallback-${System.currentTimeMillis()}@properbackup.dev")
+        kp.setTestMode(user, false)
+        assertEquals("sk_test_fallback", kp.secretKeyFor(user))
+        assertEquals("pk_test_fallback", kp.publicKeyFor(user))
+    }
+
+    @Test
+    @Order(205)
+    fun `StripeKeyProvider webhookSecretCandidates returns both when different`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "",
+            liveSecretKeyOverride = "",
+            testWebhookSecretOverride = "whsec_test_205",
+            liveWebhookSecretOverride = "whsec_live_205",
+        )
+        val candidates = kp.webhookSecretCandidates()
+        assertEquals(2, candidates.size)
+        assertTrue(candidates[0].first)
+        assertEquals("whsec_test_205", candidates[0].second)
+        assertFalse(candidates[1].first)
+        assertEquals("whsec_live_205", candidates[1].second)
+    }
+
+    @Test
+    @Order(206)
+    fun `StripeKeyProvider webhookSecretCandidates deduplicates identical secrets`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "",
+            liveSecretKeyOverride = "",
+            testWebhookSecretOverride = "whsec_same",
+            liveWebhookSecretOverride = "whsec_same",
+        )
+        val candidates = kp.webhookSecretCandidates()
+        assertEquals(1, candidates.size)
+    }
+
+    @Test
+    @Order(207)
+    fun `stripeTestMode flag persisted in UserStore User data class`() {
+        val user = createTestUser("flag-persist-${System.currentTimeMillis()}@properbackup.dev")
+        val before = userStore.findById(user).orElseThrow()
+        assertTrue(before.stripeTestMode, "new user should default to test mode")
+
+        val kp = StripeKeyProvider(db, testSecretKeyOverride = "", liveSecretKeyOverride = "")
+        kp.setTestMode(user, false)
+
+        val after = userStore.findById(user).orElseThrow()
+        assertFalse(after.stripeTestMode, "flag should be false after setting to live")
+    }
+
+    @Test
+    @Order(208)
+    fun `StripeHandler exposes per-user mode via getStripeModeForUser`() {
+        val kp = StripeKeyProvider(
+            db,
+            testSecretKeyOverride = "",
+            liveSecretKeyOverride = "",
+        )
+        val handler = StripeHandler(
+            db, userStore, promoCodeHandler,
+            keyProvider = kp,
+            panelUrlOverride = "http://localhost:5175",
+        )
+        val user = createTestUser("mode-api-${System.currentTimeMillis()}@properbackup.dev")
+        assertEquals("test", handler.getStripeModeForUser(user))
+
+        kp.setTestMode(user, false)
+        assertEquals("live", handler.getStripeModeForUser(user))
+    }
+
+    @Test
+    @Order(209)
+    fun `webhook dual-secret verification accepts test-mode webhook`() {
+        val testSecret = "whsec_test_dual_${System.currentTimeMillis()}"
+        val liveSecret = "whsec_live_dual_${System.currentTimeMillis()}"
+        val handler = StripeHandler(
+            db, userStore, promoCodeHandler,
+            keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testWebhookSecretOverride = testSecret,
+                liveWebhookSecretOverride = liveSecret,
+            ),
+            panelUrlOverride = "http://localhost:5175",
+        )
+        val eventId = "evt_dual_test_${System.currentTimeMillis()}"
+        val payload = """{"id":"$eventId","object":"event","type":"customer.subscription.updated","data":{"object":{}}}"""
+        val ts = System.currentTimeMillis() / 1000
+        val sig = stripeSignatureHeader(payload, testSecret, ts)
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, body = payload, headers = mapOf("Stripe-Signature" to sig))
+        handler.handleWebhook(ctx)
+        assertEquals(200, recorder.statusCode, "test secret should be accepted")
+    }
+
+    @Test
+    @Order(210)
+    fun `webhook dual-secret verification accepts live-mode webhook`() {
+        val testSecret = "whsec_test_dual2_${System.currentTimeMillis()}"
+        val liveSecret = "whsec_live_dual2_${System.currentTimeMillis()}"
+        val handler = StripeHandler(
+            db, userStore, promoCodeHandler,
+            keyProvider = StripeKeyProvider(
+                db,
+                testSecretKeyOverride = "",
+                liveSecretKeyOverride = "",
+                testWebhookSecretOverride = testSecret,
+                liveWebhookSecretOverride = liveSecret,
+            ),
+            panelUrlOverride = "http://localhost:5175",
+        )
+        val eventId = "evt_dual_live_${System.currentTimeMillis()}"
+        val payload = """{"id":"$eventId","object":"event","type":"customer.subscription.updated","data":{"object":{}}}"""
+        val ts = System.currentTimeMillis() / 1000
+        val sig = stripeSignatureHeader(payload, liveSecret, ts)
+        val recorder = ResponseRecorder()
+        val ctx = mockCtx(recorder, body = payload, headers = mapOf("Stripe-Signature" to sig))
+        handler.handleWebhook(ctx)
+        assertEquals(200, recorder.statusCode, "live secret should be accepted")
     }
 
     /** Build a Stripe-Signature header value with `t=<ts>,v1=<hmac>`. */
