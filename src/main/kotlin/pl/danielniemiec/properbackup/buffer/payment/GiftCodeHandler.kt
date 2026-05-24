@@ -86,16 +86,17 @@ class GiftCodeHandler(
         val now = Instant.now()
         val currentExpiry = u.subscriptionExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
         val localSubActive = currentExpiry?.isAfter(now) == true
-        val hasStripeSub = !u.stripeSubscriptionId.isNullOrBlank()
+        val currentSubId = u.currentStripeSubscriptionId()
+        val hasStripeSub = !currentSubId.isNullOrBlank()
         val cancelAtPeriodEnd = u.subscriptionCancelAtPeriodEnd
 
         if (hasStripeSub && localSubActive && !cancelAtPeriodEnd) {
-            log.warn("Gift code redeem REJECTED: userId={} has ACTIVE auto-renewing Stripe sub={} — must cancel first", userId, u.stripeSubscriptionId)
+            log.warn("Gift code redeem REJECTED: userId={} has ACTIVE auto-renewing Stripe sub={} — must cancel first", userId, currentSubId)
             ctx.status(409).contentType("application/json").result(
                 gson.toJson(mapOf(
                     "error" to "active_paid_subscription",
                     "message" to "You already have an active paid subscription. Cancel it first to redeem this gift code.",
-                    "stripeSubscriptionId" to u.stripeSubscriptionId,
+                    "stripeSubscriptionId" to currentSubId,
                 )),
             )
             return

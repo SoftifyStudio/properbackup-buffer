@@ -160,38 +160,61 @@ class StripeHandler(
         }
     }
 
-    private var monthlyPriceId: String? = null
-    private var annualPriceId: String? = null
+    // Price/Product IDs are per-mode (test vs live live in separate Stripe accounts).
+    // Keyed by (testMode, planKey). Populated lazily on first checkout for that mode.
+    private val priceIds: MutableMap<Pair<Boolean, String>, String> = java.util.concurrent.ConcurrentHashMap()
 
     init {
         if (keyProvider.hasAnyKey()) {
             log.info("Stripe initialized via StripeKeyProvider (per-user key isolation active)")
-            initPriceIds()
+            // Initialize test prices eagerly (matches legacy behavior — most traffic is test).
+            // Live prices are loaded on first live checkout to avoid crashing the app when
+            // live keys are not yet configured.
+            initPriceIdsForMode(testMode = true, eager = true)
         } else {
             log.warn("No Stripe keys configured — Stripe payments disabled")
         }
     }
 
-    private fun initPriceIds() {
+    /**
+     * Load price ids for a given mode from the DB; if missing AND eager, create them in Stripe.
+     * Returns true if both monthly + annual price ids are populated after this call.
+     */
+    private fun initPriceIdsForMode(testMode: Boolean, eager: Boolean): Boolean {
         try {
-            monthlyPriceId = loadPriceId(MONTHLY_PLAN)
-            annualPriceId = loadPriceId(ANNUAL_PLAN)
-
-            if (monthlyPriceId == null || annualPriceId == null) {
-                ensureStripePrices()
+            val cachedMonthly = priceIds[testMode to MONTHLY_PLAN] ?: loadPriceId(MONTHLY_PLAN, testMode)?.also {
+                priceIds[testMode to MONTHLY_PLAN] = it
+            }
+            val cachedAnnual = priceIds[testMode to ANNUAL_PLAN] ?: loadPriceId(ANNUAL_PLAN, testMode)?.also {
+                priceIds[testMode to ANNUAL_PLAN] = it
             }
 
-            log.info("Stripe Prices: monthly={} annual={}", monthlyPriceId, annualPriceId)
+            if ((cachedMonthly == null || cachedAnnual == null) && eager) {
+                ensureStripePricesForMode(testMode)
+            }
+
+            val mode = keyProvider.modeLabelForMode(testMode)
+            log.info(
+                "Stripe Prices ({}): monthly={} annual={}",
+                mode,
+                priceIds[testMode to MONTHLY_PLAN],
+                priceIds[testMode to ANNUAL_PLAN],
+            )
+            return priceIds[testMode to MONTHLY_PLAN] != null && priceIds[testMode to ANNUAL_PLAN] != null
         } catch (e: Exception) {
-            log.warn("Failed to init Stripe Prices (will create on first use): {}", e.message)
+            log.warn("Failed to init Stripe Prices (mode={}): {}", keyProvider.modeLabelForMode(testMode), e.message)
+            return false
         }
     }
 
-    private fun loadPriceId(planKey: String): String? {
+    private fun loadPriceId(planKey: String, testMode: Boolean): String? {
         return try {
             db.getConnection().use { conn ->
-                conn.prepareStatement("SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ?").use { ps ->
+                conn.prepareStatement(
+                    "SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ? AND mode = ?",
+                ).use { ps ->
                     ps.setString(1, planKey)
+                    ps.setString(2, if (testMode) "test" else "live")
                     ps.executeQuery().use { rs ->
                         if (rs.next()) rs.getString("stripe_price_id") else null
                     }
@@ -202,34 +225,49 @@ class StripeHandler(
         }
     }
 
-    private fun savePriceId(planKey: String, priceId: String) {
+    private fun savePriceId(planKey: String, testMode: Boolean, priceId: String) {
+        val modeLabel = if (testMode) "test" else "live"
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO stripe_price_config (plan_key, stripe_price_id) VALUES (?, ?) ON CONFLICT (plan_key) DO UPDATE SET stripe_price_id = ?, updated_at = NOW()",
+                "INSERT INTO stripe_price_config (plan_key, mode, stripe_price_id) VALUES (?, ?, ?) ON CONFLICT (plan_key, mode) DO UPDATE SET stripe_price_id = ?, updated_at = NOW()",
             ).use { ps ->
                 ps.setString(1, planKey)
-                ps.setString(2, priceId)
+                ps.setString(2, modeLabel)
                 ps.setString(3, priceId)
+                ps.setString(4, priceId)
                 ps.executeUpdate()
             }
         }
     }
 
-    private fun defaultRequestOptions(): RequestOptions = keyProvider.requestOptionsForMode(true)
-
-    private fun ensureStripePrices() {
-        val opts = defaultRequestOptions()
+    private fun ensureStripePricesForMode(testMode: Boolean) {
+        val opts = keyProvider.requestOptionsForMode(testMode)
         val productId = findOrCreateProduct(opts)
 
-        if (monthlyPriceId == null) {
-            monthlyPriceId = findOrCreatePrice(productId, MONTHLY_PLAN, MONTHLY_PRICE_PLN, PriceCreateParams.Recurring.Interval.MONTH, opts)
-            savePriceId(MONTHLY_PLAN, monthlyPriceId!!)
+        if (priceIds[testMode to MONTHLY_PLAN] == null) {
+            val id = findOrCreatePrice(productId, MONTHLY_PLAN, MONTHLY_PRICE_PLN, PriceCreateParams.Recurring.Interval.MONTH, opts)
+            priceIds[testMode to MONTHLY_PLAN] = id
+            savePriceId(MONTHLY_PLAN, testMode, id)
         }
 
-        if (annualPriceId == null) {
-            annualPriceId = findOrCreatePrice(productId, ANNUAL_PLAN, ANNUAL_PRICE_PLN, PriceCreateParams.Recurring.Interval.YEAR, opts)
-            savePriceId(ANNUAL_PLAN, annualPriceId!!)
+        if (priceIds[testMode to ANNUAL_PLAN] == null) {
+            val id = findOrCreatePrice(productId, ANNUAL_PLAN, ANNUAL_PRICE_PLN, PriceCreateParams.Recurring.Interval.YEAR, opts)
+            priceIds[testMode to ANNUAL_PLAN] = id
+            savePriceId(ANNUAL_PLAN, testMode, id)
         }
+    }
+
+    /**
+     * Returns the cached price id for (mode, plan), bootstrapping it via Stripe API
+     * if not yet present. Returns null if Stripe is unavailable (e.g. live keys missing).
+     */
+    private fun priceIdFor(testMode: Boolean, plan: String): String? {
+        priceIds[testMode to plan]?.let { return it }
+        // Not in cache — try loading from DB then Stripe (lazy bootstrap for live mode).
+        if (initPriceIdsForMode(testMode, eager = true)) {
+            return priceIds[testMode to plan]
+        }
+        return null
     }
 
     private fun findOrCreateProduct(opts: RequestOptions): String {
@@ -314,11 +352,8 @@ class StripeHandler(
         val plan = (body?.get("plan") as? String) ?: ctx.queryParam("plan") ?: MONTHLY_PLAN
         val promoCode = (body?.get("promoCode") as? String)?.trim()?.uppercase()
 
-        val priceId = if (plan == ANNUAL_PLAN) annualPriceId else monthlyPriceId
-        if (priceId == null) {
-            ensureStripePrices()
-        }
-        val resolvedPriceId = (if (plan == ANNUAL_PLAN) annualPriceId else monthlyPriceId)
+        val userTestMode = keyProvider.isTestMode(userId)
+        val resolvedPriceId = priceIdFor(userTestMode, plan)
             ?: run {
                 ctx.status(503).contentType("application/json").result(
                     gson.toJson(mapOf("error" to "Stripe prices not configured")),
@@ -499,7 +534,7 @@ class StripeHandler(
     }
 
     private fun cancelExistingStripeSubscription(user: UserStore.User) {
-        val subId = user.stripeSubscriptionId
+        val subId = user.currentStripeSubscriptionId()
         if (subId.isNullOrBlank()) return
 
         val opts = keyProvider.requestOptionsFor(user.id)
@@ -514,7 +549,7 @@ class StripeHandler(
             log.warn("Failed to cancel existing subscription subId={}: {}", subId, e.message)
         }
 
-        userStore.updateStripeSubscriptionId(user.id, null)
+        userStore.updateStripeSubscriptionId(user.id, null, user.stripeTestMode)
     }
 
     /**
@@ -686,7 +721,7 @@ class StripeHandler(
                     "trialExpiresAt" to user.trialExpiresAt,
                     "subscriptionPlan" to user.subscriptionPlan,
                     "subscriptionExpiresAt" to user.subscriptionExpiresAt,
-                    "stripeSubscriptionId" to user.stripeSubscriptionId,
+                    "stripeSubscriptionId" to user.currentStripeSubscriptionId(),
                 ),
             ),
         )
@@ -972,9 +1007,11 @@ class StripeHandler(
         return try {
             val sub = Subscription.retrieve(subscriptionId, opts)
             val priceId = sub.items?.data?.firstOrNull()?.price?.id
-            when (priceId) {
-                annualPriceId -> ANNUAL_PLAN
-                monthlyPriceId -> MONTHLY_PLAN
+            // Match against both test and live cached price ids — a subscription belongs to one
+            // mode but at lookup time we don't know which, so check all known ids.
+            val matchedPlan = priceIds.entries.firstOrNull { it.value == priceId }?.key?.second
+            when {
+                matchedPlan != null -> matchedPlan
                 else -> {
                     val amount = sub.items?.data?.firstOrNull()?.price?.unitAmount
                     if (amount != null && amount >= 10000L) ANNUAL_PLAN else MONTHLY_PLAN
@@ -1212,7 +1249,7 @@ class StripeHandler(
 
         logAudit(userId, "cancel_requested", mapOf("plan" to (user.subscriptionPlan ?: "")))
 
-        val subId = user.stripeSubscriptionId
+        val subId = user.currentStripeSubscriptionId()
         if (!subId.isNullOrBlank()) {
             val userOpts = keyProvider.requestOptionsFor(userId)
             try {
@@ -1275,7 +1312,7 @@ class StripeHandler(
             return
         }
         val plan = user.subscriptionPlan!!
-        val subId = user.stripeSubscriptionId
+        val subId = user.currentStripeSubscriptionId()
         val daysRemaining = calculateDaysRemaining(user)
 
         logAudit(userId, "cancel_immediate_requested", mapOf("plan" to plan, "daysRemaining" to daysRemaining))
@@ -1436,7 +1473,7 @@ class StripeHandler(
             return
         }
 
-        val subId = user.stripeSubscriptionId
+        val subId = user.currentStripeSubscriptionId()
         if (!subId.isNullOrBlank() && keyProvider.hasAnyKey()) {
             val userOpts = keyProvider.requestOptionsFor(userId)
             try {
@@ -1523,7 +1560,7 @@ class StripeHandler(
 
             if (paid) {
                 val user = userStore.findById(userId).orElse(null)
-                val alreadyActive = user?.subscriptionPlan == plan && user.stripeSubscriptionId == subscriptionId
+                val alreadyActive = user?.subscriptionPlan == plan && user.currentStripeSubscriptionId() == subscriptionId
 
                 if (!alreadyActive) {
                     // Resolve the canonical Stripe period_end (P2-9) so the verify path is

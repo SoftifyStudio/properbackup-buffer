@@ -28,10 +28,15 @@ class UserStore(private val db: Database) {
         val everSubscribed: Boolean = false,
         val stripeTestMode: Boolean = true,
         val stripeLiveCustomerId: String? = null,
-    )
+        val stripeLiveSubscriptionId: String? = null,
+    ) {
+        /** Returns the subscription id for the user's current Stripe mode. */
+        fun currentStripeSubscriptionId(): String? =
+            if (stripeTestMode) stripeSubscriptionId else stripeLiveSubscriptionId
+    }
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed, stripe_test_mode, stripe_live_customer_id"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed, stripe_test_mode, stripe_live_customer_id, stripe_live_subscription_id"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -105,7 +110,7 @@ class UserStore(private val db: Database) {
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false, true)
+        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false, true, null, null)
     }
 
     fun verifyEmail(token: String): Boolean {
@@ -178,17 +183,40 @@ class UserStore(private val db: Database) {
         }
     }
 
+    /**
+     * Update the subscription id for the user's current Stripe mode (test vs live).
+     * Writes to `stripe_subscription_id` for test mode or `stripe_live_subscription_id` for live mode.
+     */
     fun updateStripeSubscriptionId(userId: String, subscriptionId: String?) {
         db.getConnection().use { conn -> updateStripeSubscriptionId(conn, userId, subscriptionId) }
     }
 
     fun updateStripeSubscriptionId(conn: Connection, userId: String, subscriptionId: String?) {
+        val testMode = lookupTestMode(conn, userId)
+        updateStripeSubscriptionId(conn, userId, subscriptionId, testMode)
+    }
+
+    fun updateStripeSubscriptionId(userId: String, subscriptionId: String?, testMode: Boolean) {
+        db.getConnection().use { conn -> updateStripeSubscriptionId(conn, userId, subscriptionId, testMode) }
+    }
+
+    fun updateStripeSubscriptionId(conn: Connection, userId: String, subscriptionId: String?, testMode: Boolean) {
+        val col = if (testMode) "stripe_subscription_id" else "stripe_live_subscription_id"
         conn.prepareStatement(
-            "UPDATE users SET stripe_subscription_id = ? WHERE id = ?",
+            "UPDATE users SET $col = ? WHERE id = ?",
         ).use { ps ->
             if (subscriptionId != null) ps.setString(1, subscriptionId) else ps.setNull(1, java.sql.Types.VARCHAR)
             ps.setString(2, userId)
             ps.executeUpdate()
+        }
+    }
+
+    private fun lookupTestMode(conn: Connection, userId: String): Boolean {
+        conn.prepareStatement("SELECT stripe_test_mode FROM users WHERE id = ?").use { ps ->
+            ps.setString(1, userId)
+            ps.executeQuery().use { rs ->
+                return if (rs.next()) rs.getBoolean("stripe_test_mode") else true
+            }
         }
     }
 
@@ -197,20 +225,27 @@ class UserStore(private val db: Database) {
     }
 
     fun deactivateSubscription(conn: Connection, userId: String) {
+        val testMode = lookupTestMode(conn, userId)
+        val subCol = if (testMode) "stripe_subscription_id" else "stripe_live_subscription_id"
         conn.prepareStatement(
-            "UPDATE users SET subscription_plan = NULL, subscription_expires_at = NULL, stripe_subscription_id = NULL, subscription_cancel_at_period_end = FALSE WHERE id = ?",
+            "UPDATE users SET subscription_plan = NULL, subscription_expires_at = NULL, $subCol = NULL, subscription_cancel_at_period_end = FALSE WHERE id = ?",
         ).use { ps ->
             ps.setString(1, userId)
             ps.executeUpdate()
         }
     }
 
+    /**
+     * Find a user by Stripe subscription id, checking both test and live columns.
+     * Stripe IDs are unique per account so there's no ambiguity in practice.
+     */
     fun findByStripeSubscriptionId(subscriptionId: String): Optional<User> {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT $SELECT_COLS FROM users WHERE stripe_subscription_id = ?",
+                "SELECT $SELECT_COLS FROM users WHERE stripe_subscription_id = ? OR stripe_live_subscription_id = ?",
             ).use { ps ->
                 ps.setString(1, subscriptionId)
+                ps.setString(2, subscriptionId)
                 ps.executeQuery().use { rs ->
                     return if (rs.next()) Optional.of(map(rs)) else Optional.empty()
                 }
@@ -221,9 +256,10 @@ class UserStore(private val db: Database) {
     fun findByStripeCustomerId(customerId: String): Optional<User> {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT $SELECT_COLS FROM users WHERE stripe_customer_id = ?",
+                "SELECT $SELECT_COLS FROM users WHERE stripe_customer_id = ? OR stripe_live_customer_id = ?",
             ).use { ps ->
                 ps.setString(1, customerId)
+                ps.setString(2, customerId)
                 ps.executeQuery().use { rs ->
                     return if (rs.next()) Optional.of(map(rs)) else Optional.empty()
                 }
@@ -317,5 +353,6 @@ class UserStore(private val db: Database) {
         rs.getBoolean("ever_subscribed"),
         rs.getBoolean("stripe_test_mode"),
         rs.getString("stripe_live_customer_id"),
+        rs.getString("stripe_live_subscription_id"),
     )
 }

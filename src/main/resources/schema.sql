@@ -363,9 +363,30 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_test_mode BOOLEAN NOT NULL DEF
 -- test customer_id will NOT work with live keys and vice-versa.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_live_customer_id VARCHAR(64);
 
--- Stripe recurring price IDs (auto-created or manually configured)
+-- Stripe recurring price IDs (auto-created or manually configured).
+-- PK is (plan_key, mode) because Stripe Products/Prices live in separate
+-- accounts for test vs live — a test price_id will NOT work with live keys
+-- and vice-versa. Each mode therefore has its own row per plan.
 CREATE TABLE IF NOT EXISTS stripe_price_config (
-  plan_key      VARCHAR(32) PRIMARY KEY,
+  plan_key      VARCHAR(32) NOT NULL,
   stripe_price_id VARCHAR(128) NOT NULL,
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  mode          VARCHAR(8) NOT NULL DEFAULT 'test',
+  PRIMARY KEY (plan_key, mode)
 );
+
+-- Migration from legacy single-PK schema: pre-existing rows were always created
+-- in test mode (the legacy defaultRequestOptions was hard-coded to test). The
+-- statements below are idempotent so they run safely on both fresh and migrated
+-- databases. Note: schema.sql is split on semicolons by the loader, so we keep
+-- each statement plain (no DO blocks).
+ALTER TABLE stripe_price_config ADD COLUMN IF NOT EXISTS mode VARCHAR(8) NOT NULL DEFAULT 'test';
+ALTER TABLE stripe_price_config DROP CONSTRAINT IF EXISTS stripe_price_config_pkey;
+ALTER TABLE stripe_price_config ADD PRIMARY KEY (plan_key, mode);
+
+-- Separate Stripe subscription IDs for test and live environments. Same rationale
+-- as stripe_customer_id / stripe_live_customer_id: subscription IDs are scoped to
+-- the Stripe account that created them. Without this split, flipping a user from
+-- test to live leaves the test subscription un-cancelable (live API can't see it)
+-- and silently overwrites the column with the new live subscription id.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_live_subscription_id VARCHAR(64);

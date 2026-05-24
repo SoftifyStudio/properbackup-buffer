@@ -67,6 +67,22 @@ class StripeKeyProvider(
         val testKeyPrefix = if (testSecretKey.length >= 8) testSecretKey.take(8) + "…" else "(empty)"
         val liveKeyPrefix = if (liveSecretKey.length >= 8) liveSecretKey.take(8) + "…" else "(empty)"
         log.info("StripeKeyProvider initialised: testKey={} liveKey={}", testKeyPrefix, liveKeyPrefix)
+
+        // Fail-loud diagnostics so operators discover misconfiguration before money moves.
+        if (liveSecretKey.isNotBlank() && liveSecretKey == testSecretKey) {
+            log.warn(
+                "⚠️  STRIPE LIVE KEYS NOT CONFIGURED — live secret key falls back to test secret key. " +
+                    "If any user has stripe_test_mode=FALSE their billing will hit Stripe TEST dashboard " +
+                    "(no real revenue). Set STRIPE_LIVE_SECRET_KEY / STRIPE_LIVE_PUBLIC_KEY / " +
+                    "STRIPE_LIVE_WEBHOOK_SECRET before promoting users to live.",
+            )
+        }
+        if (testSecretKey.isNotBlank() && testSecretKey.startsWith("sk_live_")) {
+            log.error("CRITICAL: STRIPE_TEST_SECRET_KEY has sk_live_ prefix — test/live keys appear swapped!")
+        }
+        if (liveSecretKey.isNotBlank() && liveSecretKey != testSecretKey && liveSecretKey.startsWith("sk_test_")) {
+            log.error("CRITICAL: STRIPE_LIVE_SECRET_KEY has sk_test_ prefix — live mode would still hit test Stripe!")
+        }
     }
 
     // ── Per-user mode flag ────────────────────────────────────────────────

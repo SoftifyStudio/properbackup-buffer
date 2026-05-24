@@ -115,7 +115,7 @@ class SubscriptionHandler(
                     "daysRemaining" to daysRemaining,
                     "active" to active,
                     "cancelAtPeriodEnd" to user.subscriptionCancelAtPeriodEnd,
-                    "stripeSubscriptionId" to user.stripeSubscriptionId,
+                    "stripeSubscriptionId" to user.currentStripeSubscriptionId(),
                     "trialExpiresAt" to user.trialExpiresAt,
                     "subscriptionExpiresAt" to user.subscriptionExpiresAt,
                     "storageLimitBytes" to user.storageLimitBytes,

@@ -826,18 +826,20 @@ class SubscriptionIntegrationTest {
     fun `stripe price config saves and loads`() {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO stripe_price_config (plan_key, stripe_price_id) VALUES (?, ?) ON CONFLICT (plan_key) DO UPDATE SET stripe_price_id = ?",
+                "INSERT INTO stripe_price_config (plan_key, mode, stripe_price_id) VALUES (?, ?, ?) ON CONFLICT (plan_key, mode) DO UPDATE SET stripe_price_id = ?",
             ).use { ps ->
                 ps.setString(1, "test_monthly")
-                ps.setString(2, "price_test_123")
+                ps.setString(2, "test")
                 ps.setString(3, "price_test_123")
+                ps.setString(4, "price_test_123")
                 ps.executeUpdate()
             }
         }
 
         val priceId = db.getConnection().use { conn ->
-            conn.prepareStatement("SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ?").use { ps ->
+            conn.prepareStatement("SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ? AND mode = ?").use { ps ->
                 ps.setString(1, "test_monthly")
+                ps.setString(2, "test")
                 ps.executeQuery().use { rs -> if (rs.next()) rs.getString("stripe_price_id") else null }
             }
         }
@@ -850,18 +852,20 @@ class SubscriptionIntegrationTest {
     fun `stripe price config upsert overwrites`() {
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "INSERT INTO stripe_price_config (plan_key, stripe_price_id) VALUES (?, ?) ON CONFLICT (plan_key) DO UPDATE SET stripe_price_id = ?, updated_at = NOW()",
+                "INSERT INTO stripe_price_config (plan_key, mode, stripe_price_id) VALUES (?, ?, ?) ON CONFLICT (plan_key, mode) DO UPDATE SET stripe_price_id = ?, updated_at = NOW()",
             ).use { ps ->
                 ps.setString(1, "test_monthly")
-                ps.setString(2, "price_test_456")
+                ps.setString(2, "test")
                 ps.setString(3, "price_test_456")
+                ps.setString(4, "price_test_456")
                 ps.executeUpdate()
             }
         }
 
         val priceId = db.getConnection().use { conn ->
-            conn.prepareStatement("SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ?").use { ps ->
+            conn.prepareStatement("SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ? AND mode = ?").use { ps ->
                 ps.setString(1, "test_monthly")
+                ps.setString(2, "test")
                 ps.executeQuery().use { rs -> if (rs.next()) rs.getString("stripe_price_id") else null }
             }
         }
