@@ -123,6 +123,41 @@ class StripeHandler(
             val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
             return digest.joinToString("") { "%02x".format(it) }.take(40)
         }
+
+        private const val MAX_RETRIES = 3
+        private val RETRY_DELAYS_MS = longArrayOf(200, 800, 2000)
+
+        fun <T> withRetry(label: String, log: org.slf4j.Logger, block: () -> T): T {
+            var lastException: Exception? = null
+            for (attempt in 0..MAX_RETRIES) {
+                try {
+                    return block()
+                } catch (e: com.stripe.exception.RateLimitException) {
+                    lastException = e
+                    if (attempt < MAX_RETRIES) {
+                        log.warn("{}: Stripe 429 (rate limit), retrying in {}ms (attempt {}/{})", label, RETRY_DELAYS_MS[attempt], attempt + 1, MAX_RETRIES)
+                        Thread.sleep(RETRY_DELAYS_MS[attempt])
+                    }
+                } catch (e: com.stripe.exception.ApiConnectionException) {
+                    lastException = e
+                    if (attempt < MAX_RETRIES) {
+                        log.warn("{}: Stripe connection error, retrying in {}ms (attempt {}/{})", label, RETRY_DELAYS_MS[attempt], attempt + 1, MAX_RETRIES)
+                        Thread.sleep(RETRY_DELAYS_MS[attempt])
+                    }
+                } catch (e: com.stripe.exception.ApiException) {
+                    if ((e.statusCode ?: 0) >= 500) {
+                        lastException = e
+                        if (attempt < MAX_RETRIES) {
+                            log.warn("{}: Stripe {}. retrying in {}ms (attempt {}/{})", label, e.statusCode, RETRY_DELAYS_MS[attempt], attempt + 1, MAX_RETRIES)
+                            Thread.sleep(RETRY_DELAYS_MS[attempt])
+                        }
+                    } else {
+                        throw e
+                    }
+                }
+            }
+            throw lastException!!
+        }
     }
 
     private var monthlyPriceId: String? = null
@@ -421,7 +456,9 @@ class StripeHandler(
                 .setApiKey(keyProvider.secretKeyFor(userId))
                 .setIdempotencyKey(idempotencyKey)
                 .build()
-            val session = Session.create(sessionBuilder.build(), requestOptions)
+            val session = withRetry("checkout", log) {
+                Session.create(sessionBuilder.build(), requestOptions)
+            }
 
             log.info(
                 "Stripe Subscription Checkout created: sessionId={} userId={} plan={} priceId={} idempKey={}",
@@ -841,34 +878,46 @@ class StripeHandler(
             return
         }
 
+        // Single transaction with FOR UPDATE to prevent race with concurrent activateSubscription.
         val now = Instant.now()
-        val expiresAt = user.subscriptionExpiresAt
-            ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        userStore.getConnection().use { conn ->
+            conn.autoCommit = false
+            try {
+                val locked = userStore.findByIdForUpdate(conn, user.id).orElse(null) ?: run {
+                    conn.rollback()
+                    return
+                }
+                val expiresAt = locked.subscriptionExpiresAt
+                    ?.let { runCatching { Instant.parse(it) }.getOrNull() }
 
-        if (expiresAt != null && expiresAt.isAfter(now)) {
-            // Paid time remains — only clear the Stripe subscription reference.
-            // The plan + expiresAt stay so the customer keeps access until the paid period ends.
-            val daysLeft = Duration.between(now, expiresAt).toDays()
-            log.info(
-                "Subscription deleted but paid time remains: userId={} plan={} expiresAt={} daysLeft={}",
-                user.id, user.subscriptionPlan, expiresAt, daysLeft,
-            )
-            userStore.updateStripeSubscriptionId(user.id, null)
-            userStore.setCancelAtPeriodEnd(user.id, true)
-            logAudit(user.id, "subscription_deleted_but_time_preserved", mapOf(
-                "subscriptionId" to subscription.id,
-                "plan" to (user.subscriptionPlan ?: ""),
-                "expiresAt" to expiresAt.toString(),
-                "daysRemaining" to daysLeft,
-            ))
-        } else {
-            // Plan expired or no date — full deactivation
-            log.info("Subscription deleted and expired: userId={} subId={}", user.id, subscription.id)
-            userStore.deactivateSubscription(user.id)
-            logAudit(user.id, "subscription_deleted", mapOf(
-                "subscriptionId" to subscription.id,
-                "reason" to (subscription.cancellationDetails?.reason ?: "unknown"),
-            ))
+                if (expiresAt != null && expiresAt.isAfter(now)) {
+                    val daysLeft = Duration.between(now, expiresAt).toDays()
+                    log.info(
+                        "Subscription deleted but paid time remains: userId={} plan={} expiresAt={} daysLeft={}",
+                        locked.id, locked.subscriptionPlan, expiresAt, daysLeft,
+                    )
+                    userStore.updateStripeSubscriptionId(conn, locked.id, null)
+                    userStore.setCancelAtPeriodEnd(conn, locked.id, true)
+                    conn.commit()
+                    logAudit(locked.id, "subscription_deleted_but_time_preserved", mapOf(
+                        "subscriptionId" to subscription.id,
+                        "plan" to (locked.subscriptionPlan ?: ""),
+                        "expiresAt" to expiresAt.toString(),
+                        "daysRemaining" to daysLeft,
+                    ))
+                } else {
+                    log.info("Subscription deleted and expired: userId={} subId={}", locked.id, subscription.id)
+                    userStore.deactivateSubscription(conn, locked.id)
+                    conn.commit()
+                    logAudit(locked.id, "subscription_deleted", mapOf(
+                        "subscriptionId" to subscription.id,
+                        "reason" to (subscription.cancellationDetails?.reason ?: "unknown"),
+                    ))
+                }
+            } catch (e: Exception) {
+                conn.rollback()
+                throw e
+            }
         }
     }
 
@@ -959,33 +1008,45 @@ class StripeHandler(
      */
     fun activateSubscription(userId: String, plan: String, stripePeriodEnd: Instant? = null) {
         val now = Instant.now()
-        val user = userStore.findById(userId).orElse(null)
-        val currentExpiresAt = user?.subscriptionExpiresAt
-            ?.let { runCatching { Instant.parse(it) }.getOrNull() }
 
-        val newExpiresAt = if (stripePeriodEnd != null) {
-            // Never shorten a paid expiry date — take the later of current vs Stripe
-            if (currentExpiresAt != null && currentExpiresAt.isAfter(stripePeriodEnd)) {
-                currentExpiresAt
-            } else {
-                stripePeriodEnd
+        // Single transaction with SELECT FOR UPDATE to prevent race conditions
+        // (e.g. concurrent invoice.paid + checkout.completed webhooks).
+        userStore.getConnection().use { conn ->
+            conn.autoCommit = false
+            try {
+                val user = userStore.findByIdForUpdate(conn, userId).orElse(null)
+                val currentExpiresAt = user?.subscriptionExpiresAt
+                    ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+
+                val newExpiresAt = if (stripePeriodEnd != null) {
+                    if (currentExpiresAt != null && currentExpiresAt.isAfter(stripePeriodEnd)) {
+                        currentExpiresAt
+                    } else {
+                        stripePeriodEnd
+                    }
+                } else {
+                    val durationSeconds = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS * 24 * 60 * 60 else MONTHLY_TOTAL_DAYS * 24 * 60 * 60
+                    val currentExpiry = currentExpiresAt
+                        ?: user?.trialExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                    val baseTime = if (currentExpiry != null && currentExpiry.isAfter(now)) currentExpiry else now
+                    baseTime.plusSeconds(durationSeconds)
+                }
+
+                userStore.updateSubscription(conn, userId, plan, newExpiresAt, STORAGE_LIMIT_BYTES)
+                conn.commit()
+
+                log.info(
+                    "Subscription activated: userId={} plan={} expiresAt={} source={} prevExpiresAt={}",
+                    userId, plan, newExpiresAt,
+                    if (stripePeriodEnd != null) "stripe_period_end" else "local_fallback",
+                    currentExpiresAt ?: "none",
+                )
+            } catch (e: Exception) {
+                conn.rollback()
+                throw e
             }
-        } else {
-            val durationSeconds = if (plan == ANNUAL_PLAN) ANNUAL_TOTAL_DAYS * 24 * 60 * 60 else MONTHLY_TOTAL_DAYS * 24 * 60 * 60
-            val currentExpiry = currentExpiresAt
-                ?: user?.trialExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            val baseTime = if (currentExpiry != null && currentExpiry.isAfter(now)) currentExpiry else now
-            baseTime.plusSeconds(durationSeconds)
         }
-
-        userStore.updateSubscription(userId, plan, newExpiresAt, STORAGE_LIMIT_BYTES)
         userStore.markEverSubscribed(userId)
-        log.info(
-            "Subscription activated: userId={} plan={} expiresAt={} source={} prevExpiresAt={}",
-            userId, plan, newExpiresAt,
-            if (stripePeriodEnd != null) "stripe_period_end" else "local_fallback",
-            currentExpiresAt ?: "none",
-        )
     }
 
     fun calculateDaysRemaining(user: UserStore.User): Long {

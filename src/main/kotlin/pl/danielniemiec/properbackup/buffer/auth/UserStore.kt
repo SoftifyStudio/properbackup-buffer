@@ -2,6 +2,7 @@ package pl.danielniemiec.properbackup.buffer.auth
 
 import at.favre.lib.crypto.bcrypt.BCrypt
 import pl.danielniemiec.properbackup.buffer.db.Database
+import java.sql.Connection
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.Optional
@@ -57,6 +58,19 @@ class UserStore(private val db: Database) {
             }
         }
     }
+
+    fun findByIdForUpdate(conn: Connection, id: String): Optional<User> {
+        conn.prepareStatement(
+            "SELECT $SELECT_COLS FROM users WHERE id = ? FOR UPDATE",
+        ).use { ps ->
+            ps.setString(1, id)
+            ps.executeQuery().use { rs ->
+                return if (rs.next()) Optional.of(map(rs)) else Optional.empty()
+            }
+        }
+    }
+
+    fun getConnection(): Connection = db.getConnection()
 
     fun listSummaries(): List<UserSummary> {
         db.getConnection().use { conn ->
@@ -148,38 +162,46 @@ class UserStore(private val db: Database) {
 
     fun updateSubscription(userId: String, plan: String, expiresAt: Instant, storageLimitBytes: Long) {
         db.getConnection().use { conn ->
-            conn.prepareStatement(
-                "UPDATE users SET subscription_plan = ?, subscription_expires_at = ?, storage_limit_bytes = ?, subscription_cancel_at_period_end = FALSE WHERE id = ?",
-            ).use { ps ->
-                ps.setString(1, plan)
-                ps.setTimestamp(2, Timestamp.from(expiresAt))
-                ps.setLong(3, storageLimitBytes)
-                ps.setString(4, userId)
-                ps.executeUpdate()
-            }
+            updateSubscription(conn, userId, plan, expiresAt, storageLimitBytes)
+        }
+    }
+
+    fun updateSubscription(conn: Connection, userId: String, plan: String, expiresAt: Instant, storageLimitBytes: Long) {
+        conn.prepareStatement(
+            "UPDATE users SET subscription_plan = ?, subscription_expires_at = ?, storage_limit_bytes = ?, subscription_cancel_at_period_end = FALSE WHERE id = ?",
+        ).use { ps ->
+            ps.setString(1, plan)
+            ps.setTimestamp(2, Timestamp.from(expiresAt))
+            ps.setLong(3, storageLimitBytes)
+            ps.setString(4, userId)
+            ps.executeUpdate()
         }
     }
 
     fun updateStripeSubscriptionId(userId: String, subscriptionId: String?) {
-        db.getConnection().use { conn ->
-            conn.prepareStatement(
-                "UPDATE users SET stripe_subscription_id = ? WHERE id = ?",
-            ).use { ps ->
-                if (subscriptionId != null) ps.setString(1, subscriptionId) else ps.setNull(1, java.sql.Types.VARCHAR)
-                ps.setString(2, userId)
-                ps.executeUpdate()
-            }
+        db.getConnection().use { conn -> updateStripeSubscriptionId(conn, userId, subscriptionId) }
+    }
+
+    fun updateStripeSubscriptionId(conn: Connection, userId: String, subscriptionId: String?) {
+        conn.prepareStatement(
+            "UPDATE users SET stripe_subscription_id = ? WHERE id = ?",
+        ).use { ps ->
+            if (subscriptionId != null) ps.setString(1, subscriptionId) else ps.setNull(1, java.sql.Types.VARCHAR)
+            ps.setString(2, userId)
+            ps.executeUpdate()
         }
     }
 
     fun deactivateSubscription(userId: String) {
-        db.getConnection().use { conn ->
-            conn.prepareStatement(
-                "UPDATE users SET subscription_plan = NULL, subscription_expires_at = NULL, stripe_subscription_id = NULL, subscription_cancel_at_period_end = FALSE WHERE id = ?",
-            ).use { ps ->
-                ps.setString(1, userId)
-                ps.executeUpdate()
-            }
+        db.getConnection().use { conn -> deactivateSubscription(conn, userId) }
+    }
+
+    fun deactivateSubscription(conn: Connection, userId: String) {
+        conn.prepareStatement(
+            "UPDATE users SET subscription_plan = NULL, subscription_expires_at = NULL, stripe_subscription_id = NULL, subscription_cancel_at_period_end = FALSE WHERE id = ?",
+        ).use { ps ->
+            ps.setString(1, userId)
+            ps.executeUpdate()
         }
     }
 
@@ -210,14 +232,16 @@ class UserStore(private val db: Database) {
     }
 
     fun setCancelAtPeriodEnd(userId: String, cancel: Boolean) {
-        db.getConnection().use { conn ->
-            conn.prepareStatement(
-                "UPDATE users SET subscription_cancel_at_period_end = ? WHERE id = ?",
-            ).use { ps ->
-                ps.setBoolean(1, cancel)
-                ps.setString(2, userId)
-                ps.executeUpdate()
-            }
+        db.getConnection().use { conn -> setCancelAtPeriodEnd(conn, userId, cancel) }
+    }
+
+    fun setCancelAtPeriodEnd(conn: Connection, userId: String, cancel: Boolean) {
+        conn.prepareStatement(
+            "UPDATE users SET subscription_cancel_at_period_end = ? WHERE id = ?",
+        ).use { ps ->
+            ps.setBoolean(1, cancel)
+            ps.setString(2, userId)
+            ps.executeUpdate()
         }
     }
 

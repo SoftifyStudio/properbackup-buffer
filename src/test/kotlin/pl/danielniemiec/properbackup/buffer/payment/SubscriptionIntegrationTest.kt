@@ -5,6 +5,7 @@ import io.mockk.every
 import io.mockk.mockk
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.MethodOrderer
@@ -1851,5 +1852,124 @@ class SubscriptionIntegrationTest {
         val hex = mac.doFinal(signedPayload.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
         return "t=$ts,v1=$hex"
+    }
+
+    // ========================================================================
+    // PARANOID QA: race condition / row-locking tests
+    // ========================================================================
+
+    @Test
+    @Order(300)
+    fun `concurrent activateSubscription calls on same user produce consistent result (race test)`() {
+        val userId = createTestUser("race-activate-${System.currentTimeMillis()}@properbackup.dev")
+        val farFuture = Instant.parse("2099-12-31T23:59:59Z")
+        stripeHandler.activateSubscription(userId, StripeHandler.ANNUAL_PLAN, farFuture)
+
+        val threads = 8
+        val latch = CountDownLatch(1)
+        val pool = Executors.newFixedThreadPool(threads)
+        val errors = AtomicInteger(0)
+
+        val nearFuture = Instant.parse("2030-01-01T00:00:00Z")
+        for (i in 0 until threads) {
+            pool.submit {
+                latch.await()
+                try {
+                    stripeHandler.activateSubscription(userId, StripeHandler.MONTHLY_PLAN, nearFuture)
+                } catch (_: Exception) {
+                    errors.incrementAndGet()
+                }
+            }
+        }
+        latch.countDown()
+        pool.shutdown()
+        pool.awaitTermination(10, TimeUnit.SECONDS)
+
+        val user = userStore.findById(userId).orElseThrow()
+        val recorded = Instant.parse(user.subscriptionExpiresAt!!)
+        // max() must have preserved the farFuture date regardless of concurrent attempts.
+        assertTrue(
+            Duration.between(farFuture, recorded).abs().toSeconds() <= 1,
+            "Concurrent activateSubscription must preserve max(expiresAt) — got $recorded, expected ~$farFuture",
+        )
+    }
+
+    @Test
+    @Order(301)
+    fun `findByIdForUpdate acquires row lock within a transaction`() {
+        val userId = createTestUser("lock-test-${System.currentTimeMillis()}@properbackup.dev")
+        val startExpiry = Instant.now().plus(Duration.ofDays(60))
+        userStore.updateSubscription(userId, StripeHandler.MONTHLY_PLAN, startExpiry, 2199023255552L)
+
+        val conn1 = db.getConnection()
+        conn1.autoCommit = false
+        val locked = userStore.findByIdForUpdate(conn1, userId)
+        assertTrue(locked.isPresent, "Should find user with FOR UPDATE")
+
+        // In a second thread, try to lock the same row — it should block until conn1 commits.
+        val blockedStart = System.currentTimeMillis()
+        val otherDone = CountDownLatch(1)
+        val otherThread = Thread {
+            val conn2 = db.getConnection()
+            conn2.autoCommit = false
+            try {
+                userStore.findByIdForUpdate(conn2, userId)
+            } finally {
+                conn2.rollback()
+                conn2.close()
+                otherDone.countDown()
+            }
+        }
+        otherThread.start()
+
+        // Give the other thread time to start (it should block on the lock).
+        Thread.sleep(200)
+        assertFalse(otherDone.await(100, TimeUnit.MILLISECONDS), "Second FOR UPDATE should block while first holds lock")
+
+        // Release the lock — second thread should proceed.
+        conn1.rollback()
+        conn1.close()
+        assertTrue(otherDone.await(5, TimeUnit.SECONDS), "Second FOR UPDATE should complete after first releases lock")
+    }
+
+    @Test
+    @Order(302)
+    fun `withRetry retries on RateLimitException then succeeds`() {
+        val callCount = AtomicInteger(0)
+        val result = StripeHandler.withRetry("test", org.slf4j.LoggerFactory.getLogger("test")) {
+            if (callCount.incrementAndGet() <= 2) {
+                throw com.stripe.exception.RateLimitException("rate limited", null, null, null, 429, null)
+            }
+            "ok"
+        }
+        assertEquals("ok", result)
+        assertEquals(3, callCount.get(), "Should have retried twice before succeeding")
+    }
+
+    @Test
+    @Order(303)
+    fun `withRetry throws after MAX_RETRIES exhausted`() {
+        val callCount = AtomicInteger(0)
+        val ex = assertThrows<com.stripe.exception.RateLimitException> {
+            StripeHandler.withRetry("test", org.slf4j.LoggerFactory.getLogger("test")) {
+                callCount.incrementAndGet()
+                throw com.stripe.exception.RateLimitException("rate limited", null, null, null, 429, null)
+            }
+        }
+        assertEquals(4, callCount.get(), "Should attempt 1 initial + 3 retries = 4 total")
+        assertNotNull(ex)
+    }
+
+    @Test
+    @Order(304)
+    fun `withRetry does NOT retry on 4xx errors`() {
+        val callCount = AtomicInteger(0)
+        assertThrows<com.stripe.exception.InvalidRequestException> {
+            StripeHandler.withRetry("test", org.slf4j.LoggerFactory.getLogger("test")) {
+                callCount.incrementAndGet()
+                throw com.stripe.exception.InvalidRequestException("bad request", "param", null, null, 400, null)
+            }
+        }
+        assertEquals(1, callCount.get(), "4xx should NOT be retried")
     }
 }
