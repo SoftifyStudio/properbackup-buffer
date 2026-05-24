@@ -279,6 +279,25 @@ class StripeHandler(
         val plan = (body?.get("plan") as? String) ?: ctx.queryParam("plan") ?: MONTHLY_PLAN
         val promoCode = (body?.get("promoCode") as? String)?.trim()?.uppercase()
 
+        // Guard: block downgrade that would shorten coverage period.
+        // E.g. user has annual expiring 2027-05 → buying monthly (expiring in ~30 days) is a loss.
+        if (user.subscriptionPlan == ANNUAL_PLAN && plan == MONTHLY_PLAN) {
+            val daysLeft = calculateDaysRemaining(user)
+            if (daysLeft > MONTHLY_TOTAL_DAYS) {
+                log.info("Checkout BLOCKED — downgrade would shorten coverage: userId={} currentPlan=annual daysRemaining={} requestedPlan=monthly", userId, daysLeft)
+                logAudit(userId, "checkout_blocked_downgrade", mapOf("currentPlan" to ANNUAL_PLAN, "requestedPlan" to plan, "daysRemaining" to daysLeft))
+                ctx.status(409).contentType("application/json").result(
+                    gson.toJson(mapOf(
+                        "error" to "downgrade_blocked",
+                        "reason" to "active_annual_plan",
+                        "daysRemaining" to daysLeft,
+                        "message" to "Cannot switch to monthly while annual plan is active with $daysLeft days remaining. Wait until your annual plan expires or contact support.",
+                    )),
+                )
+                return
+            }
+        }
+
         val priceId = if (plan == ANNUAL_PLAN) annualPriceId else monthlyPriceId
         if (priceId == null) {
             ensureStripePrices()
