@@ -335,6 +335,51 @@ class SubscriptionIntegrationTest {
     }
 
     @Test
+    @Order(28_1)
+    fun `EDGE CASE - annual user with 500 days remaining switches to monthly (gt365 days)`() {
+        // Customer somehow has >365 days (e.g. stacked gift codes + annual renewal).
+        // remainingValue = 19000 * 500 / 365 = 26027. Monthly base = 1900.
+        // Coupon caps at 1900. Overflow = 26027 - 1900 = 24127.
+        val (discount, overflow) = StripeHandler.calculateProratedDiscount(
+            currentPlan = StripeHandler.ANNUAL_PLAN, daysRemaining = 500L,
+            newPlanBaseGrosze = StripeHandler.MONTHLY_PRICE_PLN,
+            newPlanTotalDays = StripeHandler.MONTHLY_TOTAL_DAYS,
+        )
+        val expectedRemaining = StripeHandler.ANNUAL_PRICE_PLN * 500L / StripeHandler.ANNUAL_TOTAL_DAYS
+        assertEquals(StripeHandler.MONTHLY_PRICE_PLN, discount, "coupon caps at monthly base")
+        assertEquals(expectedRemaining - StripeHandler.MONTHLY_PRICE_PLN, overflow, "excess goes to customer.balance")
+        assertEquals(expectedRemaining, discount + overflow, "total value preserved")
+    }
+
+    @Test
+    @Order(28_2)
+    fun `EDGE CASE - annual user with 500 days remaining switches to annual`() {
+        val (discount, overflow) = StripeHandler.calculateProratedDiscount(
+            currentPlan = StripeHandler.ANNUAL_PLAN, daysRemaining = 500L,
+            newPlanBaseGrosze = StripeHandler.ANNUAL_PRICE_PLN,
+            newPlanTotalDays = StripeHandler.ANNUAL_TOTAL_DAYS,
+        )
+        val expectedRemaining = StripeHandler.ANNUAL_PRICE_PLN * 500L / StripeHandler.ANNUAL_TOTAL_DAYS
+        assertEquals(StripeHandler.ANNUAL_PRICE_PLN, discount, "coupon caps at annual base (free renewal)")
+        assertEquals(expectedRemaining - StripeHandler.ANNUAL_PRICE_PLN, overflow)
+        assertEquals(expectedRemaining, discount + overflow, "total value preserved")
+    }
+
+    @Test
+    @Order(28_3)
+    fun `EDGE CASE - monthly user with 60 days remaining (stacked gift) switches to monthly`() {
+        val (discount, overflow) = StripeHandler.calculateProratedDiscount(
+            currentPlan = StripeHandler.MONTHLY_PLAN, daysRemaining = 60L,
+            newPlanBaseGrosze = StripeHandler.MONTHLY_PRICE_PLN,
+            newPlanTotalDays = StripeHandler.MONTHLY_TOTAL_DAYS,
+        )
+        val expectedRemaining = StripeHandler.MONTHLY_PRICE_PLN * 60L / StripeHandler.MONTHLY_TOTAL_DAYS
+        assertEquals(StripeHandler.MONTHLY_PRICE_PLN, discount, "coupon caps at monthly base")
+        assertTrue(overflow > 0, "must have overflow credit when remaining > plan period")
+        assertEquals(expectedRemaining, discount + overflow, "total value preserved")
+    }
+
+    @Test
     @Order(29)
     fun `total discount cannot exceed base price`() {
         // Used to be a tautology over a local minOf. Now wired through the real helper to ensure
