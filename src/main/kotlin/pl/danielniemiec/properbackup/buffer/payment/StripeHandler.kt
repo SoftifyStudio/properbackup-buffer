@@ -878,6 +878,7 @@ class StripeHandler(
         // Guard: if the user was flagged as abuse-blocked (by handleCheckoutCompleted),
         // do NOT re-activate via invoice.paid. Re-read from DB to catch concurrent updates.
         val freshUser = userStore.findById(user.id).orElse(null) ?: user
+        log.info("Stripe invoice.paid guard: userId={} paymentStatus={}", user.id, freshUser.subscriptionPaymentStatus)
         if (freshUser.subscriptionPaymentStatus == "abuse_blocked") {
             log.info("Stripe invoice.paid: user {} is abuse_blocked, skipping activation", user.id)
             return
@@ -887,11 +888,14 @@ class StripeHandler(
         // handleCheckoutCompleted), do NOT re-activate via invoice.paid.
         try {
             val stripeSub = Subscription.retrieve(subscriptionId, opts)
+            log.info("Stripe invoice.paid guard: subscription {} status={} for userId={}", subscriptionId, stripeSub.status, user.id)
             if (stripeSub.status == "canceled") {
                 log.info("Stripe invoice.paid: subscription {} is canceled, skipping activation for userId={}", subscriptionId, user.id)
                 return
             }
-        } catch (_: Exception) { /* proceed if we can't verify */ }
+        } catch (e: Exception) {
+            log.warn("Stripe invoice.paid guard: could not check sub status for {}: {}", subscriptionId, e.message)
+        }
 
         // Extend subscription to the exact next period_end from Stripe (P2-9). Falls back to
         // 31/365-day stacking only if we can't resolve the canonical timestamp.
@@ -1138,6 +1142,14 @@ class StripeHandler(
             conn.autoCommit = false
             try {
                 val user = userStore.findByIdForUpdate(conn, userId).orElse(null)
+
+                // Guard: never activate a user flagged as abuse-blocked
+                if (user?.subscriptionPaymentStatus == "abuse_blocked") {
+                    log.info("activateSubscription blocked: userId={} is abuse_blocked", userId)
+                    conn.rollback()
+                    return
+                }
+
                 val currentExpiresAt = user?.subscriptionExpiresAt
                     ?.let { runCatching { Instant.parse(it) }.getOrNull() }
 
