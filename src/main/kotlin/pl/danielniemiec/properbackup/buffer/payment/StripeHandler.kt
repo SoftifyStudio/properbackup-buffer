@@ -872,6 +872,16 @@ class StripeHandler(
             user.id, subscriptionId, plan, invoice.amountPaid,
         )
 
+        // Guard: if the subscription was cancelled (e.g. by trial abuse detection in
+        // handleCheckoutCompleted), do NOT re-activate via invoice.paid.
+        try {
+            val stripeSub = Subscription.retrieve(subscriptionId, opts)
+            if (stripeSub.status == "canceled") {
+                log.info("Stripe invoice.paid: subscription {} is canceled, skipping activation for userId={}", subscriptionId, user.id)
+                return
+            }
+        } catch (_: Exception) { /* proceed if we can't verify */ }
+
         // Extend subscription to the exact next period_end from Stripe (P2-9). Falls back to
         // 31/365-day stacking only if we can't resolve the canonical timestamp.
         val periodEnd = invoice.lines?.data?.firstOrNull()?.period?.end?.let { Instant.ofEpochSecond(it) }
