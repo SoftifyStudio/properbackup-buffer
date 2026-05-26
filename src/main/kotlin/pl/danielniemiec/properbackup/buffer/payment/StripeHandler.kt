@@ -784,6 +784,9 @@ class StripeHandler(
                         "Trial abuse detected: userId={} tried card fingerprint={} already used by userId={}",
                         userId, cardFingerprint, existingUsers.first { it.id != userId }.id,
                     )
+                    // Mark as abuse-blocked BEFORE cancelling, to prevent invoice.paid from
+                    // re-activating this user during the race window.
+                    userStore.setSubscriptionPaymentStatus(userId, "abuse_blocked")
                     // Cancel the new subscription immediately
                     try {
                         val sub = Subscription.retrieve(subscriptionId, opts)
@@ -871,6 +874,14 @@ class StripeHandler(
             "Stripe invoice.paid: userId={} subscriptionId={} plan={} amountPaid={}",
             user.id, subscriptionId, plan, invoice.amountPaid,
         )
+
+        // Guard: if the user was flagged as abuse-blocked (by handleCheckoutCompleted),
+        // do NOT re-activate via invoice.paid. Re-read from DB to catch concurrent updates.
+        val freshUser = userStore.findById(user.id).orElse(null) ?: user
+        if (freshUser.subscriptionPaymentStatus == "abuse_blocked") {
+            log.info("Stripe invoice.paid: user {} is abuse_blocked, skipping activation", user.id)
+            return
+        }
 
         // Guard: if the subscription was cancelled (e.g. by trial abuse detection in
         // handleCheckoutCompleted), do NOT re-activate via invoice.paid.
