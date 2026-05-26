@@ -3,6 +3,10 @@ plugins {
     application
 }
 
+repositories {
+    mavenCentral()
+}
+
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
@@ -22,6 +26,10 @@ dependencies {
     implementation("com.github.librepdf:openpdf:2.0.3")
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testImplementation("io.javalin:javalin-testtools:6.3.0")
+    testImplementation("org.testcontainers:testcontainers:1.19.8")
+    testImplementation("org.testcontainers:junit-jupiter:1.19.8")
+    testImplementation("org.testcontainers:postgresql:1.19.8")
 }
 
 tasks.test {

@@ -215,3 +215,96 @@ INSERT INTO data_retention_config (table_name, retention_days) VALUES
 ON CONFLICT (table_name) DO NOTHING;
 
 -- Przyszłość MVP+: archive_manifest_entry (nagłówki tar przy seal) — dodać osobną migracją
+
+-- ============================================================================
+-- Recovery Session tables (user-facing-recovery-spec.md Section B)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS recovery_session (
+  id                 VARCHAR(36)  PRIMARY KEY,
+  server_id          VARCHAR(36)  NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  user_id            VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target_snapshot_id BIGINT       NOT NULL REFERENCES archive_snapshot(id),
+  state              VARCHAR(32)  NOT NULL DEFAULT 'REQUESTED',
+  created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  confirmed_at       TIMESTAMPTZ,
+  thaw_started_at    TIMESTAMPTZ,
+  thaw_completed_at  TIMESTAMPTZ,
+  agent_started_at   TIMESTAMPTZ,
+  agent_completed_at TIMESTAMPTZ,
+  verifying_started_at TIMESTAMPTZ,
+  completed_at       TIMESTAMPTZ,
+  cancelled_at       TIMESTAMPTZ,
+  failed_at          TIMESTAMPTZ,
+  pre_recovery_snapshot_id BIGINT REFERENCES archive_snapshot(id),
+  dry_run_files_to_restore INT,
+  dry_run_files_to_delete  INT,
+  dry_run_files_unchanged  INT,
+  dry_run_total_bytes      BIGINT,
+  files_restored     INT          NOT NULL DEFAULT 0,
+  files_deleted      INT          NOT NULL DEFAULT 0,
+  bytes_transferred  BIGINT       NOT NULL DEFAULT 0,
+  failure_reason     TEXT,
+  cancellation_reason TEXT,
+  user_confirmed_via_ip    VARCHAR(45),
+  user_confirmed_via_user_agent TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_session_user ON recovery_session(user_id);
+CREATE INDEX IF NOT EXISTS idx_recovery_session_state ON recovery_session(state);
+CREATE INDEX IF NOT EXISTS idx_recovery_session_server_active
+  ON recovery_session(server_id)
+  WHERE state NOT IN ('DONE', 'FAILED', 'CANCELLED');
+
+-- Partial unique: max 1 active recovery per server
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recovery_session_server_active
+  ON recovery_session(server_id)
+  WHERE state NOT IN ('DONE', 'FAILED', 'CANCELLED');
+
+CREATE TABLE IF NOT EXISTS recovery_operation (
+  id                   VARCHAR(36) PRIMARY KEY,
+  recovery_session_id  VARCHAR(36) NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+  operation_type       VARCHAR(16) NOT NULL,
+  path_hash            CHAR(64)    NOT NULL,
+  path                 TEXT        NOT NULL,
+  sha256_target        CHAR(64),
+  sha256_local         CHAR(64),
+  size_bytes           BIGINT,
+  state                VARCHAR(16) NOT NULL DEFAULT 'pending',
+  started_at           TIMESTAMPTZ,
+  completed_at         TIMESTAMPTZ,
+  error                TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_op_session ON recovery_operation(recovery_session_id);
+CREATE INDEX IF NOT EXISTS idx_recovery_op_state ON recovery_operation(recovery_session_id, state);
+
+CREATE TABLE IF NOT EXISTS recovery_dry_run (
+  id                          VARCHAR(36) PRIMARY KEY,
+  recovery_session_id         VARCHAR(36) NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+  computed_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  files_to_restore_count      INT         NOT NULL,
+  files_to_restore_size       BIGINT      NOT NULL,
+  files_to_delete_count       INT         NOT NULL,
+  files_to_delete_size        BIGINT      NOT NULL,
+  files_unchanged_count       INT         NOT NULL,
+  critical_files_protected_count INT      NOT NULL,
+  sample_files_to_restore     TEXT,
+  sample_files_to_delete      TEXT,
+  estimated_duration_seconds  INT
+);
+
+-- Extend archive_snapshot for recovery
+ALTER TABLE archive_snapshot ADD COLUMN IF NOT EXISTS snapshot_type VARCHAR(32) NOT NULL DEFAULT 'AUTO';
+ALTER TABLE archive_snapshot ADD COLUMN IF NOT EXISTS pre_recovery_session_id VARCHAR(36) REFERENCES recovery_session(id);
+
+-- Audit log table for recovery actions (append-only)
+CREATE TABLE IF NOT EXISTS recovery_audit_log (
+  id                   BIGSERIAL PRIMARY KEY,
+  recovery_session_id  VARCHAR(36) NOT NULL REFERENCES recovery_session(id) ON DELETE CASCADE,
+  action               VARCHAR(64) NOT NULL,
+  detail               TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_audit_session ON recovery_audit_log(recovery_session_id, created_at);
