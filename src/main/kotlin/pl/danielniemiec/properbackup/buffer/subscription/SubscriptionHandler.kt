@@ -111,7 +111,7 @@ class SubscriptionHandler(
             gson.toJson(
                 mapOf(
                     "status" to status,
-                    "plan" to (user.subscriptionPlan ?: "trial"),
+                    "plan" to (user.subscriptionPlan ?: if (user.trialExpiresAt != null) "trial" else "none"),
                     "daysRemaining" to daysRemaining,
                     "active" to active,
                     "cancelAtPeriodEnd" to user.subscriptionCancelAtPeriodEnd,
@@ -128,6 +128,8 @@ class SubscriptionHandler(
                     "stripeMode" to (stripeHandler?.getStripeModeForUser(userId) ?: "test"),
                     "stripeTestMode" to user.stripeTestMode,
                     "customerBalanceCreditGrosze" to customerBalanceCreditGrosze,
+                    "trialEligible" to (!user.everSubscribed && user.trialExpiresAt == null && user.subscriptionPlan == null),
+                    "trialDays" to StripeHandler.TRIAL_DAYS,
                     "pricing" to mapOf(
                         "monthly" to mapOf(
                             "basePriceGrosze" to monthlyPriceGrosze,

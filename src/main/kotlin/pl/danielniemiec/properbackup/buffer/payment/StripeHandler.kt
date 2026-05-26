@@ -461,6 +461,19 @@ class StripeHandler(
                 sessionBuilder.putMetadata("promoCode", promoCode)
             }
 
+            // First-time users get a 30-day free trial managed by Stripe.
+            // Stripe won't charge until the trial ends, and blocks the same card
+            // from getting multiple trials across different accounts.
+            if (!user.everSubscribed && user.subscriptionPlan == null && user.trialExpiresAt == null) {
+                sessionBuilder.setSubscriptionData(
+                    SessionCreateParams.SubscriptionData.builder()
+                        .setTrialPeriodDays(TRIAL_DAYS)
+                        .build(),
+                )
+                sessionBuilder.putMetadata("trialApplied", "true")
+                log.info("Stripe checkout: trial_period_days={} applied for first-time user userId={}", TRIAL_DAYS, userId)
+            }
+
             val lineItemBuilder = SessionCreateParams.LineItem.builder()
                 .setPrice(resolvedPriceId)
                 .setQuantity(1)

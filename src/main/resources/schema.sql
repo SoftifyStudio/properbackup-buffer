@@ -16,12 +16,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_cancel_at_period_end BOO
 ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_limit_bytes BIGINT NOT NULL DEFAULT 2199023255552;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_trial_notification VARCHAR(16);
 
--- One-time backfill: grant trial to users created before the registration-time fix.
--- New registrations set trial_expires_at at INSERT time, so this is a no-op for them.
--- The ever_subscribed guard prevents abuse: once a user has paid (or had a trial),
--- a fresh account with the same email cannot re-trigger trial via this migration.
-UPDATE users SET trial_expires_at = created_at + INTERVAL '30 days'
-  WHERE trial_expires_at IS NULL AND subscription_plan IS NULL AND ever_subscribed = FALSE;
+-- Legacy backfill removed: trial no longer starts at registration.
+-- Trial is now managed by Stripe (trial_period_days on checkout).
+-- Existing users who already have trial_expires_at keep their trials.
 
 CREATE TABLE IF NOT EXISTS servers (
   id           VARCHAR(36)  PRIMARY KEY,
