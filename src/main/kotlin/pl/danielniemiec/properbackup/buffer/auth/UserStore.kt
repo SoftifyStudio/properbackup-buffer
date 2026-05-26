@@ -33,6 +33,8 @@ class UserStore(private val db: Database) {
         val stripeTestMode: Boolean = true,
         val stripeLiveCustomerId: String? = null,
         val stripeLiveSubscriptionId: String? = null,
+        val stripeCardFingerprint: String? = null,
+        val subscriptionPaymentStatus: String? = null,
     ) {
         /** Returns the subscription id for the user's current Stripe mode. */
         fun currentStripeSubscriptionId(): String? =
@@ -40,7 +42,7 @@ class UserStore(private val db: Database) {
     }
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed, stripe_test_mode, stripe_live_customer_id, stripe_live_subscription_id"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, email_verified, stripe_customer_id, stripe_subscription_id, subscription_cancel_at_period_end, ever_subscribed, stripe_test_mode, stripe_live_customer_id, stripe_live_subscription_id, stripe_card_fingerprint, subscription_payment_status"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -116,7 +118,7 @@ class UserStore(private val db: Database) {
                 ps.executeUpdate()
             }
         }
-        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false, true, null, null)
+        return User(id, email.lowercase(), hash, now.toString(), false, null, null, null, 2199023255552L, null, false, null, null, false, false, true, null, null, null, null)
     }
 
     fun verifyEmail(token: String): Boolean {
@@ -330,6 +332,45 @@ class UserStore(private val db: Database) {
         }
     }
 
+    fun updateCardFingerprint(userId: String, fingerprint: String) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET stripe_card_fingerprint = ? WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, fingerprint)
+                ps.setString(2, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun findByCardFingerprint(fingerprint: String): List<User> {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT $SELECT_COLS FROM users WHERE stripe_card_fingerprint = ?",
+            ).use { ps ->
+                ps.setString(1, fingerprint)
+                ps.executeQuery().use { rs ->
+                    val out = ArrayList<User>()
+                    while (rs.next()) out.add(map(rs))
+                    return out
+                }
+            }
+        }
+    }
+
+    fun setSubscriptionPaymentStatus(userId: String, status: String?) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET subscription_payment_status = ? WHERE id = ?",
+            ).use { ps ->
+                if (status != null) ps.setString(1, status) else ps.setNull(1, java.sql.Types.VARCHAR)
+                ps.setString(2, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
     fun markEverSubscribed(userId: String) {
         db.getConnection().use { conn ->
             conn.prepareStatement(
@@ -360,5 +401,7 @@ class UserStore(private val db: Database) {
         rs.getBoolean("stripe_test_mode"),
         rs.getString("stripe_live_customer_id"),
         rs.getString("stripe_live_subscription_id"),
+        rs.getString("stripe_card_fingerprint"),
+        rs.getString("subscription_payment_status"),
     )
 }

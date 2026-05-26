@@ -774,6 +774,32 @@ class StripeHandler(
         )
 
         if (session.mode == "subscription" && !subscriptionId.isNullOrBlank()) {
+            // --- Trial abuse prevention: check card fingerprint ---
+            val cardFingerprint = extractCardFingerprint(session.customer, opts)
+            if (cardFingerprint != null) {
+                val existingUsers = userStore.findByCardFingerprint(cardFingerprint)
+                val abuseDetected = existingUsers.any { it.id != userId && it.everSubscribed }
+                if (abuseDetected) {
+                    log.warn(
+                        "Trial abuse detected: userId={} tried card fingerprint={} already used by userId={}",
+                        userId, cardFingerprint, existingUsers.first { it.id != userId }.id,
+                    )
+                    // Cancel the new subscription immediately
+                    try {
+                        val sub = Subscription.retrieve(subscriptionId, opts)
+                        sub.cancel(com.stripe.param.SubscriptionCancelParams.builder().build(), opts)
+                    } catch (e: Exception) {
+                        log.warn("Failed to cancel abusive subscription: {}", e.message)
+                    }
+                    logAudit(userId, "trial_abuse_blocked", mapOf(
+                        "fingerprint" to cardFingerprint,
+                        "existingUserId" to existingUsers.first { it.id != userId }.id,
+                    ))
+                    return
+                }
+                userStore.updateCardFingerprint(userId, cardFingerprint)
+            }
+
             // Cancel previous Stripe subscription only after new one is confirmed
             val existingUser = userStore.findById(userId).orElse(null)
             if (existingUser != null) {
@@ -784,6 +810,8 @@ class StripeHandler(
             // Pull the canonical period_end from Stripe so our DB never drifts (P2-9).
             val stripePeriodEnd = fetchStripeCurrentPeriodEnd(subscriptionId, opts)
             activateSubscription(userId, plan, stripePeriodEnd)
+            // Clear any stale payment status from a previous cycle
+            userStore.setSubscriptionPaymentStatus(userId, null)
         } else if (session.mode == "payment" || session.mode == "setup") {
             // Fallback for legacy one-time payments (no recurring period_end available).
             activateSubscription(userId, plan)
@@ -851,6 +879,7 @@ class StripeHandler(
         activateSubscription(user.id, plan, periodEnd)
         userStore.updateStripeSubscriptionId(user.id, subscriptionId)
         userStore.setCancelAtPeriodEnd(user.id, false)
+        userStore.setSubscriptionPaymentStatus(user.id, null)
 
         logAudit(user.id, "invoice_paid", mapOf(
             "subscriptionId" to subscriptionId,
@@ -892,10 +921,33 @@ class StripeHandler(
         )
 
         if (user != null) {
+            // Set subscription to past_due state and grant grace period.
+            // Stripe retries automatically (configurable in Dashboard); we keep the user
+            // active during the retry window instead of locking them out immediately.
+            userStore.setSubscriptionPaymentStatus(user.id, "past_due")
+
+            // Extend subscription_expires_at by 7 days grace period so the user
+            // isn't locked out while Stripe retries the payment.
+            val currentExpiry = user.subscriptionExpiresAt
+                ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+            if (currentExpiry != null) {
+                val gracePeriodEnd = Instant.now().plus(Duration.ofDays(7))
+                if (gracePeriodEnd.isAfter(currentExpiry)) {
+                    userStore.updateSubscription(
+                        user.id,
+                        user.subscriptionPlan ?: "monthly",
+                        gracePeriodEnd,
+                        user.storageLimitBytes,
+                    )
+                    log.info("Extended subscription grace period for userId={} until {}", user.id, gracePeriodEnd)
+                }
+            }
+
             logAudit(user.id, "invoice_payment_failed", mapOf(
                 "subscriptionId" to (subscriptionId ?: ""),
                 "attemptCount" to (invoice.attemptCount ?: 0L),
                 "invoiceId" to (invoice.id ?: ""),
+                "paymentStatus" to "past_due",
             ))
         }
     }
@@ -1649,6 +1701,33 @@ class StripeHandler(
     fun getStripeModeForUser(userId: String): String = keyProvider.modeLabel(userId)
 
     fun getStripeMode(): String = "test"
+
+    /**
+     * Extract the card fingerprint from the customer's default payment method.
+     * Stripe assigns a stable fingerprint per physical card — same card on different
+     * customers always produces the same fingerprint.
+     */
+    private fun extractCardFingerprint(customerId: String?, opts: RequestOptions): String? {
+        if (customerId.isNullOrBlank()) return null
+        return try {
+            val customer = Customer.retrieve(customerId, opts)
+            val paymentMethods = Customer.listPaymentMethods(
+                customerId,
+                CustomerListPaymentMethodsParams.builder()
+                    .setType(CustomerListPaymentMethodsParams.Type.CARD)
+                    .setLimit(1L)
+                    .build(),
+                opts,
+            )
+            val pm = paymentMethods.data.firstOrNull() ?: return null
+            val fingerprint = pm.card?.fingerprint
+            log.info("Extracted card fingerprint: customerId={} fingerprint={}", customerId, fingerprint)
+            fingerprint
+        } catch (e: Exception) {
+            log.warn("Failed to extract card fingerprint for customerId={}: {}", customerId, e.message)
+            null
+        }
+    }
 
     private fun logAudit(userId: String, action: String, details: Map<String, Any>) {
         try {

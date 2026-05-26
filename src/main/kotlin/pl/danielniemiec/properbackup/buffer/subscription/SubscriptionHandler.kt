@@ -51,6 +51,11 @@ class SubscriptionHandler(
         val active: Boolean
 
         when {
+            user.subscriptionPlan != null && subscriptionExpiresAt != null && subscriptionExpiresAt.isAfter(now) && user.subscriptionPaymentStatus == "past_due" -> {
+                status = "past_due"
+                daysRemaining = Duration.between(now, subscriptionExpiresAt).toDays()
+                active = true
+            }
             user.subscriptionPlan != null && subscriptionExpiresAt != null && subscriptionExpiresAt.isAfter(now) -> {
                 status = "active"
                 daysRemaining = Duration.between(now, subscriptionExpiresAt).toDays()

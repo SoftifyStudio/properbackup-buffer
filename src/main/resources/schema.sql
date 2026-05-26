@@ -391,3 +391,14 @@ ALTER TABLE stripe_price_config ADD PRIMARY KEY (plan_key, mode);
 -- test to live leaves the test subscription un-cancelable (live API can't see it)
 -- and silently overwrites the column with the new live subscription id.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_live_subscription_id VARCHAR(64);
+
+-- Card fingerprint for trial abuse prevention. Stripe assigns a stable fingerprint
+-- per physical card — even across different customers/accounts. After activating a
+-- trial we store the fingerprint and reject future trial activations that share it.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_card_fingerprint VARCHAR(64);
+
+-- Subscription payment status. Tracks Stripe-level dunning state independently from
+-- our subscription_expires_at (which tracks entitlement period). When Stripe fails to
+-- charge, we set this to 'past_due' and grant a grace period before full lockout.
+-- Values: NULL (default/healthy), 'past_due', 'unpaid'.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_payment_status VARCHAR(16);
