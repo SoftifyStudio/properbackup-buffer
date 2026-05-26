@@ -1710,16 +1710,12 @@ class StripeHandler(
     private fun extractCardFingerprint(customerId: String?, opts: RequestOptions): String? {
         if (customerId.isNullOrBlank()) return null
         return try {
-            val customer = Customer.retrieve(customerId, opts)
-            val paymentMethods = Customer.listPaymentMethods(
-                customerId,
-                CustomerListPaymentMethodsParams.builder()
-                    .setType(CustomerListPaymentMethodsParams.Type.CARD)
-                    .setLimit(1L)
-                    .build(),
-                opts,
-            )
-            val pm = paymentMethods.data.firstOrNull() ?: return null
+            val params = CustomerListPaymentMethodsParams.builder()
+                .setType(CustomerListPaymentMethodsParams.Type.CARD)
+                .setLimit(1)
+                .build()
+            val methods = Customer.retrieve(customerId, opts).listPaymentMethods(params, opts)
+            val pm = methods.data.firstOrNull() ?: return null
             val fingerprint = pm.card?.fingerprint
             log.info("Extracted card fingerprint: customerId={} fingerprint={}", customerId, fingerprint)
             fingerprint
