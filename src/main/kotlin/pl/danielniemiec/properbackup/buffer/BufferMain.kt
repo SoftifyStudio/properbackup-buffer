@@ -44,6 +44,14 @@ import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
 import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
+import pl.danielniemiec.properbackup.buffer.recovery.RecoveryAuditLog
+import pl.danielniemiec.properbackup.buffer.recovery.RecoveryEventBus
+import pl.danielniemiec.properbackup.buffer.recovery.RecoveryGuard
+import pl.danielniemiec.properbackup.buffer.recovery.RecoveryHandler
+import pl.danielniemiec.properbackup.buffer.recovery.RecoverySessionStore
+import pl.danielniemiec.properbackup.buffer.recovery.DryRunComputer
+import pl.danielniemiec.properbackup.buffer.recovery.PreRecoverySnapshotCreator
+import pl.danielniemiec.properbackup.buffer.recovery.RecoveryActiveException
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.nio.file.Path
 import java.time.Instant
@@ -148,6 +156,17 @@ fun main(args: Array<String>) {
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
+    )
+
+    val recoverySessionStore = RecoverySessionStore(db)
+    val recoveryGuard = RecoveryGuard(recoverySessionStore)
+    val recoveryAuditLog = RecoveryAuditLog(db)
+    val recoveryEventBus = RecoveryEventBus(sseBus)
+    val dryRunComputer = DryRunComputer(recoverySessionStore, recoveryEventBus, recoveryAuditLog)
+    val preRecoverySnapshotCreator = PreRecoverySnapshotCreator(recoverySessionStore, recoveryEventBus, recoveryAuditLog)
+    val recoveryHandler = RecoveryHandler(
+        recoverySessionStore, recoveryGuard, dryRunComputer,
+        preRecoverySnapshotCreator, recoveryAuditLog, recoveryEventBus,
     )
 
     flusher.start()
@@ -398,6 +417,33 @@ fun main(args: Array<String>) {
     app.get("/servers/{id}/backup-config", serverHandler::getBackupConfig)
     app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
     app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
+
+    // Recovery Session endpoints (user-facing-recovery-spec.md Section B)
+    app.before("/recovery/*", jwtFilter)
+    app.before("/recovery", jwtFilter)
+    app.post("/recovery/start", recoveryHandler::startRecovery)
+    app.get("/recovery/history", recoveryHandler::history)
+    app.get("/recovery/{id}", recoveryHandler::getSession)
+    app.post("/recovery/{id}/confirm", recoveryHandler::confirmRecovery)
+    app.post("/recovery/{id}/cancel", recoveryHandler::cancelRecovery)
+    app.get("/recovery/{id}/audit", recoveryHandler::getAudit)
+
+    // Recovery Agent endpoints
+    app.get("/agent/recovery/poll", recoveryHandler::agentPoll)
+    app.post("/agent/recovery/{id}/dry_run_result", recoveryHandler::agentDryRunResult)
+    app.post("/agent/recovery/{id}/progress", recoveryHandler::agentProgress)
+    app.post("/agent/recovery/{id}/complete", recoveryHandler::agentComplete)
+
+    // RecoveryGuard: block write actions during active recovery (return 423 Locked)
+    app.exception(RecoveryActiveException::class.java) { e, ctx ->
+        ctx.status(423).contentType("application/json").result(
+            Gson().toJson(mapOf(
+                "code" to "RECOVERY_ACTIVE",
+                "sessionId" to e.sessionId,
+                "blockedAction" to e.blockedAction,
+            )),
+        )
+    }
 
     app.get("/objects") { ctx ->
         val list = objectRead.listMerged()
