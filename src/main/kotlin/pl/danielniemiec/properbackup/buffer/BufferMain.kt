@@ -118,7 +118,7 @@ fun main(args: Array<String>) {
     val jwtFilter = JwtFilter(jwtService)
 
     val tokenStore = ActivationTokenStore(db)
-    val objectRead = ObjectReadFacade(objectStore, swiftRemote)
+    val objectRead = ObjectReadFacade(objectStore, swiftRemote, packBuffer)
     val restoreVerifier = RestoreVerifier(db, objectRead)
     sealer.setVerifier(restoreVerifier)
     val backupConfigStore = BackupConfigStore(db)
