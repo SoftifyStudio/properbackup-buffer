@@ -116,6 +116,22 @@ class PackBuffer(
     }
 
     /**
+     * Read a specific object by scanning packs across ALL servers in the buffer.
+     * Used by ObjectReadFacade when the caller doesn't know which server owns the object.
+     */
+    fun readObjectFromAnyServer(objectName: String): ByteArray? {
+        if (!Files.exists(bufferDir)) return null
+        Files.list(bufferDir).use { serverDirs ->
+            for (serverDir in serverDirs.filter { Files.isDirectory(it) }.toList()) {
+                val serverId = serverDir.fileName.toString()
+                val result = readObject(serverId, objectName)
+                if (result != null) return result
+            }
+        }
+        return null
+    }
+
+    /**
      * List all objects currently in the buffer for a server.
      */
     fun listBufferedObjects(serverId: String): List<String> {
