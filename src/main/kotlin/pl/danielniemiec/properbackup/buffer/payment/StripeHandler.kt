@@ -352,6 +352,13 @@ class StripeHandler(
         val plan = (body?.get("plan") as? String) ?: ctx.queryParam("plan") ?: MONTHLY_PLAN
         val promoCode = (body?.get("promoCode") as? String)?.trim()?.uppercase()
 
+        if (plan != MONTHLY_PLAN && plan != ANNUAL_PLAN) {
+            ctx.status(400).contentType("application/json").result(
+                gson.toJson(mapOf("error" to "Invalid plan. Must be '$MONTHLY_PLAN' or '$ANNUAL_PLAN'.")),
+            )
+            return
+        }
+
         val userTestMode = keyProvider.isTestMode(userId)
         val resolvedPriceId = priceIdFor(userTestMode, plan)
             ?: run {
