@@ -27,10 +27,21 @@ class AuthHandler(
         return !t.equals("false", ignoreCase = true) && t != "0"
     }
 
+    private val EMAIL_REGEX = Regex("^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}$")
+
     fun register(ctx: Context) {
         val req = gson.fromJson(ctx.body(), RegReq::class.java)
         if (req == null || req.email == null || req.password == null) {
             ctx.status(400).result("email and password required")
+            return
+        }
+        val email = req.email.trim()
+        if (email.length > 64) {
+            ctx.status(400).result("EMAIL_TOO_LONG")
+            return
+        }
+        if (!EMAIL_REGEX.matches(email)) {
+            ctx.status(400).result("INVALID_EMAIL_FORMAT")
             return
         }
         val pwErr = PasswordPolicy.validate(req.password)
