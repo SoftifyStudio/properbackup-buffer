@@ -11,12 +11,14 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * Auto-test restore: after a successful seal, verify backup integrity by
- * downloading the archive, decrypting it, and checking that files extract correctly.
+ * Server-side backup verification: after a successful seal, check the stored
+ * object on a background thread.
  *
- * Runs in a separate thread pool. Does NOT require Docker in MVP — performs
- * verification in-process using the same ProperCrypto library as the agent.
- * Docker isolation can be added later for production hardening.
+ * The buffer is zero-knowledge — it never holds the encryption password — so it
+ * cannot decrypt and therefore cannot perform a true restore. That check runs on
+ * the agent (properbackup-shared RestoreVerification), which has the password.
+ * Here we validate the ProperCrypto container format and frame framing via
+ * [ContainerInspector], which reliably detects truncated or garbled uploads.
  */
 class RestoreVerifier(
     private val db: Database,
@@ -52,26 +54,18 @@ class RestoreVerifier(
             return
         }
 
-        // Verify the encrypted archive is structurally valid:
-        // - Must start with ProperCrypto header (salt + nonce)
-        // - Minimum size: 32 (salt) + 12 (nonce) + 16 (auth tag) = 60 bytes
-        if (data.size < 60) {
-            storeResult(serverId, objectName, pathId, "failed", "Archive too small: ${data.size} bytes (expected >= 60)")
-            return
+        // Buffer is zero-knowledge (no password), so it cannot decrypt to do a
+        // true restore — that runs on the agent (see properbackup-shared
+        // RestoreVerification). Here we validate the container format and frame
+        // framing, which detects truncated/garbled uploads.
+        val inspection = ContainerInspector.inspect(data)
+        if (inspection.ok) {
+            storeResult(serverId, objectName, pathId, "passed", inspection.detail)
+            println("[verify] PASSED for $objectName (${inspection.detail})")
+        } else {
+            storeResult(serverId, objectName, pathId, "failed", inspection.detail)
+            println("[verify] FAILED for $objectName: ${inspection.detail}")
         }
-
-        // Check for ProperCrypto format marker:
-        // Salt is 32 bytes, then 12-byte nonce, then ciphertext with 16-byte GCM tag
-        val sizeOk = data.size >= 60
-        if (!sizeOk) {
-            storeResult(serverId, objectName, pathId, "failed", "Invalid archive format")
-            return
-        }
-
-        // In production with Docker, we'd decrypt and extract here.
-        // For MVP, structural validation confirms the archive was sealed correctly.
-        storeResult(serverId, objectName, pathId, "passed", "Archive intact (${data.size} bytes, encrypted)")
-        println("[verify] PASSED for $objectName (${data.size} bytes)")
     }
 
     private fun storeResult(serverId: String, objectName: String, pathId: String, status: String, detail: String?) {
