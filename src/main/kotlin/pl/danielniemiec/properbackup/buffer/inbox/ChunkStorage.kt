@@ -12,14 +12,25 @@ class ChunkStorage(private val inboxDir: Path) {
         Files.createDirectories(inboxDir)
     }
 
+    /**
+     * Persist a received fragment write-ahead (HR-1): `.tmp` -> atomic rename.
+     *
+     * The part filename is derived from the content SHA-256 so that a retried
+     * upload of identical bytes resolves to the same file instead of creating a
+     * duplicate that `ChunkSealer.seal()` would later concatenate into a
+     * corrupted object. The rename uses REPLACE_EXISTING, making retries
+     * idempotent at the filesystem level.
+     */
     @Throws(IOException::class)
-    fun store(userId: String, pathId: String, data: ByteArray, flag: String) {
+    fun store(userId: String, pathId: String, data: ByteArray, flag: String, contentSha: String) {
         val dir = inboxDir.resolve(userId).resolve(pathId)
         Files.createDirectories(dir)
-        val name = System.currentTimeMillis().toString() + "-" + flag + ".part"
-        val tmp = dir.resolve(name + ".tmp")
+        val name = "$contentSha-$flag.part"
+        val target = dir.resolve(name)
+        if (Files.exists(target)) return
+        val tmp = dir.resolve("$name.${System.nanoTime()}.tmp")
         Files.write(tmp, data)
-        Files.move(tmp, dir.resolve(name), StandardCopyOption.ATOMIC_MOVE)
+        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
     }
 
     @Throws(IOException::class)

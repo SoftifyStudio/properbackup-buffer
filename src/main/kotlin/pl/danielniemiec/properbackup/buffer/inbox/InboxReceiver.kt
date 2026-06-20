@@ -2,6 +2,7 @@ package pl.danielniemiec.properbackup.buffer.inbox
 
 import io.javalin.http.Context
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
+import java.security.MessageDigest
 
 class InboxReceiver(
     private val storage: ChunkStorage,
@@ -40,10 +41,22 @@ class InboxReceiver(
             return
         }
 
-        storage.store(userId, pathId, body, flag ?: "A")
+        val contentSha = sha256Hex(body)
+        val declaredSha = ctx.header("X-Content-Sha256")?.trim()?.lowercase()
+        if (declaredSha != null && declaredSha != contentSha) {
+            ctx.status(400).result("Integrity check failed: X-Content-Sha256 does not match body")
+            println("[inbox] REJECTED $pathId — sha mismatch (declared=$declaredSha actual=$contentSha)")
+            return
+        }
+
+        storage.store(userId, pathId, body, flag, contentSha)
         ctx.status(200).result("OK")
-        println("[inbox] stored ${body.size} bytes for $pathId ($origPath) flag=$flag")
+        println("[inbox] stored ${body.size} bytes for $pathId ($origPath) flag=$flag sha=$contentSha")
     }
+
+    private fun sha256Hex(data: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(data)
+            .joinToString("") { "%02x".format(it) }
 
     companion object {
         private const val MAX_PAYLOAD = 100 * 1024 * 1024
