@@ -203,6 +203,60 @@ class PackPipelineHardeningTest {
         return bytes
     }
 
+    @Test
+    fun `GZIP compression reduces pack size`() {
+        val raw = buildValidPackBytes("compressible-obj", ByteArray(10_000))
+        val compressed = PackBuffer.compressPack(raw)
+        assertTrue(compressed.size < raw.size, "compressed should be smaller: raw=${raw.size}, gz=${compressed.size}")
+        assertEquals(0x1f.toByte(), compressed[0])
+        assertEquals(0x8b.toByte(), compressed[1])
+    }
+
+    @Test
+    fun `GZIP decompress restores original pack data`() {
+        val data = randomBytes(500)
+        val raw = buildValidPackBytes("roundtrip-obj", data)
+        val compressed = PackBuffer.compressPack(raw)
+        val decompressed = PackBuffer.decompressPack(compressed)
+        assertArrayEquals(raw, decompressed)
+    }
+
+    @Test
+    fun `parsePackData handles GZIP-compressed input`() {
+        val data = randomBytes(300)
+        val raw = buildValidPackBytes("gzip-parse-obj", data)
+        val compressed = PackBuffer.compressPack(raw)
+        val entries = PackBuffer.parsePackData(compressed)
+        assertEquals(1, entries.size)
+        assertEquals("gzip-parse-obj", entries[0].objectName)
+        assertArrayEquals(data, entries[0].data)
+    }
+
+    @Test
+    fun `decompressPack passes through non-GZIP data`() {
+        val raw = buildValidPackBytes("plain-obj", randomBytes(100))
+        val result = PackBuffer.decompressPack(raw)
+        assertArrayEquals(raw, result)
+    }
+
+    @Test
+    fun `flush to remote produces GZIP-compressed data`() {
+        val packBuffer = PackBuffer(packBufferDir, db, mockSwift, 1024, forceFlushAgeMs = 86400_000)
+        val data = randomBytes(600)
+        packBuffer.addToPack(serverId, "flush-gzip-obj", data)
+        packBuffer.flushAll()
+
+        val remoteObjects = mockSwift.list()
+        assertEquals(1, remoteObjects.size)
+        val remoteData = mockSwift.get(remoteObjects[0])
+        assertEquals(0x1f.toByte(), remoteData[0])
+        assertEquals(0x8b.toByte(), remoteData[1])
+
+        val entries = PackBuffer.parsePackData(remoteData)
+        assertEquals(1, entries.size)
+        assertArrayEquals(data, entries[0].data)
+    }
+
     private fun buildValidPackBytes(objectName: String, data: ByteArray): ByteArray {
         val baos = ByteArrayOutputStream()
         val dos = DataOutputStream(baos)

@@ -16,6 +16,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import java.util.zip.GZIPOutputStream
+import java.util.zip.GZIPInputStream
 
 /**
  * PackBuffer collects sealed chunks into packs (up to PACK_MAX_BYTES).
@@ -200,8 +202,14 @@ class PackBuffer(
                                 .sorted()
                                 .toList()
                             for (packFile in packFiles) {
-                                sealOpenPack(packFile)
-                                flushPack(serverId, packFile)
+                                val actualPath = if (packFile.fileName.toString().endsWith(".open.pack")) {
+                                    sealOpenPack(packFile)
+                                    val sealedName = packFile.fileName.toString().replace(".open.pack", ".pack")
+                                    packFile.parent.resolve(sealedName)
+                                } else {
+                                    packFile
+                                }
+                                flushPack(serverId, actualPath)
                             }
                         }
                     } finally {
@@ -280,12 +288,13 @@ class PackBuffer(
             }
 
             val packData = Files.readAllBytes(actualPath)
+            val compressed = compressPack(packData)
             val remotePackName = actualPath.fileName.toString()
 
-            remote.put(remotePackName, packData)
-            println("[pack-buffer] flushed pack to remote: $remotePackName (${packData.size} bytes)")
+            remote.put(remotePackName, compressed)
+            println("[pack-buffer] flushed pack to remote: $remotePackName (raw=${packData.size}, gzip=${compressed.size} bytes, ratio=${String.format("%.1f", compressed.size * 100.0 / packData.size)}%)")
 
-            recordPackInDb(serverId, remotePackName, packData.size.toLong())
+            recordPackInDb(serverId, remotePackName, compressed.size.toLong())
 
             Files.deleteIfExists(actualPath)
             println("[pack-buffer] deleted local pack: $remotePackName")
@@ -401,10 +410,24 @@ class PackBuffer(
         const val VERSION = 1
         const val PACK_MAX_BYTES = 900L * 1024 * 1024 // 900 MB
         const val DEFAULT_FORCE_FLUSH_AGE_MS = 24L * 60 * 60 * 1000
+        private val GZIP_MAGIC = byteArrayOf(0x1f.toByte(), 0x8b.toByte())
+
+        fun compressPack(raw: ByteArray): ByteArray {
+            val baos = ByteArrayOutputStream(raw.size / 2)
+            GZIPOutputStream(baos).use { gzip -> gzip.write(raw) }
+            return baos.toByteArray()
+        }
+
+        fun decompressPack(data: ByteArray): ByteArray {
+            if (data.size < 2) return data
+            if (data[0] != GZIP_MAGIC[0] || data[1] != GZIP_MAGIC[1]) return data
+            return GZIPInputStream(ByteArrayInputStream(data)).use { it.readAllBytes() }
+        }
 
         fun parsePackData(raw: ByteArray): List<PackEntry> {
+            val decompressed = decompressPack(raw)
             val entries = mutableListOf<PackEntry>()
-            val dis = DataInputStream(ByteArrayInputStream(raw))
+            val dis = DataInputStream(ByteArrayInputStream(decompressed))
 
             val magic = dis.readInt()
             if (magic != MAGIC) throw IllegalArgumentException("Invalid pack magic: ${Integer.toHexString(magic)}")
