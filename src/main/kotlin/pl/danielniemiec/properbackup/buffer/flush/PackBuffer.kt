@@ -16,6 +16,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import java.util.zip.GZIPOutputStream
+import java.util.zip.GZIPInputStream
 
 /**
  * PackBuffer collects sealed chunks into packs (up to PACK_MAX_BYTES).
@@ -39,6 +41,8 @@ class PackBuffer(
     private val db: Database,
     private val swiftRemote: SwiftClient? = null,
     private val maxPackBytes: Long = PACK_MAX_BYTES,
+    private val forceFlushAgeMs: Long = System.getenv("PROPERBACKUP_FORCE_FLUSH_AGE_MS")?.toLongOrNull()
+        ?: DEFAULT_FORCE_FLUSH_AGE_MS,
 ) {
     private val locks = ConcurrentHashMap<String, ReentrantLock>()
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -49,8 +53,9 @@ class PackBuffer(
     }
 
     fun start() {
-        scheduler.scheduleAtFixedRate({ flushFullPacks() }, 30, 30, TimeUnit.SECONDS)
-        println("[pack-buffer] started (check every 30s, max pack size=${maxPackBytes / 1024 / 1024}MB)")
+        recoverFromCrash()
+        scheduler.scheduleAtFixedRate({ flushFullPacks(); forceFlushStalePacks() }, 30, 30, TimeUnit.SECONDS)
+        println("[pack-buffer] started (check every 30s, max pack size=${maxPackBytes / 1024 / 1024}MB, force-flush after ${forceFlushAgeMs / 3600_000}h)")
     }
 
     fun stop() {
@@ -197,8 +202,14 @@ class PackBuffer(
                                 .sorted()
                                 .toList()
                             for (packFile in packFiles) {
-                                sealOpenPack(packFile)
-                                flushPack(serverId, packFile)
+                                val actualPath = if (packFile.fileName.toString().endsWith(".open.pack")) {
+                                    sealOpenPack(packFile)
+                                    val sealedName = packFile.fileName.toString().replace(".open.pack", ".pack")
+                                    packFile.parent.resolve(sealedName)
+                                } else {
+                                    packFile
+                                }
+                                flushPack(serverId, actualPath)
                             }
                         }
                     } finally {
@@ -277,12 +288,13 @@ class PackBuffer(
             }
 
             val packData = Files.readAllBytes(actualPath)
+            val compressed = compressPack(packData)
             val remotePackName = actualPath.fileName.toString()
 
-            remote.put(remotePackName, packData)
-            println("[pack-buffer] flushed pack to remote: $remotePackName (${packData.size} bytes)")
+            remote.put(remotePackName, compressed)
+            println("[pack-buffer] flushed pack to remote: $remotePackName (raw=${packData.size}, gzip=${compressed.size} bytes, ratio=${String.format("%.1f", compressed.size * 100.0 / packData.size)}%)")
 
-            recordPackInDb(serverId, remotePackName, packData.size.toLong())
+            recordPackInDb(serverId, remotePackName, compressed.size.toLong())
 
             Files.deleteIfExists(actualPath)
             println("[pack-buffer] deleted local pack: $remotePackName")
@@ -319,14 +331,103 @@ class PackBuffer(
         override fun hashCode(): Int = 31 * objectName.hashCode() + data.contentHashCode()
     }
 
+    /**
+     * Force-flush open packs older than forceFlushAgeMs (HR-7: default 24h).
+     */
+    fun forceFlushStalePacks() {
+        try {
+            if (!Files.exists(bufferDir)) return
+            val now = System.currentTimeMillis()
+            Files.list(bufferDir).use { serverDirs ->
+                for (serverDir in serverDirs.filter { Files.isDirectory(it) }.toList()) {
+                    val serverId = serverDir.fileName.toString()
+                    val lock = locks.computeIfAbsent(serverId) { ReentrantLock() }
+                    if (!lock.tryLock()) continue
+                    try {
+                        val openPack = findOpenPack(serverDir)
+                        if (openPack != null) {
+                            val lastModified = Files.getLastModifiedTime(openPack).toMillis()
+                            if ((now - lastModified) >= forceFlushAgeMs) {
+                                println("[pack-buffer] force-flush stale open pack: ${openPack.fileName} (age=${(now - lastModified) / 1000}s)")
+                                sealOpenPack(openPack)
+                                val sealedName = openPack.fileName.toString().replace(".open.pack", ".pack")
+                                val sealedPath = openPack.parent.resolve(sealedName)
+                                flushPack(serverId, sealedPath)
+                            }
+                        }
+                    } finally {
+                        lock.unlock()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("[pack-buffer] forceFlushStalePacks error: ${e.message}")
+        }
+    }
+
+    /**
+     * Recover from a crash: clean up .tmp files, validate open packs.
+     */
+    private fun recoverFromCrash() {
+        try {
+            if (!Files.exists(bufferDir)) return
+            Files.list(bufferDir).use { serverDirs ->
+                for (serverDir in serverDirs.filter { Files.isDirectory(it) }.toList()) {
+                    Files.list(serverDir).use { files ->
+                        for (file in files.toList()) {
+                            val name = file.fileName.toString()
+                            if (name.endsWith(".tmp")) {
+                                println("[pack-buffer] crash recovery: removing orphan tmp file: $name")
+                                Files.deleteIfExists(file)
+                                continue
+                            }
+                            if (name.endsWith(".pack") || name.endsWith(".open.pack")) {
+                                if (Files.size(file) < 6) {
+                                    println("[pack-buffer] crash recovery: removing corrupt pack (too small): $name")
+                                    Files.deleteIfExists(file)
+                                    continue
+                                }
+                                try {
+                                    val data = Files.readAllBytes(file)
+                                    parsePackData(data)
+                                    println("[pack-buffer] crash recovery: pack OK: $name (${data.size} bytes)")
+                                } catch (e: Exception) {
+                                    println("[pack-buffer] crash recovery: corrupt pack removed: $name (${e.message})")
+                                    Files.deleteIfExists(file)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("[pack-buffer] crash recovery error: ${e.message}")
+        }
+    }
+
     companion object {
         const val MAGIC = 0x50424B31 // "PBK1"
         const val VERSION = 1
         const val PACK_MAX_BYTES = 900L * 1024 * 1024 // 900 MB
+        const val DEFAULT_FORCE_FLUSH_AGE_MS = 24L * 60 * 60 * 1000
+        private val GZIP_MAGIC = byteArrayOf(0x1f.toByte(), 0x8b.toByte())
+
+        fun compressPack(raw: ByteArray): ByteArray {
+            val baos = ByteArrayOutputStream(raw.size / 2)
+            GZIPOutputStream(baos).use { gzip -> gzip.write(raw) }
+            return baos.toByteArray()
+        }
+
+        fun decompressPack(data: ByteArray): ByteArray {
+            if (data.size < 2) return data
+            if (data[0] != GZIP_MAGIC[0] || data[1] != GZIP_MAGIC[1]) return data
+            return GZIPInputStream(ByteArrayInputStream(data)).use { it.readAllBytes() }
+        }
 
         fun parsePackData(raw: ByteArray): List<PackEntry> {
+            val decompressed = decompressPack(raw)
             val entries = mutableListOf<PackEntry>()
-            val dis = DataInputStream(ByteArrayInputStream(raw))
+            val dis = DataInputStream(ByteArrayInputStream(decompressed))
 
             val magic = dis.readInt()
             if (magic != MAGIC) throw IllegalArgumentException("Invalid pack magic: ${Integer.toHexString(magic)}")
