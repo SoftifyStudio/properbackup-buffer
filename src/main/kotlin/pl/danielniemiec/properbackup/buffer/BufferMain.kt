@@ -49,6 +49,7 @@ import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.sse.UserSseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
+import pl.danielniemiec.properbackup.buffer.agent.AgentSessionHandler
 import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryAuditLog
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryEventBus
@@ -169,6 +170,7 @@ fun main(args: Array<String>) {
     val subscriptionAuditLog = SubscriptionAuditLog(db)
     val dunningNotifier = DunningNotifier(db, userStore, subscriptionAuditLog)
     val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier, userSseBus)
+    val agentSessionHandler = AgentSessionHandler(db, jwtService, serverStore, userStore, uploadToken)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
@@ -275,6 +277,9 @@ fun main(args: Array<String>) {
 
     app.post("/servers/activate", serverHandler::activate)
     app.post("/agent/auto-register", serverHandler::autoRegister)
+    app.post("/agent/session/start", agentSessionHandler::startSession)
+    app.before("/agent/session/refresh", jwtFilter)
+    app.post("/agent/session/refresh", agentSessionHandler::refreshSession)
 
     app.before("/servers/*", jwtFilter)
     app.before("/servers", jwtFilter)

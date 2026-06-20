@@ -17,8 +17,9 @@ class JwtFilter(private val jwtService: JwtService) : Handler {
         val token = auth.substring(7)
         try {
             val claims = jwtService.verify(token)
+            ctx.attribute("claims", claims)
             ctx.attribute("userId", claims.subject)
-            ctx.attribute("userEmail", claims["email"] as String?)
+            ctx.attribute("userEmail", claims["email"] as? String)
             ctx.attribute("isSystemAdmin", java.lang.Boolean.TRUE == claims["sa"])
         } catch (e: JwtException) {
             throw UnauthorizedResponse("Invalid or expired token")

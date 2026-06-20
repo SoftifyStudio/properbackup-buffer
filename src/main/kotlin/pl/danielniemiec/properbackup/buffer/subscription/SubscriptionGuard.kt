@@ -31,6 +31,9 @@ class SubscriptionGuard(private val userStore: UserStore) : Handler {
     )
 
     companion object {
+        fun resolveStatus(user: UserStore.User, now: Instant = Instant.now()): String =
+            computeAccess(user, now).state.name.lowercase()
+
         fun computeAccess(user: UserStore.User, now: Instant = Instant.now()): AccessResult {
             val trialActive = user.trialExpiresAt != null &&
                 Instant.parse(user.trialExpiresAt).isAfter(now)

@@ -28,6 +28,17 @@ class JwtService(secret: String) {
             .signWith(key)
             .compact()
 
+    fun generateAgentToken(serverId: String, userId: String, subscriptionStatus: String): String =
+        Jwts.builder()
+            .subject(serverId)
+            .claim("userId", userId)
+            .claim("subscription_status", subscriptionStatus)
+            .claim("type", "agent")
+            .issuedAt(Date())
+            .expiration(Date(System.currentTimeMillis() + AGENT_TTL_MS))
+            .signWith(key)
+            .compact()
+
     fun verify(token: String): Claims =
         Jwts.parser()
             .verifyWith(key)
@@ -37,5 +48,6 @@ class JwtService(secret: String) {
 
     companion object {
         private val TTL_MS = 30L * 24 * 60 * 60 * 1000
+        private val AGENT_TTL_MS = 5L * 60 * 1000 // 5 minutes per spec [TDD-G1]
     }
 }
