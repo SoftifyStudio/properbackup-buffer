@@ -219,6 +219,48 @@ fun main(args: Array<String>) {
     app.post("/agent/register-paths", logApi::ingestRegisterPaths)
     app.post("/agent/status", logApi::ingestAgentStatus)
 
+    // GET /agent/status — subscription check for agent [TDD-A1]
+    app.get("/agent/status") { ctx ->
+        val auth = ctx.header("Authorization")
+        if (auth == null || auth != "Bearer $uploadToken") {
+            ctx.status(401).result("Unauthorized")
+            return@get
+        }
+        val serverId = ctx.header("X-Server-Id")?.trim()
+        if (serverId.isNullOrBlank()) {
+            ctx.status(400).result("Missing X-Server-Id")
+            return@get
+        }
+        val server = serverStore.findById(serverId).orElse(null)
+        if (server == null) {
+            ctx.status(404).result("Server not found")
+            return@get
+        }
+        val user = userStore.findById(server.userId).orElse(null)
+        if (user == null) {
+            ctx.status(404).result("User not found")
+            return@get
+        }
+        val access = SubscriptionGuard.computeAccess(user)
+        if (!access.canUpload) {
+            val errorCode = when (access.state) {
+                SubscriptionGuard.AccessState.PAST_DUE_SUSPENDED -> "SUBSCRIPTION_PAST_DUE"
+                SubscriptionGuard.AccessState.EXPIRED -> "SUBSCRIPTION_EXPIRED"
+                SubscriptionGuard.AccessState.NONE -> "NO_ACTIVE_SUBSCRIPTION"
+                else -> "SUBSCRIPTION_EXPIRED"
+            }
+            ctx.status(403).contentType("application/json").result(
+                """{"code":"$errorCode","message":"Upload blocked. Please update your subscription.","canRestore":true}"""
+            )
+            return@get
+        }
+        ctx.contentType("application/json").result(Gson().toJson(mapOf(
+            "status" to access.state.name.lowercase(),
+            "canUpload" to access.canUpload,
+            "canRestore" to access.canRestore,
+        )))
+    }
+
     app.post("/agent/scan-complete") { ctx ->
         val auth = ctx.header("Authorization")
         if (auth == null || auth != "Bearer $uploadToken") {

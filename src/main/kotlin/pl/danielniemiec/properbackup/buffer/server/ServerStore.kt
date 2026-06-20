@@ -115,7 +115,7 @@ class ServerStore(private val db: Database) {
         rs.getString("name"),
         rs.getString("user_id"),
         rs.getString("owner_email"),
-        rs.getTimestamp("activated_at").toInstant().toString(),
-        rs.getTimestamp("last_seen_at").toInstant().toString(),
+        rs.getTimestamp("activated_at")?.toInstant()?.toString() ?: java.time.Instant.now().toString(),
+        rs.getTimestamp("last_seen_at")?.toInstant()?.toString() ?: java.time.Instant.now().toString(),
     )
 }
