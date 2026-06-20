@@ -43,7 +43,12 @@ import pl.danielniemiec.properbackup.buffer.server.ServerHandler
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
+import pl.danielniemiec.properbackup.buffer.monitoring.AgentHealthMonitor
 import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
+import pl.danielniemiec.properbackup.buffer.notifications.EmailNotifier
+import pl.danielniemiec.properbackup.buffer.notifications.NotificationScheduler
+import pl.danielniemiec.properbackup.buffer.notifications.NotificationSettingsHandler
+import pl.danielniemiec.properbackup.buffer.notifications.NotificationSettingsStore
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryAuditLog
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryEventBus
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryGuard
@@ -169,9 +174,17 @@ fun main(args: Array<String>) {
         preRecoverySnapshotCreator, recoveryAuditLog, recoveryEventBus,
     )
 
+    val notifSettingsStore = NotificationSettingsStore(db)
+    val emailNotifier = EmailNotifier()
+    val notifScheduler = NotificationScheduler(db, notifSettingsStore, emailNotifier)
+    val agentHealthMonitor = AgentHealthMonitor(db, serverStore, notifScheduler)
+    val notifSettingsHandler = NotificationSettingsHandler(notifSettingsStore)
+
     flusher.start()
     packBuffer.start()
     trialNotifier.start()
+    notifScheduler.start()
+    agentHealthMonitor.start()
 
     val app = Javalin.create { cfg ->
         cfg.http.maxRequestSize = 100L * 1024 * 1024
@@ -279,6 +292,8 @@ fun main(args: Array<String>) {
     app.get("/account/checkout", lemonHandler::getCheckoutUrl)
 
     app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
+    app.get("/account/notification-settings", notifSettingsHandler::getSettings)
+    app.post("/account/notification-settings", notifSettingsHandler::saveSettings)
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)
