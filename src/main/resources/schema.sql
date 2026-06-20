@@ -196,6 +196,22 @@ CREATE TABLE IF NOT EXISTS buffer_pack (
 
 CREATE INDEX IF NOT EXISTS idx_buffer_pack_server_time ON buffer_pack(server_id, flushed_at DESC);
 
+-- Per-user daily storage cost tracking (OVH Cloud Archive economics)
+CREATE TABLE IF NOT EXISTS user_storage_daily (
+  id                BIGSERIAL    PRIMARY KEY,
+  user_id           VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day               DATE         NOT NULL,
+  stored_bytes      BIGINT       NOT NULL DEFAULT 0,
+  uploaded_bytes    BIGINT       NOT NULL DEFAULT 0,
+  storage_cost_pln  NUMERIC(12,6) NOT NULL DEFAULT 0,
+  upload_cost_pln   NUMERIC(12,6) NOT NULL DEFAULT 0,
+  total_cost_pln    NUMERIC(12,6) NOT NULL DEFAULT 0,
+  updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_storage_daily_user_day ON user_storage_daily(user_id, day DESC);
+
 -- ============================================================================
 -- Data retention / cleanup support
 -- ============================================================================
