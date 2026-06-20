@@ -308,3 +308,41 @@ CREATE TABLE IF NOT EXISTS recovery_audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_recovery_audit_session ON recovery_audit_log(recovery_session_id, created_at);
+
+-- Stripe event idempotency (webhook deduplication)
+CREATE TABLE IF NOT EXISTS stripe_event_idempotency (
+  stripe_event_id VARCHAR(64) PRIMARY KEY,
+  event_type      VARCHAR(128) NOT NULL,
+  processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  response_status INT NOT NULL DEFAULT 200
+);
+
+-- Out-of-order webhook protection
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stripe_event_at TIMESTAMPTZ;
+
+-- Webhook Dead-Letter Queue (failed events for manual replay)
+CREATE TABLE IF NOT EXISTS stripe_webhook_dlq (
+  id               BIGSERIAL PRIMARY KEY,
+  stripe_event_id  VARCHAR(64) NOT NULL,
+  event_type       VARCHAR(128) NOT NULL,
+  payload          TEXT NOT NULL,
+  signature_header TEXT NOT NULL,
+  retry_count      INT NOT NULL DEFAULT 0,
+  last_error       TEXT,
+  first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  resolved_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_stripe_webhook_dlq_unresolved
+  ON stripe_webhook_dlq(resolved_at) WHERE resolved_at IS NULL;
+
+-- Subscription audit log (append-only billing compliance trail)
+CREATE TABLE IF NOT EXISTS subscription_audit_log (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    VARCHAR(36) NOT NULL,
+  action     VARCHAR(64) NOT NULL,
+  detail     TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sub_audit_user ON subscription_audit_log(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sub_audit_action ON subscription_audit_log(action, created_at DESC);
