@@ -422,12 +422,12 @@ fun main(args: Array<String>) {
     app.before("/recovery/*", jwtFilter)
     app.before("/recovery", jwtFilter)
     app.post("/recovery/start", recoveryHandler::startRecovery)
+    app.get("/recovery/active", recoveryHandler::activeRecoveries)
     app.get("/recovery/history", recoveryHandler::history)
     app.get("/recovery/{id}", recoveryHandler::getSession)
     app.post("/recovery/{id}/confirm", recoveryHandler::confirmRecovery)
     app.post("/recovery/{id}/cancel", recoveryHandler::cancelRecovery)
     app.get("/recovery/{id}/audit", recoveryHandler::getAudit)
-    app.get("/recovery/active", recoveryHandler::activeRecoveries)
     app.sse("/recovery/{id}/stream") { client ->
         val ctx = client.ctx()
         val sessionId = ctx.pathParam("id")
