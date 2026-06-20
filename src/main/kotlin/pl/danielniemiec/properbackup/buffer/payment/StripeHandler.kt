@@ -33,6 +33,7 @@ class StripeHandler(
     private val auditLog: SubscriptionAuditLog,
     private val dunningNotifier: DunningNotifier? = null,
     private val userSseBus: UserSseEventBus? = null,
+    private val trialAbuseHeuristics: TrialAbuseHeuristics? = null,
 ) {
     private val gson = Gson()
 
@@ -143,6 +144,29 @@ class StripeHandler(
 
         auditLog.append(userId, "checkout_completed", "plan=$plan, subscription=$subscriptionId")
         println("[Stripe] Checkout completed: user=$userId plan=$plan subscription=$subscriptionId")
+
+        // Trial abuse detection per [TDD-E1] — card fingerprint check
+        val paymentIntent = session.get("payment_intent")?.asString
+        val cardFingerprint = session.getAsJsonObject("payment_method_options")
+            ?.getAsJsonObject("card")?.get("fingerprint")?.asString
+            ?: metadata?.get("card_fingerprint")?.asString
+        if (trialAbuseHeuristics != null && !cardFingerprint.isNullOrBlank()) {
+            trialAbuseHeuristics.storeFingerprint(userId, cardFingerprint)
+            val abuseResult = trialAbuseHeuristics.checkCardFingerprint(userId, cardFingerprint)
+            if (abuseResult.isAbuse) {
+                trialAbuseHeuristics.markAbuse(userId, abuseResult.score)
+                auditLog.append(userId, "trial_abuse_fingerprint_match",
+                    "score=${abuseResult.score}, reasons=${abuseResult.reasons.joinToString(";")}")
+                println("[Stripe] Trial abuse detected for user=$userId score=${abuseResult.score}")
+                // Trial shortened to NOW — user must pay immediately
+                db.getConnection().use { conn ->
+                    conn.prepareStatement("UPDATE users SET trial_expires_at = NOW() WHERE id = ?").use { stmt ->
+                        stmt.setString(1, userId)
+                        stmt.executeUpdate()
+                    }
+                }
+            }
+        }
 
         // Publish SSE event for ProcessingScreen (§9.3 [TDD-F1])
         userSseBus?.publish(userId, "subscription", mapOf(

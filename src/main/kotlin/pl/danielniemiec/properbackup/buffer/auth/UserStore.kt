@@ -93,6 +93,17 @@ class UserStore(private val db: Database) {
     fun verifyPassword(user: User, plainPassword: String): Boolean =
         BCrypt.verifyer().verify(plainPassword.toCharArray(), user.bcryptHash).verified
 
+    fun getStripeSubscriptionId(userId: String): String? {
+        return db.getConnection().use { conn ->
+            conn.prepareStatement("SELECT stripe_subscription_id FROM users WHERE id = ?").use { ps ->
+                ps.setString(1, userId)
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) rs.getString("stripe_subscription_id") else null
+                }
+            }
+        }
+    }
+
     fun isEmpty(): Boolean {
         db.getConnection().use { conn ->
             conn.prepareStatement("SELECT COUNT(*) FROM users").use { ps ->

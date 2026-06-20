@@ -359,3 +359,27 @@ CREATE TABLE IF NOT EXISTS subscription_audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_sub_audit_user ON subscription_audit_log(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sub_audit_action ON subscription_audit_log(action, created_at DESC);
+
+-- Trial abuse detection (Group E [TDD-E1])
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_card_fingerprint VARCHAR(64);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS abuse_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS abuse_score INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_users_card_fingerprint ON users(stripe_card_fingerprint) WHERE stripe_card_fingerprint IS NOT NULL;
+
+-- Stripe price configuration (for subscription management endpoints)
+-- Table already exists with columns: plan_key, stripe_price_id, updated_at, mode
+-- PRIMARY KEY (plan_key, mode)
+CREATE TABLE IF NOT EXISTS stripe_price_config (
+  plan_key        VARCHAR(32) NOT NULL,
+  stripe_price_id VARCHAR(128) NOT NULL,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  mode            VARCHAR(8) NOT NULL DEFAULT 'test',
+  PRIMARY KEY (plan_key, mode)
+);
+
+-- Default test prices (override in production)
+INSERT INTO stripe_price_config (plan_key, stripe_price_id, mode) VALUES
+  ('monthly', 'price_test_monthly', 'test'),
+  ('annual', 'price_test_annual', 'test')
+ON CONFLICT (plan_key, mode) DO NOTHING;

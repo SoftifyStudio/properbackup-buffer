@@ -29,7 +29,9 @@ import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.payment.StripeApiClient
 import pl.danielniemiec.properbackup.buffer.payment.StripeHandler
+import pl.danielniemiec.properbackup.buffer.payment.TrialAbuseHeuristics
 import pl.danielniemiec.properbackup.buffer.payment.SubscriptionAuditLog
 import pl.danielniemiec.properbackup.buffer.payment.WebhookDlq
 import pl.danielniemiec.properbackup.buffer.payment.WebhookIdempotency
@@ -38,6 +40,7 @@ import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import pl.danielniemiec.properbackup.buffer.subscription.DunningNotifier
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
+import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionManagementHandler
 import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
 import pl.danielniemiec.properbackup.buffer.pathsidx.ArchiveSnapshotStore
 import pl.danielniemiec.properbackup.buffer.pathsidx.BackupConfigStore
@@ -169,8 +172,14 @@ fun main(args: Array<String>) {
     val webhookIdempotency = WebhookIdempotency(db)
     val webhookDlq = WebhookDlq(db)
     val dunningNotifier = DunningNotifier(db, userStore, subscriptionAuditLog)
-    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier, userSseBus)
+    val trialAbuseHeuristics = TrialAbuseHeuristics(db)
+    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier, userSseBus, trialAbuseHeuristics)
     val agentSessionHandler = AgentSessionHandler(db, jwtService, serverStore, userStore, uploadToken)
+
+    val stripeSecretKey = System.getenv("STRIPE_SECRET_KEY") ?: System.getenv("STRIPE_TEST_SECRET_KEY") ?: ""
+    val panelUrl = System.getenv("PROPERBACKUP_PANEL_URL") ?: "https://properbackup-test-server.softify.com.pl"
+    val stripeApi = if (stripeSecretKey.isNotBlank()) StripeApiClient(db, stripeSecretKey, "$panelUrl/panel", "$panelUrl/account/subscription") else null
+    val subscriptionMgmtHandler = SubscriptionManagementHandler(userStore, stripeApi, subscriptionAuditLog)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
@@ -295,9 +304,22 @@ fun main(args: Array<String>) {
         ctx.contentType("application/json").result(Gson().toJson(userStore.listSummaries()))
     }
     app.get("/admin/logs", logApi::listLogsAdmin)
+    app.post("/admin/users/{id}/clear-abuse-block") { ctx ->
+        if (java.lang.Boolean.TRUE != ctx.attribute<Boolean>("isSystemAdmin")) {
+            throw ForbiddenResponse()
+        }
+        val targetUserId = ctx.pathParam("id")
+        trialAbuseHeuristics.clearAbuseBlock(targetUserId)
+        subscriptionAuditLog.append(targetUserId, "abuse_block_cleared", "by_admin")
+        ctx.result("ok")
+    }
 
     app.before("/account/*", jwtFilter)
     app.get("/account/subscription", subscriptionHandler::getSubscription)
+    app.post("/account/subscription/checkout", subscriptionMgmtHandler::checkout)
+    app.post("/account/subscription/cancel", subscriptionMgmtHandler::cancel)
+    app.post("/account/subscription/reactivate", subscriptionMgmtHandler::reactivate)
+    app.post("/account/subscription/change-plan", subscriptionMgmtHandler::changePlan)
     app.get("/account/checkout", lemonHandler::getCheckoutUrl)
 
     app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
