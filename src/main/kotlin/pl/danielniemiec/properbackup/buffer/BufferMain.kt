@@ -44,6 +44,7 @@ import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
 import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
+import pl.danielniemiec.properbackup.buffer.monitoring.HealthHandler
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryAuditLog
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryEventBus
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryGuard
@@ -169,6 +170,8 @@ fun main(args: Array<String>) {
         preRecoverySnapshotCreator, recoveryAuditLog, recoveryEventBus,
     )
 
+    val healthHandler = HealthHandler(db, storagePath)
+
     flusher.start()
     packBuffer.start()
     trialNotifier.start()
@@ -178,7 +181,15 @@ fun main(args: Array<String>) {
         cfg.bundledPlugins.enableCors { cors -> cors.addRule { it.anyHost() } }
     }
 
-    app.get("/health") { ctx -> ctx.status(200).contentType("text/plain").result("ok") }
+    app.get("/health", healthHandler::health)
+    app.get("/health/detailed") { ctx ->
+        jwtFilter.handle(ctx)
+        healthHandler.healthDetailed(ctx)
+    }
+    app.get("/live", healthHandler::live)
+    app.get("/ready", healthHandler::ready)
+
+    healthHandler.markReady()
 
     app.post("/auth/login", authHandler::login)
     app.post("/auth/register", authHandler::register)
