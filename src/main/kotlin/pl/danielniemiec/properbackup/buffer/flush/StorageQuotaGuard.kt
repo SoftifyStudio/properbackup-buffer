@@ -25,29 +25,37 @@ class StorageQuotaGuard(
         return QuotaStatus(usedBytes, limitBytes, remaining, pct, usedBytes >= limitBytes)
     }
 
+    /**
+     * Returns false (fail-closed) if:
+     * - DB is unavailable (cannot verify quota)
+     * - User not found
+     * - Quota would be exceeded
+     *
+     * Per [TDD-G1c]: MUST fail-closed when DB unreachable.
+     */
     fun canUpload(userId: String, additionalBytes: Long): Boolean {
-        val status = checkQuota(userId)
-        return (status.usedBytes + additionalBytes) <= status.limitBytes
+        return try {
+            val status = checkQuota(userId)
+            (status.usedBytes + additionalBytes) <= status.limitBytes
+        } catch (e: Exception) {
+            System.err.println("[StorageQuotaGuard] FAIL-CLOSED: DB unavailable during canUpload check: ${e.message}")
+            false
+        }
     }
 
     private fun totalStorageUsed(userId: String): Long {
-        return try {
-            db.getConnection().use { conn ->
-                conn.prepareStatement(
-                    """SELECT COALESCE(SUM(a.size_bytes), 0)
-                       FROM archive_snapshot a
-                       JOIN servers s ON s.id = a.server_id
-                       WHERE s.user_id = ?""",
-                ).use { ps ->
-                    ps.setString(1, userId)
-                    ps.executeQuery().use { rs ->
-                        if (rs.next()) rs.getLong(1) else 0L
-                    }
+        return db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """SELECT COALESCE(SUM(a.size_bytes), 0)
+                   FROM archive_snapshot a
+                   JOIN servers s ON s.id = a.server_id
+                   WHERE s.user_id = ?""",
+            ).use { ps ->
+                ps.setString(1, userId)
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) rs.getLong(1) else 0L
                 }
             }
-        } catch (e: java.sql.SQLException) {
-            System.err.println("[StorageQuotaGuard] DB error: ${e.message}")
-            0L
         }
     }
 }
