@@ -329,6 +329,10 @@ CREATE TABLE IF NOT EXISTS stripe_event_idempotency (
 -- Out-of-order webhook protection
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stripe_event_at TIMESTAMPTZ;
 
+-- Dunning flow (Group H)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_past_due_notification VARCHAR(32);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS past_due_started_at TIMESTAMPTZ;
+
 -- Webhook Dead-Letter Queue (failed events for manual replay)
 CREATE TABLE IF NOT EXISTS stripe_webhook_dlq (
   id               BIGSERIAL PRIMARY KEY,

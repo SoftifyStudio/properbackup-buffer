@@ -35,6 +35,7 @@ import pl.danielniemiec.properbackup.buffer.payment.WebhookDlq
 import pl.danielniemiec.properbackup.buffer.payment.WebhookIdempotency
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
+import pl.danielniemiec.properbackup.buffer.subscription.DunningNotifier
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionHandler
 import pl.danielniemiec.properbackup.buffer.subscription.TrialNotifier
@@ -164,7 +165,8 @@ fun main(args: Array<String>) {
     val webhookIdempotency = WebhookIdempotency(db)
     val webhookDlq = WebhookDlq(db)
     val subscriptionAuditLog = SubscriptionAuditLog(db)
-    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog)
+    val dunningNotifier = DunningNotifier(db, userStore, subscriptionAuditLog)
+    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
@@ -184,6 +186,7 @@ fun main(args: Array<String>) {
     flusher.start()
     packBuffer.start()
     trialNotifier.start()
+    dunningNotifier.start()
 
     val app = Javalin.create { cfg ->
         cfg.http.maxRequestSize = 100L * 1024 * 1024

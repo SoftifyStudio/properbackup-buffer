@@ -20,10 +20,15 @@ class UserStore(private val db: Database) {
         val subscriptionExpiresAt: String?,
         val storageLimitBytes: Long,
         val lastTrialNotification: String?,
+        val subscriptionPaymentStatus: String? = null,
+        val cancelAtPeriodEnd: Boolean = false,
+        val everSubscribed: Boolean = false,
+        val lastPastDueNotification: String? = null,
+        val pastDueStartedAt: String? = null,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, subscription_payment_status, cancel_at_period_end, ever_subscribed, last_past_due_notification, past_due_started_at"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -144,6 +149,35 @@ class UserStore(private val db: Database) {
         }
     }
 
+    fun updateLastPastDueNotification(userId: String, marker: String) {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "UPDATE users SET last_past_due_notification = ? WHERE id = ?",
+            ).use { ps ->
+                ps.setString(1, marker)
+                ps.setString(2, userId)
+                ps.executeUpdate()
+            }
+        }
+    }
+
+    fun listPastDueUsersNeedingNotification(): List<User> {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """SELECT $SELECT_COLS FROM users
+                   WHERE subscription_payment_status IN ('past_due', 'unpaid')
+                     AND past_due_started_at IS NOT NULL
+                   ORDER BY past_due_started_at ASC""",
+            ).use { ps ->
+                ps.executeQuery().use { rs ->
+                    val out = ArrayList<User>()
+                    while (rs.next()) out.add(map(rs))
+                    return out
+                }
+            }
+        }
+    }
+
     private fun map(rs: java.sql.ResultSet): User = User(
         rs.getString("id"),
         rs.getString("email"),
@@ -155,5 +189,10 @@ class UserStore(private val db: Database) {
         rs.getTimestamp("subscription_expires_at")?.toInstant()?.toString(),
         rs.getLong("storage_limit_bytes").let { if (rs.wasNull()) 2199023255552L else it },
         rs.getString("last_trial_notification"),
+        rs.getString("subscription_payment_status"),
+        rs.getBoolean("cancel_at_period_end"),
+        rs.getBoolean("ever_subscribed"),
+        rs.getString("last_past_due_notification"),
+        rs.getTimestamp("past_due_started_at")?.toInstant()?.toString(),
     )
 }

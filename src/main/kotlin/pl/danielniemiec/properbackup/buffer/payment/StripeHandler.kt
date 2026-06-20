@@ -6,6 +6,7 @@ import com.google.gson.JsonParser
 import io.javalin.http.Context
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
+import pl.danielniemiec.properbackup.buffer.subscription.DunningNotifier
 import java.sql.Timestamp
 import java.time.Instant
 import javax.crypto.Mac
@@ -29,6 +30,7 @@ class StripeHandler(
     private val idempotency: WebhookIdempotency,
     private val dlq: WebhookDlq,
     private val auditLog: SubscriptionAuditLog,
+    private val dunningNotifier: DunningNotifier? = null,
 ) {
     private val gson = Gson()
 
@@ -222,7 +224,9 @@ class StripeHandler(
                    subscription_expires_at = current_period_end,
                    cancel_at_period_end = FALSE,
                    subscription_payment_status = NULL,
-                   stripe_subscription_id = NULL
+                   stripe_subscription_id = NULL,
+                   past_due_started_at = NULL,
+                   last_past_due_notification = NULL
                    WHERE id = ?"""
             ).use { stmt ->
                 stmt.setString(1, userId)
@@ -235,6 +239,13 @@ class StripeHandler(
         }
 
         auditLog.append(userId, "subscription_deleted", "subscription=$subscriptionId")
+
+        // Send final cancellation dunning email
+        val user = userStore.findById(userId).orElse(null)
+        if (user != null && dunningNotifier != null) {
+            dunningNotifier.sendFinalCancellation(userId, user.email)
+        }
+
         println("[Stripe] Subscription deleted: user=$userId subscription=$subscriptionId")
     }
 
@@ -257,11 +268,13 @@ class StripeHandler(
             ?.get("period")?.asJsonObject
             ?.get("end")?.asLong?.let { Instant.ofEpochSecond(it) }
 
-        // Clear any payment issues, extend period
+        // Clear any payment issues, extend period, reset dunning state
         db.getConnection().use { conn ->
             conn.prepareStatement(
                 """UPDATE users SET 
                    subscription_payment_status = NULL,
+                   past_due_started_at = NULL,
+                   last_past_due_notification = NULL,
                    current_period_end = COALESCE(?, current_period_end),
                    subscription_expires_at = COALESCE(?, subscription_expires_at)
                    WHERE id = ?"""
@@ -294,10 +307,13 @@ class StripeHandler(
             return
         }
 
-        // Set payment status to past_due
+        // Set payment status to past_due + record when it started
         db.getConnection().use { conn ->
             conn.prepareStatement(
-                "UPDATE users SET subscription_payment_status = 'past_due' WHERE id = ?"
+                """UPDATE users SET 
+                   subscription_payment_status = 'past_due',
+                   past_due_started_at = COALESCE(past_due_started_at, NOW())
+                   WHERE id = ?"""
             ).use { stmt ->
                 stmt.setString(1, userId)
                 stmt.executeUpdate()
@@ -309,6 +325,13 @@ class StripeHandler(
         }
 
         auditLog.append(userId, "invoice_payment_failed", "subscription=$subscriptionId")
+
+        // Trigger immediate T+0 dunning email
+        val user = userStore.findById(userId).orElse(null)
+        if (user != null && dunningNotifier != null) {
+            dunningNotifier.sendImmediateT0(userId, user.email)
+        }
+
         println("[Stripe] Invoice payment failed: user=$userId subscription=$subscriptionId")
     }
 
