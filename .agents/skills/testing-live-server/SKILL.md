@@ -51,9 +51,10 @@ scp -i /home/ubuntu/.ssh/test_server_key build/install/properbackup-buffer/bin/p
 scp -i /home/ubuntu/.ssh/test_server_key src/main/resources/schema.sql \
   root@properbackup-test-server.softify.com.pl:/opt/properbackup/buffer/schema.sql
 
-# Apply schema (CREATE IF NOT EXISTS + ALTER TABLE IF NOT EXISTS)
+# Apply schema (copy into container first)
 ssh -i /home/ubuntu/.ssh/test_server_key root@properbackup-test-server.softify.com.pl \
-  "docker exec properbackup-db psql -U properbackup -d properbackup -f /docker-entrypoint-initdb.d/01-schema.sql"
+  "docker cp /opt/properbackup/buffer/schema.sql properbackup-db:/tmp/schema.sql && \
+   docker exec properbackup-db psql -U properbackup -d properbackup -f /tmp/schema.sql"
 
 # Restart (use force-recreate if .env changed, otherwise restart is enough)
 ssh -i /home/ubuntu/.ssh/test_server_key root@properbackup-test-server.softify.com.pl \
@@ -69,6 +70,15 @@ If you changed `/opt/properbackup/.env`, you MUST use:
 cd /opt/properbackup && docker compose up -d --force-recreate buffer
 ```
 This recreates the container with fresh env vars. A plain `restart` keeps the old environment.
+
+## IMPORTANT: Schema Apply Path
+
+The schema.sql file must be copied INTO the Docker container before psql can read it:
+```bash
+docker cp /opt/properbackup/buffer/schema.sql properbackup-db:/tmp/schema.sql
+docker exec properbackup-db psql -U properbackup -d properbackup -f /tmp/schema.sql
+```
+Do NOT try to reference host paths from inside the container (e.g. `/var/lib/postgresql/data/schema.sql` won't work unless it's a mounted volume).
 
 ## Smoke Tests After Deploy
 
@@ -129,7 +139,7 @@ curl -X POST http://properbackup-test-server.softify.com.pl/api/payment/stripe/w
   -d "$BODY"
 ```
 
-### Key Test Scenarios
+### Webhook Test Scenarios
 
 1. **Valid webhook** → HTTP 200 "ok", DB mutation applied
 2. **Tampered signature** → HTTP 400 "Invalid signature"
@@ -138,15 +148,37 @@ curl -X POST http://properbackup-test-server.softify.com.pl/api/payment/stripe/w
 5. **Out-of-order event** (stale timestamp < last_stripe_event_at) → HTTP 200 but NO mutation
 6. **Blank webhook secret** → HTTP 503 "Webhook secret not configured"
 
+### Dunning Flow Test Scenarios
+
+For testing the dunning email escalation (Group H):
+
+1. **invoice.payment_failed** → sets `subscription_payment_status='past_due'`, `past_due_started_at=NOW()`, audit: `invoice_payment_failed` + `dunning_email_sent marker=past_due_t0`
+2. **invoice.paid (recovery)** → clears `subscription_payment_status`, `past_due_started_at`, `last_past_due_notification` to NULL
+3. **subscription.deleted** → clears subscription fields + sends final cancellation (audit: `dunning_email_sent marker=final_cancellation`)
+4. **COALESCE test** — second `invoice.payment_failed` does NOT overwrite existing `past_due_started_at`
+
+Reset user for dunning tests:
+```sql
+UPDATE users SET subscription_plan='monthly', stripe_subscription_id='sub_test_dunning_001',
+  stripe_customer_id='cus_test_dunning_001', subscription_expires_at=NOW()+INTERVAL '30 days',
+  current_period_end=NOW()+INTERVAL '30 days', ever_subscribed=TRUE,
+  subscription_payment_status=NULL, past_due_started_at=NULL, last_past_due_notification=NULL,
+  cancel_at_period_end=FALSE, last_stripe_event_at=NULL
+WHERE id='beab1b48-0ee9-442c-ac3b-c1e654efd7ff';
+DELETE FROM stripe_event_idempotency;
+DELETE FROM subscription_audit_log WHERE user_id='beab1b48-0ee9-442c-ac3b-c1e654efd7ff';
+```
+
 ### Test User for Webhooks
 
 Use `beab1b48-0ee9-442c-ac3b-c1e654efd7ff` (e2e-billing-test@properbackup.dev) — trial user suitable for webhook testing.
 
-Reset before testing:
+Basic reset (pre-dunning):
 ```sql
 UPDATE users SET subscription_plan=NULL, stripe_subscription_id=NULL, stripe_customer_id=NULL,
   ever_subscribed=FALSE, subscription_payment_status=NULL, current_period_end=NULL,
-  last_stripe_event_at=NULL, cancel_at_period_end=FALSE
+  last_stripe_event_at=NULL, cancel_at_period_end=FALSE,
+  past_due_started_at=NULL, last_past_due_notification=NULL
 WHERE id='beab1b48-0ee9-442c-ac3b-c1e654efd7ff';
 DELETE FROM stripe_event_idempotency;
 DELETE FROM subscription_audit_log WHERE user_id='beab1b48-0ee9-442c-ac3b-c1e654efd7ff';
@@ -162,11 +194,13 @@ DELETE FROM subscription_audit_log WHERE user_id='beab1b48-0ee9-442c-ac3b-c1e654
 
 4. **Agent is actively running** — there are real agents uploading to this server. Be careful with destructive operations (DB drops, container removal). Brief `docker stop properbackup-db` for testing is OK (agents will retry).
 
-5. **No Resend API key configured** — email sending is skipped (logged as SKIP). Verification emails don't actually send.
+5. **No Resend API key configured** — email sending is skipped (logged as SKIP). Verification emails don't actually send. DunningNotifier uses LoggingMailer (stdout) — check `docker logs properbackup-buffer` for email content.
 
 6. **Column name drift** — Prior deploys may have created tables with slightly different column names (e.g. `details` vs `detail`). Always verify with `\d table_name` after deploy if inserts fail.
 
 7. **Env var naming convention** — Buffer reads Stripe keys as `STRIPE_TEST_WEBHOOK_SECRET` (matching docker-compose), with fallback to `STRIPE_WEBHOOK_SECRET`. Both work.
+
+8. **DunningNotifier daemon thread** — starts automatically on buffer boot, checks past_due users hourly. For testing, trigger emails directly via webhook events rather than waiting for the hourly check.
 
 ## DB Access
 
@@ -182,3 +216,20 @@ The critical test for the fail-closed fix:
 3. Call `/account/storage` → expect 500 (NOT 200 with usedBytes=0)
 4. `docker start properbackup-db && sleep 3`
 5. Call `/account/storage` → expect 200 (recovery)
+
+## Testing SubscriptionGuard State Machine
+
+SubscriptionGuard determines access state from DB columns. To test specific states, manipulate the user's DB record:
+
+| State | DB Setup |
+|-------|----------|
+| NONE | subscription_plan=NULL, trial_expires_at=NULL |
+| TRIALING | trial_expires_at > NOW() |
+| ACTIVE | subscription_plan set, subscription_expires_at > NOW() |
+| ACTIVE_CANCELLED | same as ACTIVE + cancel_at_period_end=TRUE |
+| PAST_DUE_GRACE | same as ACTIVE + subscription_payment_status='past_due' |
+| PAST_DUE_SUSPENDED | same as ACTIVE + subscription_payment_status='unpaid' |
+| EXPIRED | subscription_expires_at < NOW(), ever_subscribed=TRUE |
+
+Anti-hostage policy: `canRestore = true` in ALL states (GDPR art. 20).
+`canUpload = false` only in NONE, PAST_DUE_SUSPENDED, EXPIRED.
