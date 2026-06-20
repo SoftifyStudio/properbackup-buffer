@@ -74,7 +74,7 @@ class PackUnpackIntegrationTest {
         packBufferDir = Files.createTempDirectory("pb-pack-")
 
         objectStore = LocalObjectStore(storageDir)
-        packBuffer = PackBuffer(packBufferDir, db, null, 10L * 1024 * 1024) // 10 MB pack limit for test
+        packBuffer = PackBuffer(packBufferDir, db, swiftRemote = null, storageClient = null, maxPackBytes = 10L * 1024 * 1024) // 10 MB pack limit for test
         facade = ObjectReadFacade(objectStore, null, packBuffer)
     }
 
