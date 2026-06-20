@@ -47,6 +47,7 @@ import pl.danielniemiec.properbackup.buffer.server.ActivationTokenStore
 import pl.danielniemiec.properbackup.buffer.server.ServerHandler
 import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
+import pl.danielniemiec.properbackup.buffer.sse.UserSseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
 import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryAuditLog
@@ -102,6 +103,7 @@ fun main(args: Array<String>) {
     val agentStatusStore = AgentStatusStore(db)
     val agentMetricsStore = AgentMetricsStore(db)
     val sseBus = SseEventBus()
+    val userSseBus = UserSseEventBus()
     val logApi = LogApiHandler(logStore, fileStateStore, fileEventStore, backupRootStore, agentStatusStore, db, ingestToken, sseBus = sseBus)
 
     val objectStore = LocalObjectStore(storageDir)
@@ -166,7 +168,7 @@ fun main(args: Array<String>) {
     val webhookDlq = WebhookDlq(db)
     val subscriptionAuditLog = SubscriptionAuditLog(db)
     val dunningNotifier = DunningNotifier(db, userStore, subscriptionAuditLog)
-    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier)
+    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier, userSseBus)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
@@ -295,6 +297,26 @@ fun main(args: Array<String>) {
 
     app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
     app.post("/payment/stripe/webhook", stripeHandler::handleWebhook)
+
+    // SSE endpoint for user-level subscription events (ProcessingScreen)
+    // Auth via JWT query param per spec §9.3
+    app.sse("/sse/subscription") { client ->
+        val ctx = client.ctx()
+        val token = ctx.queryParam("token")
+        if (token == null) {
+            client.sendEvent("error", """{"message":"Missing token"}""")
+            return@sse
+        }
+        val userId = try {
+            jwtService.verify(token).subject
+        } catch (e: Exception) {
+            client.sendEvent("error", """{"message":"Invalid token"}""")
+            return@sse
+        }
+        if (userId != null) {
+            userSseBus.subscribe(userId, "subscription", client)
+        }
+    }
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)

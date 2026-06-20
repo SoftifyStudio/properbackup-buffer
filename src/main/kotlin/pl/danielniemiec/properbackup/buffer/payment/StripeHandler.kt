@@ -7,6 +7,7 @@ import io.javalin.http.Context
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.subscription.DunningNotifier
+import pl.danielniemiec.properbackup.buffer.sse.UserSseEventBus
 import java.sql.Timestamp
 import java.time.Instant
 import javax.crypto.Mac
@@ -31,6 +32,7 @@ class StripeHandler(
     private val dlq: WebhookDlq,
     private val auditLog: SubscriptionAuditLog,
     private val dunningNotifier: DunningNotifier? = null,
+    private val userSseBus: UserSseEventBus? = null,
 ) {
     private val gson = Gson()
 
@@ -141,6 +143,13 @@ class StripeHandler(
 
         auditLog.append(userId, "checkout_completed", "plan=$plan, subscription=$subscriptionId")
         println("[Stripe] Checkout completed: user=$userId plan=$plan subscription=$subscriptionId")
+
+        // Publish SSE event for ProcessingScreen (§9.3 [TDD-F1])
+        userSseBus?.publish(userId, "subscription", mapOf(
+            "type" to "subscription_activated",
+            "plan" to plan,
+            "subscriptionId" to subscriptionId,
+        ))
     }
 
     private fun handleSubscriptionUpdated(subscription: JsonObject, eventCreated: Instant?) {
