@@ -117,7 +117,8 @@ fun main(args: Array<String>) {
     val maxFlushes = System.getenv("PROPERBACKUP_MAX_FLUSHES_PER_DAY")?.toIntOrNull() ?: 50
     val budgetGuard = BudgetGuard(db, maxFlushes)
     val swiftRemote = swiftClientFromEnv(storageDir)
-    val storageQuotaGuard = StorageQuotaGuard(db, userStore)
+    val subscriptionAuditLog = SubscriptionAuditLog(db)
+    val storageQuotaGuard = StorageQuotaGuard(db, userStore, subscriptionAuditLog)
     val packBufferDir = Path.of(System.getenv().getOrDefault("PROPERBACKUP_PACK_BUFFER_DIR", "/tmp/properbackup/pack-buffer"))
     val packBuffer = PackBuffer(packBufferDir, db, swiftRemote)
 
@@ -167,7 +168,6 @@ fun main(args: Array<String>) {
         ?: ""
     val webhookIdempotency = WebhookIdempotency(db)
     val webhookDlq = WebhookDlq(db)
-    val subscriptionAuditLog = SubscriptionAuditLog(db)
     val dunningNotifier = DunningNotifier(db, userStore, subscriptionAuditLog)
     val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog, dunningNotifier, userSseBus)
     val agentSessionHandler = AgentSessionHandler(db, jwtService, serverStore, userStore, uploadToken)

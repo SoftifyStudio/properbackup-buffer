@@ -2,10 +2,12 @@ package pl.danielniemiec.properbackup.buffer.flush
 
 import pl.danielniemiec.properbackup.buffer.auth.UserStore
 import pl.danielniemiec.properbackup.buffer.db.Database
+import pl.danielniemiec.properbackup.buffer.payment.SubscriptionAuditLog
 
 class StorageQuotaGuard(
     private val db: Database,
     private val userStore: UserStore,
+    private val auditLog: SubscriptionAuditLog? = null,
 ) {
 
     data class QuotaStatus(
@@ -36,9 +38,17 @@ class StorageQuotaGuard(
     fun canUpload(userId: String, additionalBytes: Long): Boolean {
         return try {
             val status = checkQuota(userId)
-            (status.usedBytes + additionalBytes) <= status.limitBytes
+            val allowed = (status.usedBytes + additionalBytes) <= status.limitBytes
+            if (!allowed) {
+                auditLog?.append(userId, "agent_blocked_quota_exceeded",
+                    "used=${status.usedBytes} limit=${status.limitBytes} additional=$additionalBytes")
+            }
+            allowed
         } catch (e: Exception) {
             System.err.println("[StorageQuotaGuard] FAIL-CLOSED: DB unavailable during canUpload check: ${e.message}")
+            auditLog?.let {
+                try { it.append(userId, "agent_blocked_db_unavailable", e.message ?: "unknown") } catch (_: Exception) {}
+            }
             false
         }
     }
