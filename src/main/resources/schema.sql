@@ -324,3 +324,39 @@ CREATE TABLE IF NOT EXISTS recovery_audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_recovery_audit_session ON recovery_audit_log(recovery_session_id, created_at);
+
+-- ── Notification settings ──
+CREATE TABLE IF NOT EXISTS notification_settings (
+  user_id                  VARCHAR(36) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  enabled                  BOOLEAN NOT NULL DEFAULT FALSE,
+  email                    VARCHAR(255) NOT NULL DEFAULT '',
+  on_agent_offline         BOOLEAN NOT NULL DEFAULT TRUE,
+  on_storage_warning       BOOLEAN NOT NULL DEFAULT TRUE,
+  on_subscription_expiry   BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── Notification queue (pending alerts to be delivered) ──
+CREATE TABLE IF NOT EXISTS notification_queue (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  alert_type    VARCHAR(32) NOT NULL,
+  subject_key   VARCHAR(128) NOT NULL,
+  payload       JSONB,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at  TIMESTAMPTZ,
+  status        VARCHAR(16) NOT NULL DEFAULT 'PENDING'
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_queue_pending ON notification_queue(status, created_at) WHERE status = 'PENDING';
+
+-- ── Notification log (deduplication + audit) ──
+CREATE TABLE IF NOT EXISTS notification_log (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  alert_type    VARCHAR(32) NOT NULL,
+  subject_key   VARCHAR(128) NOT NULL,
+  sent_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_log_dedup ON notification_log(user_id, alert_type, subject_key, sent_at);
