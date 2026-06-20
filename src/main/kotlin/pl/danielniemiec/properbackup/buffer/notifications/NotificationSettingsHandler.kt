@@ -8,12 +8,17 @@ class NotificationSettingsHandler(
 ) {
     private val gson = Gson()
 
+    private fun jsonResponse(ctx: Context, data: Any) {
+        ctx.contentType("application/json").result(gson.toJson(data))
+    }
+
     fun getSettings(ctx: Context) {
         val userId = ctx.attribute<String>("userId")
-        if (userId == null) { ctx.status(401).json(mapOf("error" to "Unauthorized")); return }
+        if (userId == null) { ctx.status(401); jsonResponse(ctx, mapOf("error" to "Unauthorized")); return }
         val settings = settingsStore.get(userId)
         if (settings != null) {
-            ctx.json(
+            jsonResponse(
+                ctx,
                 mapOf(
                     "enabled" to settings.enabled,
                     "email" to settings.email,
@@ -23,7 +28,8 @@ class NotificationSettingsHandler(
                 ),
             )
         } else {
-            ctx.json(
+            jsonResponse(
+                ctx,
                 mapOf(
                     "enabled" to false,
                     "email" to "",
@@ -37,7 +43,7 @@ class NotificationSettingsHandler(
 
     fun saveSettings(ctx: Context) {
         val userId = ctx.attribute<String>("userId")
-        if (userId == null) { ctx.status(401).json(mapOf("error" to "Unauthorized")); return }
+        if (userId == null) { ctx.status(401); jsonResponse(ctx, mapOf("error" to "Unauthorized")); return }
 
         data class Req(
             val enabled: Boolean = false,
@@ -50,7 +56,7 @@ class NotificationSettingsHandler(
         val req = try {
             gson.fromJson(ctx.body(), Req::class.java)
         } catch (e: Exception) {
-            ctx.status(400).json(mapOf("error" to "Invalid JSON")); return
+            ctx.status(400); jsonResponse(ctx, mapOf("error" to "Invalid JSON")); return
         }
 
         settingsStore.upsert(
@@ -63,6 +69,6 @@ class NotificationSettingsHandler(
                 onSubscriptionExpiry = req.onSubscriptionExpiry,
             ),
         )
-        ctx.json(mapOf("ok" to true))
+        jsonResponse(ctx, mapOf("ok" to true))
     }
 }
