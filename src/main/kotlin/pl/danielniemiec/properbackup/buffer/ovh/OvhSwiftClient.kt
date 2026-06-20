@@ -17,6 +17,9 @@ class OvhSwiftClient private constructor(
     private val authUrlBase: String,
     private val keystoneAuthJson: String,
     private val container: String,
+    private val maxRetries: Int = DEFAULT_MAX_RETRIES,
+    private val initialRetryDelayMs: Long = DEFAULT_INITIAL_RETRY_DELAY_MS,
+    private val maxRetryDelayMs: Long = DEFAULT_MAX_RETRY_DELAY_MS,
 ) : SwiftClient {
 
     private val http = HttpClient.newBuilder()
@@ -33,6 +36,10 @@ class OvhSwiftClient private constructor(
     private var storageUrl: String? = null
 
     companion object {
+        const val DEFAULT_MAX_RETRIES = 5
+        const val DEFAULT_INITIAL_RETRY_DELAY_MS = 1_000L
+        const val DEFAULT_MAX_RETRY_DELAY_MS = 60_000L
+
         @JvmStatic
         fun tryCreateFromEnv(): OvhSwiftClient? {
             val auth = firstNonBlankWithDefault(
@@ -195,6 +202,41 @@ class OvhSwiftClient private constructor(
         }
     }
 
+    private fun <T> sendWithRetry(
+        requestBuilder: () -> HttpRequest,
+        handler: HttpResponse.BodyHandler<T>,
+        operationName: String,
+    ): HttpResponse<T> {
+        var delay = initialRetryDelayMs
+        var lastException: IOException? = null
+
+        for (attempt in 1..maxRetries) {
+            try {
+                val resp = send(requestBuilder(), handler)
+                val code = resp.statusCode()
+                if (code in 500..599 && attempt < maxRetries) {
+                    System.err.println("[OVH] $operationName attempt $attempt/$maxRetries got $code, retrying in ${delay}ms")
+                    Thread.sleep(delay)
+                    delay = minOf(delay * 2, maxRetryDelayMs)
+                    continue
+                }
+                return resp
+            } catch (e: IOException) {
+                lastException = e
+                if (attempt == maxRetries) break
+                System.err.println("[OVH] $operationName attempt $attempt/$maxRetries failed: ${e.message}, retrying in ${delay}ms")
+                try {
+                    Thread.sleep(delay)
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw IOException("Interrupted during retry", ie)
+                }
+                delay = minOf(delay * 2, maxRetryDelayMs)
+            }
+        }
+        throw lastException ?: IOException("$operationName failed after $maxRetries attempts")
+    }
+
     @Synchronized
     @Throws(IOException::class)
     private fun ensureToken() {
@@ -219,30 +261,60 @@ class OvhSwiftClient private constructor(
         tokenExpiresAt = System.currentTimeMillis() + 23L * 3600 * 1000
     }
 
+    private fun objectUri(objectName: String): URI {
+        return URI.create("${storageUrl!!}/${enc(container)}/${encObjectName(objectName)}")
+    }
+
     override fun put(objectName: String, data: ByteArray) {
         ensureToken()
-        val uri = URI.create("${storageUrl!!}/${enc(container)}/${encObjectName(objectName)}")
-        val req = HttpRequest.newBuilder(uri)
-            .timeout(Duration.ofMinutes(5))
-            .header("X-Auth-Token", token!!)
-            .PUT(HttpRequest.BodyPublishers.ofByteArray(data))
-            .build()
-        val resp = send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+        val resp = sendWithRetry(
+            requestBuilder = {
+                HttpRequest.newBuilder(objectUri(objectName))
+                    .timeout(Duration.ofMinutes(5))
+                    .header("X-Auth-Token", token!!)
+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(data))
+                    .build()
+            },
+            handler = HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8),
+            operationName = "PUT $objectName",
+        )
         val code = resp.statusCode()
         if (code < 200 || code >= 300) {
             throw IOException("OVH PUT failed: $code ${truncate(resp.body(), 200)}")
+        }
+        verifyAfterPut(objectName, data.size.toLong())
+    }
+
+    private fun verifyAfterPut(objectName: String, expectedSize: Long) {
+        val meta = headObject(objectName)
+        if (meta == null) {
+            System.err.println("[OVH] integrity warning: HEAD after PUT returned null for $objectName")
+            return
+        }
+        if (meta.contentLength != expectedSize) {
+            System.err.println(
+                "[OVH] integrity MISMATCH for $objectName: expected=$expectedSize, got=${meta.contentLength}"
+            )
+            throw IOException(
+                "OVH integrity verification failed: size mismatch for $objectName " +
+                    "(expected=$expectedSize, actual=${meta.contentLength})"
+            )
         }
     }
 
     override fun get(objectName: String): ByteArray {
         ensureToken()
-        val uri = URI.create("${storageUrl!!}/${enc(container)}/${encObjectName(objectName)}")
-        val req = HttpRequest.newBuilder(uri)
-            .timeout(Duration.ofMinutes(2))
-            .header("X-Auth-Token", token!!)
-            .GET()
-            .build()
-        val resp = send(req, HttpResponse.BodyHandlers.ofByteArray())
+        val resp = sendWithRetry(
+            requestBuilder = {
+                HttpRequest.newBuilder(objectUri(objectName))
+                    .timeout(Duration.ofMinutes(2))
+                    .header("X-Auth-Token", token!!)
+                    .GET()
+                    .build()
+            },
+            handler = HttpResponse.BodyHandlers.ofByteArray(),
+            operationName = "GET $objectName",
+        )
         val code = resp.statusCode()
         if (code == 404) throw IOException("Object not found: $objectName")
         if (code < 200 || code >= 300) throw IOException("OVH GET failed: $code")
@@ -252,12 +324,17 @@ class OvhSwiftClient private constructor(
     override fun list(): List<String> {
         ensureToken()
         val uri = URI.create("${storageUrl!!}/${enc(container)}?format=plain")
-        val req = HttpRequest.newBuilder(uri)
-            .timeout(Duration.ofMinutes(2))
-            .header("X-Auth-Token", token!!)
-            .GET()
-            .build()
-        val resp = send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+        val resp = sendWithRetry(
+            requestBuilder = {
+                HttpRequest.newBuilder(uri)
+                    .timeout(Duration.ofMinutes(2))
+                    .header("X-Auth-Token", token!!)
+                    .GET()
+                    .build()
+            },
+            handler = HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8),
+            operationName = "LIST",
+        )
         val code = resp.statusCode()
         if (code == 204) return emptyList()
         if (code < 200 || code >= 300) throw IOException("OVH LIST failed: $code")
@@ -266,20 +343,25 @@ class OvhSwiftClient private constructor(
 
     override fun delete(objectName: String) {
         ensureToken()
-        val uri = URI.create("${storageUrl!!}/${enc(container)}/${encObjectName(objectName)}")
-        val req = HttpRequest.newBuilder(uri)
-            .timeout(Duration.ofMinutes(1))
-            .header("X-Auth-Token", token!!)
-            .DELETE()
-            .build()
-        val resp = send(req, HttpResponse.BodyHandlers.discarding())
+        val uri = objectUri(objectName)
+        val resp = sendWithRetry(
+            requestBuilder = {
+                HttpRequest.newBuilder(uri)
+                    .timeout(Duration.ofMinutes(1))
+                    .header("X-Auth-Token", token!!)
+                    .DELETE()
+                    .build()
+            },
+            handler = HttpResponse.BodyHandlers.discarding(),
+            operationName = "DELETE $objectName",
+        )
         val code = resp.statusCode()
         if (code != 204 && code != 404) throw IOException("OVH DELETE failed: $code")
     }
 
     override fun exists(objectName: String): Boolean {
         ensureToken()
-        val uri = URI.create("${storageUrl!!}/${enc(container)}/${encObjectName(objectName)}")
+        val uri = objectUri(objectName)
         val req = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(30))
             .header("X-Auth-Token", token!!)
@@ -287,5 +369,87 @@ class OvhSwiftClient private constructor(
             .build()
         val resp = send(req, HttpResponse.BodyHandlers.discarding())
         return resp.statusCode() == 200
+    }
+
+    override fun headObject(objectName: String): ObjectMetadata? {
+        ensureToken()
+        val uri = objectUri(objectName)
+        val req = HttpRequest.newBuilder(uri)
+            .timeout(Duration.ofSeconds(30))
+            .header("X-Auth-Token", token!!)
+            .method("HEAD", HttpRequest.BodyPublishers.noBody())
+            .build()
+        val resp = send(req, HttpResponse.BodyHandlers.discarding())
+        if (resp.statusCode() == 404) return null
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw IOException("OVH HEAD failed: ${resp.statusCode()}")
+        }
+        val headers = mutableMapOf<String, String>()
+        resp.headers().map().forEach { (k, v) -> if (v.isNotEmpty()) headers[k.lowercase()] = v[0] }
+        return ObjectMetadata(
+            contentLength = headers["content-length"]?.toLongOrNull() ?: 0L,
+            etag = headers["etag"]?.replace("\"", ""),
+            contentType = headers["content-type"],
+            headers = headers,
+        )
+    }
+
+    override fun requestUnseal(objectName: String): UnsealStatus {
+        ensureToken()
+        val uri = objectUri(objectName)
+        val req = HttpRequest.newBuilder(uri)
+            .timeout(Duration.ofSeconds(30))
+            .header("X-Auth-Token", token!!)
+            .method("HEAD", HttpRequest.BodyPublishers.noBody())
+            .build()
+        val resp = send(req, HttpResponse.BodyHandlers.discarding())
+        if (resp.statusCode() == 404) return UnsealStatus.NOT_FOUND
+
+        val headers = mutableMapOf<String, String>()
+        resp.headers().map().forEach { (k, v) -> if (v.isNotEmpty()) headers[k.lowercase()] = v[0] }
+
+        val unsealState = headers["x-ovh-retrieval-state"]
+        return when {
+            unsealState == null -> UnsealStatus.UNSEALED
+            unsealState.equals("unsealed", ignoreCase = true) -> UnsealStatus.UNSEALED
+            unsealState.equals("unsealing", ignoreCase = true) -> UnsealStatus.UNSEALING
+            unsealState.equals("sealed", ignoreCase = true) -> {
+                val getReq = HttpRequest.newBuilder(uri)
+                    .timeout(Duration.ofSeconds(30))
+                    .header("X-Auth-Token", token!!)
+                    .GET()
+                    .build()
+                try {
+                    send(getReq, HttpResponse.BodyHandlers.discarding())
+                } catch (_: IOException) {
+                    // expected to fail for sealed objects; triggers unseal
+                }
+                UnsealStatus.UNSEALING
+            }
+            else -> UnsealStatus.SEALED
+        }
+    }
+
+    override fun checkUnsealStatus(objectName: String): UnsealStatus {
+        ensureToken()
+        val uri = objectUri(objectName)
+        val req = HttpRequest.newBuilder(uri)
+            .timeout(Duration.ofSeconds(30))
+            .header("X-Auth-Token", token!!)
+            .method("HEAD", HttpRequest.BodyPublishers.noBody())
+            .build()
+        val resp = send(req, HttpResponse.BodyHandlers.discarding())
+        if (resp.statusCode() == 404) return UnsealStatus.NOT_FOUND
+
+        val headers = mutableMapOf<String, String>()
+        resp.headers().map().forEach { (k, v) -> if (v.isNotEmpty()) headers[k.lowercase()] = v[0] }
+
+        val unsealState = headers["x-ovh-retrieval-state"]
+        return when {
+            unsealState == null -> UnsealStatus.UNSEALED
+            unsealState.equals("unsealed", ignoreCase = true) -> UnsealStatus.UNSEALED
+            unsealState.equals("unsealing", ignoreCase = true) -> UnsealStatus.UNSEALING
+            else -> UnsealStatus.SEALED
+        }
     }
 }

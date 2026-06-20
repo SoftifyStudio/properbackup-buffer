@@ -41,5 +41,11 @@ class DevSafetyGuard(private val delegate: SwiftClient) : SwiftClient {
 
     override fun exists(objectName: String): Boolean = delegate.exists(objectName)
 
+    override fun headObject(objectName: String): ObjectMetadata? = delegate.headObject(objectName)
+
+    override fun requestUnseal(objectName: String): UnsealStatus = delegate.requestUnseal(objectName)
+
+    override fun checkUnsealStatus(objectName: String): UnsealStatus = delegate.checkUnsealStatus(objectName)
+
     fun isSafeMode(): Boolean = safeMode
 }
