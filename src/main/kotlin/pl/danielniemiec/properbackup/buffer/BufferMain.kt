@@ -29,6 +29,10 @@ import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.payment.StripeHandler
+import pl.danielniemiec.properbackup.buffer.payment.SubscriptionAuditLog
+import pl.danielniemiec.properbackup.buffer.payment.WebhookDlq
+import pl.danielniemiec.properbackup.buffer.payment.WebhookIdempotency
 import pl.danielniemiec.properbackup.buffer.report.AuditReportHandler
 import pl.danielniemiec.properbackup.buffer.verify.RestoreVerifier
 import pl.danielniemiec.properbackup.buffer.subscription.SubscriptionGuard
@@ -153,6 +157,12 @@ fun main(args: Array<String>) {
 
     val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
+
+    val stripeWebhookSecret = System.getenv().getOrDefault("STRIPE_WEBHOOK_SECRET", "")
+    val webhookIdempotency = WebhookIdempotency(db)
+    val webhookDlq = WebhookDlq(db)
+    val subscriptionAuditLog = SubscriptionAuditLog(db)
+    val stripeHandler = StripeHandler(db, userStore, stripeWebhookSecret, webhookIdempotency, webhookDlq, subscriptionAuditLog)
 
     val auditReportHandler = AuditReportHandler(
         serverStore, userStore, backupRootStore, archiveSnapshotStore, fileStateStore, storageQuotaGuard,
@@ -279,6 +289,7 @@ fun main(args: Array<String>) {
     app.get("/account/checkout", lemonHandler::getCheckoutUrl)
 
     app.post("/webhooks/lemonsqueezy", lemonHandler::handleWebhook)
+    app.post("/payment/stripe/webhook", stripeHandler::handleWebhook)
     app.get("/account/storage") { ctx ->
         val userId = ctx.attribute<String>("userId")!!
         val q = storageQuotaGuard.checkQuota(userId)

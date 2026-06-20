@@ -309,6 +309,15 @@ CREATE TABLE IF NOT EXISTS recovery_audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_recovery_audit_session ON recovery_audit_log(recovery_session_id, created_at);
 
+-- Stripe integration columns
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(64);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(64);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_payment_status VARCHAR(32);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ever_subscribed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Stripe event idempotency (webhook deduplication)
 CREATE TABLE IF NOT EXISTS stripe_event_idempotency (
   stripe_event_id VARCHAR(64) PRIMARY KEY,
