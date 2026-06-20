@@ -25,10 +25,11 @@ class UserStore(private val db: Database) {
         val everSubscribed: Boolean = false,
         val lastPastDueNotification: String? = null,
         val pastDueStartedAt: String? = null,
+        val emailVerified: Boolean = false,
     )
     data class UserSummary(val id: String, val email: String)
 
-    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, subscription_payment_status, cancel_at_period_end, ever_subscribed, last_past_due_notification, past_due_started_at"
+    private val SELECT_COLS = "id, email, bcrypt_hash, created_at, is_system_admin, trial_expires_at, subscription_plan, subscription_expires_at, storage_limit_bytes, last_trial_notification, subscription_payment_status, cancel_at_period_end, ever_subscribed, last_past_due_notification, past_due_started_at, email_verified"
 
     fun findByEmail(email: String): Optional<User> {
         db.getConnection().use { conn ->
@@ -205,5 +206,6 @@ class UserStore(private val db: Database) {
         rs.getBoolean("ever_subscribed"),
         rs.getString("last_past_due_notification"),
         rs.getTimestamp("past_due_started_at")?.toInstant()?.toString(),
+        rs.getBoolean("email_verified"),
     )
 }

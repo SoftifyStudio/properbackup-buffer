@@ -33,6 +33,13 @@ class SubscriptionManagementHandler(
             return
         }
 
+        // §8.16: Email must be verified before checkout
+        if (!user.emailVerified) {
+            ctx.status(403).contentType("application/json")
+                .result("""{"error":"EMAIL_NOT_VERIFIED","message":"Potwierdź email aby kontynuować"}""")
+            return
+        }
+
         val body = gson.fromJson(ctx.body(), Map::class.java)
         val plan = (body?.get("plan") as? String) ?: "monthly"
 

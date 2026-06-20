@@ -29,6 +29,7 @@ import pl.danielniemiec.properbackup.buffer.ovh.MockSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.OvhSwiftClient
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
 import pl.danielniemiec.properbackup.buffer.payment.LemonSqueezyHandler
+import pl.danielniemiec.properbackup.buffer.payment.CleanupScheduler
 import pl.danielniemiec.properbackup.buffer.payment.StripeApiClient
 import pl.danielniemiec.properbackup.buffer.payment.StripeHandler
 import pl.danielniemiec.properbackup.buffer.payment.TrialAbuseHeuristics
@@ -596,6 +597,10 @@ fun main(args: Array<String>) {
         }
         ctx.contentType("application/json").result(Gson().toJson(mapOf("servers" to serverIds)))
     }
+
+    // Start background cleanup scheduler (§8.8, §8.9)
+    val cleanupScheduler = CleanupScheduler(db, webhookIdempotency, webhookDlq)
+    cleanupScheduler.start()
 
     app.start(port)
     println("ProperBackup Buffer listening on port $port")
