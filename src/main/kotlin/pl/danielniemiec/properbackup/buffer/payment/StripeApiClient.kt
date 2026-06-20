@@ -23,6 +23,14 @@ class StripeApiClient(
 ) {
     init {
         Stripe.apiKey = stripeSecretKey
+        // §8.11: Warn if live key is identical to test key (config error)
+        val liveKey = System.getenv("STRIPE_LIVE_SECRET_KEY") ?: ""
+        val testKey = System.getenv("STRIPE_TEST_SECRET_KEY") ?: ""
+        if (liveKey.isNotBlank() && testKey.isNotBlank() && liveKey == testKey) {
+            System.err.println("[CRITICAL] STRIPE LIVE KEYS ARE IDENTICAL TO TEST — this is a configuration error!")
+        }
+        // §8.20: Never log the full key — only first 8 chars for debugging
+        println("[Stripe] Initialized with key: ${stripeSecretKey.take(8)}...")
     }
 
     data class CheckoutResult(val url: String, val sessionId: String)
@@ -130,14 +138,18 @@ class StripeApiClient(
     }
 
     private fun getPriceId(plan: String): String {
+        val mode = if (stripeSecretKey.startsWith("sk_live_")) "live" else "test"
         return db.getConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ? LIMIT 1"
+                "SELECT stripe_price_id FROM stripe_price_config WHERE plan_key = ? AND mode = ? LIMIT 1"
             ).use { stmt ->
                 stmt.setString(1, plan)
+                stmt.setString(2, mode)
                 stmt.executeQuery().use { rs ->
                     if (rs.next()) rs.getString("stripe_price_id")
-                    else throw IllegalArgumentException("No price configured for plan: $plan")
+                    else throw IllegalArgumentException(
+                        "No price configured for plan=$plan mode=$mode. Run schema migration and seed stripe_price_config."
+                    )
                 }
             }
         }
