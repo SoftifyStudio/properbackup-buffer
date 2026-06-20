@@ -158,7 +158,9 @@ fun main(args: Array<String>) {
     val lemonWebhookSecret = System.getenv().getOrDefault("LEMONSQUEEZY_WEBHOOK_SECRET", "")
     val lemonHandler = LemonSqueezyHandler(userStore, lemonWebhookSecret)
 
-    val stripeWebhookSecret = System.getenv().getOrDefault("STRIPE_WEBHOOK_SECRET", "")
+    val stripeWebhookSecret = System.getenv("STRIPE_TEST_WEBHOOK_SECRET")
+        ?: System.getenv("STRIPE_WEBHOOK_SECRET")
+        ?: ""
     val webhookIdempotency = WebhookIdempotency(db)
     val webhookDlq = WebhookDlq(db)
     val subscriptionAuditLog = SubscriptionAuditLog(db)
