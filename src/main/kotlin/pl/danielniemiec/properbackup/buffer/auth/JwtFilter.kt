@@ -9,6 +9,7 @@ class JwtFilter(private val jwtService: JwtService) : Handler {
     override fun handle(ctx: Context) {
         if (ctx.path() == "/servers/activate") return
         if (ctx.path().endsWith("/events")) return  // SSE does its own token auth via query string
+        if (ctx.path().endsWith("/stream")) return  // Recovery SSE uses ?token= query param
 
         val auth = ctx.header("Authorization")
         if (auth == null || !auth.startsWith("Bearer ")) {

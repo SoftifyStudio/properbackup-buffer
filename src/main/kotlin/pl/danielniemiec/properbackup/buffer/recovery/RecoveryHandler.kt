@@ -169,6 +169,13 @@ class RecoveryHandler(
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("entries" to entries)))
     }
 
+    fun activeRecoveries(ctx: Context) {
+        val userId = ctx.attribute<String>("userId")!!
+        val sessions = store.activeForUser(userId)
+        ctx.status(200).contentType("application/json")
+            .result(gson.toJson(mapOf("sessions" to sessions.map { sessionToMap(it) })))
+    }
+
     fun history(ctx: Context) {
         val serverId = ctx.queryParam("server_id")?.trim()
         if (serverId.isNullOrBlank()) {
@@ -276,7 +283,7 @@ class RecoveryHandler(
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
     }
 
-    private fun sessionToMap(s: RecoverySession): Map<String, Any?> = mapOf(
+    fun sessionToMap(s: RecoverySession): Map<String, Any?> = mapOf(
         "id" to s.id,
         "serverId" to s.serverId,
         "userId" to s.userId,

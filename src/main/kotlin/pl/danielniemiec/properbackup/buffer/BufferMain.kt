@@ -422,11 +422,35 @@ fun main(args: Array<String>) {
     app.before("/recovery/*", jwtFilter)
     app.before("/recovery", jwtFilter)
     app.post("/recovery/start", recoveryHandler::startRecovery)
+    app.get("/recovery/active", recoveryHandler::activeRecoveries)
     app.get("/recovery/history", recoveryHandler::history)
     app.get("/recovery/{id}", recoveryHandler::getSession)
     app.post("/recovery/{id}/confirm", recoveryHandler::confirmRecovery)
     app.post("/recovery/{id}/cancel", recoveryHandler::cancelRecovery)
     app.get("/recovery/{id}/audit", recoveryHandler::getAudit)
+    app.sse("/recovery/{id}/stream") { client ->
+        val ctx = client.ctx()
+        val sessionId = ctx.pathParam("id")
+        val qToken = ctx.queryParam("token")?.trim()
+        if (!qToken.isNullOrBlank()) {
+            try {
+                val claims = jwtService.verify(qToken)
+                val userId = claims.subject
+                val isAdmin = claims["sa"] == true
+                val session = recoverySessionStore.byId(sessionId)
+                if (session != null && (session.userId == userId || isAdmin)) {
+                    recoveryEventBus.subscribeSession(sessionId, client)
+                    client.sendEvent("recovery_state", Gson().toJson(recoveryHandler.sessionToMap(session)))
+                } else {
+                    client.sendEvent("error", "\"not_found_or_forbidden\"")
+                }
+            } catch (_: Exception) {
+                client.sendEvent("error", "\"invalid_token\"")
+            }
+        } else {
+            client.sendEvent("error", "\"token_required\"")
+        }
+    }
 
     // Recovery Agent endpoints
     app.get("/agent/recovery/poll", recoveryHandler::agentPoll)
