@@ -55,6 +55,10 @@ import pl.danielniemiec.properbackup.buffer.recovery.RecoverySessionStore
 import pl.danielniemiec.properbackup.buffer.recovery.DryRunComputer
 import pl.danielniemiec.properbackup.buffer.recovery.PreRecoverySnapshotCreator
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryActiveException
+import pl.danielniemiec.properbackup.buffer.flush.ForceFlushCron
+import pl.danielniemiec.properbackup.buffer.storage.LocalFsStorageClient
+import pl.danielniemiec.properbackup.buffer.storage.StorageClient
+import pl.danielniemiec.properbackup.buffer.storage.StorageUsageMonitor
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.nio.file.Path
 import java.time.Instant
@@ -114,7 +118,9 @@ fun main(args: Array<String>) {
     val swiftRemote = swiftClientFromEnv(storageDir)
     val storageQuotaGuard = StorageQuotaGuard(db, userStore)
     val packBufferDir = Path.of(System.getenv().getOrDefault("PROPERBACKUP_PACK_BUFFER_DIR", "/tmp/properbackup/pack-buffer"))
-    val packBuffer = PackBuffer(packBufferDir, db, swiftRemote)
+    val localStoragePath = System.getenv().getOrDefault("PROPERBACKUP_LOCAL_STORAGE_DIR", "/mnt/storage")
+    val localStorageClient: StorageClient = LocalFsStorageClient(Path.of(localStoragePath))
+    val packBuffer = PackBuffer(packBufferDir, db, swiftRemote, localStorageClient)
 
     val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard, sseBus)
     sealer.setPackBuffer(packBuffer)
@@ -176,8 +182,13 @@ fun main(args: Array<String>) {
     val agentHealthMonitor = AgentHealthMonitor(db, serverStore, emailNotifier)
     val notificationHandler = NotificationHandler(db)
 
+    val forceFlushCron = ForceFlushCron(packBuffer, packBufferDir)
+    val storageUsageMonitor = StorageUsageMonitor(db)
+
     flusher.start()
     packBuffer.start()
+    forceFlushCron.start()
+    storageUsageMonitor.start()
     trialNotifier.start()
     agentHealthMonitor.start()
 
@@ -645,6 +656,8 @@ fun main(args: Array<String>) {
             agentHealthMonitor.stop()
             flusher.stop()
             packBuffer.stop()
+            forceFlushCron.stop()
+            storageUsageMonitor.stop()
             app.stop()
             db.close()
         },

@@ -2,6 +2,7 @@ package pl.danielniemiec.properbackup.buffer.flush
 
 import pl.danielniemiec.properbackup.buffer.db.Database
 import pl.danielniemiec.properbackup.buffer.ovh.SwiftClient
+import pl.danielniemiec.properbackup.buffer.storage.StorageClient
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.DataInputStream
@@ -38,6 +39,7 @@ class PackBuffer(
     private val bufferDir: Path,
     private val db: Database,
     private val swiftRemote: SwiftClient? = null,
+    private val storageClient: StorageClient? = null,
     private val maxPackBytes: Long = PACK_MAX_BYTES,
 ) {
     private val locks = ConcurrentHashMap<String, ReentrantLock>()
@@ -263,8 +265,13 @@ class PackBuffer(
 
     private fun flushPack(serverId: String, packFile: Path) {
         if (!Files.exists(packFile)) return
-        val remote = swiftRemote ?: run {
-            println("[pack-buffer] no remote configured, keeping pack locally: ${packFile.fileName}")
+
+        // Primary: LocalFsStorageClient (local RAID5)
+        // Fallback: SwiftClient (legacy, kept behind interface)
+        val hasStorage = storageClient != null
+        val hasRemote = swiftRemote != null
+        if (!hasStorage && !hasRemote) {
+            println("[pack-buffer] no storage configured, keeping pack locally: ${packFile.fileName}")
             return
         }
 
@@ -277,31 +284,38 @@ class PackBuffer(
             }
 
             val packData = Files.readAllBytes(actualPath)
-            val remotePackName = actualPath.fileName.toString()
+            val packName = actualPath.fileName.toString()
 
-            remote.put(remotePackName, packData)
-            println("[pack-buffer] flushed pack to remote: $remotePackName (${packData.size} bytes)")
-
-            recordPackInDb(serverId, remotePackName, packData.size.toLong())
+            val sc = storageClient
+            if (sc != null) {
+                val result = sc.putPack(packName, packData)
+                println("[pack-buffer] flushed pack to local storage: $packName (${result.sizeBytes} bytes, sha256=${result.sha256})")
+                recordPackInDb(serverId, packName, result.sizeBytes, result.sha256)
+            } else if (hasRemote) {
+                swiftRemote!!.put(packName, packData)
+                println("[pack-buffer] flushed pack to remote: $packName (${packData.size} bytes)")
+                recordPackInDb(serverId, packName, packData.size.toLong(), null)
+            }
 
             Files.deleteIfExists(actualPath)
-            println("[pack-buffer] deleted local pack: $remotePackName")
+            println("[pack-buffer] deleted buffer pack: $packName")
         } catch (e: Exception) {
             System.err.println("[pack-buffer] flush failed for ${packFile.fileName}: ${e.message}")
         }
     }
 
-    private fun recordPackInDb(serverId: String, packName: String, sizeBytes: Long) {
+    private fun recordPackInDb(serverId: String, packName: String, sizeBytes: Long, sha256: String? = null) {
         try {
             db.getConnection().use { conn ->
                 conn.prepareStatement(
-                    "INSERT INTO buffer_pack(server_id, pack_name, size_bytes, flushed_at) " +
-                        "VALUES (?, ?, ?, NOW()) " +
+                    "INSERT INTO buffer_pack(server_id, pack_name, size_bytes, pack_sha256, flushed_at) " +
+                        "VALUES (?, ?, ?, ?, NOW()) " +
                         "ON CONFLICT (server_id, pack_name) DO NOTHING"
                 ).use { ps ->
                     ps.setString(1, serverId)
                     ps.setString(2, packName)
                     ps.setLong(3, sizeBytes)
+                    ps.setString(4, sha256)
                     ps.executeUpdate()
                 }
             }

@@ -303,6 +303,88 @@ class RecoveryHandlerTest {
     }
 
     @Test
+    fun `GET agent recovery poll transitions READY to AGENT_RESTORING`() {
+        JavalinTest.test(createApp()) { _, client ->
+            // Create session → dry_run → confirm (hot) → READY
+            val createResp = client.request("/recovery/start") {
+                it.post(jsonBody(mapOf("server_id" to "server-1", "target_snapshot_id" to snapshotId)))
+            }
+            val sessionId = gson.fromJson(createResp.body?.string(), Map::class.java)["session_id"] as String
+
+            client.request("/agent/recovery/$sessionId/dry_run_result") {
+                it.post(jsonBody(mapOf(
+                    "files_to_restore" to 10, "files_to_delete" to 1, "files_unchanged" to 50,
+                    "total_bytes" to 1024,
+                    "sample_restore" to emptyList<String>(), "sample_delete" to emptyList<String>(),
+                    "critical_protected" to 0,
+                )))
+            }
+
+            client.request("/recovery/$sessionId/confirm") {
+                it.post(jsonBody(mapOf("user_confirmation" to true, "cold_tier" to false)))
+            }
+
+            // Verify state is READY before poll
+            val beforePoll = client.get("/recovery/$sessionId")
+            val beforeBody = gson.fromJson(beforePoll.body?.string(), Map::class.java)
+            assertEquals("READY", beforeBody["state"])
+
+            // Agent polls — should get "execute" command and transition to AGENT_RESTORING
+            val pollResp = client.request("/agent/recovery/poll") {
+                it.header("X-Server-Id", "server-1").get()
+            }
+            assertEquals(200, pollResp.code)
+            val pollBody = gson.fromJson(pollResp.body?.string(), Map::class.java)
+            val commands = pollBody["commands"] as List<*>
+            assertEquals(1, commands.size)
+            val cmd = commands[0] as Map<*, *>
+            assertEquals("execute", cmd["command"])
+            assertEquals(sessionId, cmd["sessionId"])
+
+            // Verify state transitioned to AGENT_RESTORING
+            val afterPoll = client.get("/recovery/$sessionId")
+            val afterBody = gson.fromJson(afterPoll.body?.string(), Map::class.java)
+            assertEquals("AGENT_RESTORING", afterBody["state"])
+        }
+    }
+
+    @Test
+    fun `GET agent recovery poll with READY does not issue duplicate commands on second poll`() {
+        JavalinTest.test(createApp()) { _, client ->
+            val createResp = client.request("/recovery/start") {
+                it.post(jsonBody(mapOf("server_id" to "server-1", "target_snapshot_id" to snapshotId)))
+            }
+            val sessionId = gson.fromJson(createResp.body?.string(), Map::class.java)["session_id"] as String
+
+            client.request("/agent/recovery/$sessionId/dry_run_result") {
+                it.post(jsonBody(mapOf(
+                    "files_to_restore" to 10, "files_to_delete" to 1, "files_unchanged" to 50,
+                    "total_bytes" to 1024,
+                    "sample_restore" to emptyList<String>(), "sample_delete" to emptyList<String>(),
+                    "critical_protected" to 0,
+                )))
+            }
+
+            client.request("/recovery/$sessionId/confirm") {
+                it.post(jsonBody(mapOf("user_confirmation" to true, "cold_tier" to false)))
+            }
+
+            // First poll transitions READY → AGENT_RESTORING
+            client.request("/agent/recovery/poll") {
+                it.header("X-Server-Id", "server-1").get()
+            }
+
+            // Second poll should NOT issue execute again (state is now AGENT_RESTORING)
+            val poll2 = client.request("/agent/recovery/poll") {
+                it.header("X-Server-Id", "server-1").get()
+            }
+            val poll2Body = gson.fromJson(poll2.body?.string(), Map::class.java)
+            val commands = poll2Body["commands"] as List<*>
+            assertEquals(0, commands.size)
+        }
+    }
+
+    @Test
     fun `POST recovery confirm without confirmation flag returns 400`() {
         JavalinTest.test(createApp()) { _, client ->
             val createResp = client.request("/recovery/start") {
