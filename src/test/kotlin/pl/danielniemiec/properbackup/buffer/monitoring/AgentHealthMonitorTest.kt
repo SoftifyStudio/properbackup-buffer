@@ -327,6 +327,190 @@ class AgentHealthMonitorTest {
         assertTrue(notifier.sentAlerts.isEmpty())
     }
 
+    // --- Edge: server never heartbeated (last_seen = registration time, very old) ---
+
+    @Test
+    fun `server registered days ago with no heartbeat is OFFLINE`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-no-hb", "s-no-heartbeat")
+        setLastSeen("s-no-heartbeat", Instant.now().minus(Duration.ofDays(7)))
+
+        val monitor = AgentHealthMonitor(db, serverStore, null)
+        monitor.checkAll()
+
+        val status = monitor.getHealthStatus("s-no-heartbeat")
+        assertNotNull(status)
+        assertEquals("OFFLINE", status!!["status"])
+    }
+
+    @Test
+    fun `server registered months ago with no heartbeat is OFFLINE`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-no-hb-long", "s-no-hb-long")
+        setLastSeen("s-no-hb-long", Instant.now().minus(Duration.ofDays(365)))
+
+        val monitor = AgentHealthMonitor(db, serverStore, null)
+        monitor.checkAll()
+
+        val status = monitor.getHealthStatus("s-no-hb-long")
+        assertNotNull(status)
+        assertEquals("OFFLINE", status!!["status"])
+    }
+
+    @Test
+    fun `server with no heartbeat triggers email alert when notifications enabled`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-no-hb-email", "s-no-hb-email")
+        setLastSeen("s-no-hb-email", Instant.now().minus(Duration.ofDays(2)))
+        insertNotificationSettings("u-no-hb-email", emailEnabled = true, emailAddress = "nohb@test.com")
+
+        val notifier = RecordingEmailNotifier()
+        val monitor = AgentHealthMonitor(db, serverStore, notifier)
+        monitor.checkAll()
+
+        assertEquals(1, notifier.sentAlerts.size)
+        assertEquals("nohb@test.com", notifier.sentAlerts[0].to)
+    }
+
+    // --- Edge: null emailNotifier does not crash on OFFLINE ---
+
+    @Test
+    fun `checkAll with null emailNotifier does not crash on OFFLINE server`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-null-notif", "s-null-notif")
+        setLastSeen("s-null-notif", Instant.now().minus(Duration.ofMinutes(31)))
+        insertNotificationSettings("u-null-notif", emailEnabled = true, emailAddress = "null@test.com")
+
+        val monitor = AgentHealthMonitor(db, serverStore, null)
+        assertDoesNotThrow { monitor.checkAll() }
+
+        val status = monitor.getHealthStatus("s-null-notif")
+        assertEquals("OFFLINE", status!!["status"])
+        assertEquals(0, countAlertHistory("s-null-notif"))
+    }
+
+    // --- Edge: health status records lastSeenAt and checkedAt correctly ---
+
+    @Test
+    fun `health status records contain valid timestamps`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-ts", "s-ts-1")
+        val before = Instant.now()
+        setLastSeen("s-ts-1", Instant.now().minus(Duration.ofMinutes(10)))
+
+        val monitor = AgentHealthMonitor(db, serverStore, null)
+        monitor.checkAll()
+
+        val status = monitor.getHealthStatus("s-ts-1")
+        assertNotNull(status)
+        val checkedAt = Instant.parse(status!!["checkedAt"] as String)
+        val lastSeenAt = Instant.parse(status["lastSeenAt"] as String)
+        assertTrue(checkedAt.isAfter(before) || checkedAt == before)
+        assertTrue(lastSeenAt.isBefore(before))
+    }
+
+    // --- Edge: multiple servers mixed states processed correctly ---
+
+    @Test
+    fun `checkAll processes all servers even when some are in different states`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-mix", "s-mix-online")
+        TestDatabaseHelper.seedUserAndServer(db, "u-mix", "s-mix-warning")
+        TestDatabaseHelper.seedUserAndServer(db, "u-mix", "s-mix-offline")
+        setLastSeen("s-mix-online", Instant.now().minus(Duration.ofSeconds(30)))
+        setLastSeen("s-mix-warning", Instant.now().minus(Duration.ofMinutes(15)))
+        setLastSeen("s-mix-offline", Instant.now().minus(Duration.ofHours(2)))
+
+        val monitor = AgentHealthMonitor(db, serverStore, null)
+        monitor.checkAll()
+
+        assertEquals("ONLINE", monitor.getHealthStatus("s-mix-online")!!["status"])
+        assertEquals("WARNING", monitor.getHealthStatus("s-mix-warning")!!["status"])
+        assertEquals("OFFLINE", monitor.getHealthStatus("s-mix-offline")!!["status"])
+    }
+
+    // --- Edge: OFFLINE server with email alert records correct serverId in alert_history ---
+
+    @Test
+    fun `alert_history records correct serverId and alert_type`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-alert-audit", "s-alert-audit")
+        setLastSeen("s-alert-audit", Instant.now().minus(Duration.ofMinutes(31)))
+        insertNotificationSettings("u-alert-audit", emailEnabled = true, emailAddress = "audit@test.com")
+
+        val notifier = RecordingEmailNotifier()
+        val monitor = AgentHealthMonitor(db, serverStore, notifier)
+        monitor.checkAll()
+
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT server_id, alert_type FROM alert_history WHERE server_id = ?",
+            ).use { ps ->
+                ps.setString(1, "s-alert-audit")
+                ps.executeQuery().use { rs ->
+                    assertTrue(rs.next())
+                    assertEquals("s-alert-audit", rs.getString("server_id"))
+                    assertEquals("agent_offline", rs.getString("alert_type"))
+                }
+            }
+        }
+    }
+
+    // --- Edge: alert for one server does not affect another server's dedup ---
+
+    @Test
+    fun `alert dedup is per-server, not global`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-dedup-iso", "s-dedup-iso-a")
+        TestDatabaseHelper.seedUserAndServer(db, "u-dedup-iso", "s-dedup-iso-b")
+        setLastSeen("s-dedup-iso-a", Instant.now().minus(Duration.ofMinutes(31)))
+        setLastSeen("s-dedup-iso-b", Instant.now().minus(Duration.ofMinutes(31)))
+        insertNotificationSettings("u-dedup-iso", emailEnabled = true, emailAddress = "iso@test.com")
+
+        val notifier = RecordingEmailNotifier()
+        val monitor = AgentHealthMonitor(db, serverStore, notifier)
+        monitor.checkAll()
+
+        assertEquals(2, notifier.sentAlerts.size)
+        val serverIds = notifier.sentAlerts.map { it.serverId }.toSet()
+        assertTrue(serverIds.contains("s-dedup-iso-a"))
+        assertTrue(serverIds.contains("s-dedup-iso-b"))
+    }
+
+    // --- Edge: checkAll with ServerStore exception → background thread survives ---
+
+    @Test
+    fun `background thread survives when checkAll encounters exception`() {
+        val failingStore = object : ServerStore(db) {
+            var callCount = 0
+            override fun listAll(): List<pl.danielniemiec.properbackup.buffer.server.Server> {
+                callCount++
+                if (callCount == 1) throw RuntimeException("Simulated DB failure")
+                return emptyList()
+            }
+        }
+
+        val monitor = AgentHealthMonitor(db, failingStore, null)
+
+        // First call throws, second succeeds
+        assertThrows(RuntimeException::class.java) { monitor.checkAll() }
+        assertDoesNotThrow { monitor.checkAll() }
+    }
+
+    @Test
+    fun `checkAll exception does not corrupt existing health status records`() {
+        TestDatabaseHelper.seedUserAndServer(db, "u-resilient", "s-resilient")
+        setLastSeen("s-resilient", Instant.now().minus(Duration.ofMinutes(31)))
+
+        val monitor = AgentHealthMonitor(db, serverStore, null)
+        monitor.checkAll()
+        assertEquals("OFFLINE", monitor.getHealthStatus("s-resilient")!!["status"])
+
+        // Now make listAll fail — existing status should be preserved
+        val failingStore = object : ServerStore(db) {
+            override fun listAll(): List<pl.danielniemiec.properbackup.buffer.server.Server> {
+                throw RuntimeException("DB connection lost")
+            }
+        }
+        val monitorWithFailure = AgentHealthMonitor(db, failingStore, null)
+        try { monitorWithFailure.checkAll() } catch (_: Exception) { }
+
+        // Existing record still there, unchanged
+        assertEquals("OFFLINE", monitor.getHealthStatus("s-resilient")!!["status"])
+    }
+
     // --- Start/stop lifecycle ---
 
     @Test
