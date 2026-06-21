@@ -12,6 +12,9 @@ class RecoveryHandler(
     private val eventBus: RecoveryEventBus,
     private val gson: Gson = Gson(),
 ) {
+    companion object {
+        const val MAX_FILES_PER_BATCH = 100
+    }
 
     fun startRecovery(ctx: Context) {
         val userId = ctx.attribute<String>("userId")!!
@@ -141,14 +144,21 @@ class RecoveryHandler(
         val reason = (body["reason"] as? String) ?: ""
 
         if (session.state == RecoveryState.AGENT_RESTORING) {
-            eventBus.emitRecoveryCommand(session.serverId, "cancel", session.id)
+            eventBus.emitRecoveryCommand(
+                session.serverId, "rollback", session.id,
+                mapOf("preRecoverySnapshotId" to session.preRecoverySnapshotId),
+            )
         }
 
         val updated = store.transition(id, session.state, RecoveryState.CANCELLED, mapOf("reason" to reason))
-        auditLog.log(id, "RECOVERY_CANCELLED", "at_phase=${session.state}, reason=$reason")
+        auditLog.log(id, "RECOVERY_CANCELLED", "at_phase=${session.state}, reason=$reason, pre_snapshot=${session.preRecoverySnapshotId}")
         eventBus.emitStateChange(updated)
 
-        ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("state" to "CANCELLED")))
+        ctx.status(200).contentType("application/json").result(gson.toJson(mapOf(
+            "state" to "CANCELLED",
+            "at_phase" to session.state.name,
+            "preRecoverySnapshotId" to session.preRecoverySnapshotId,
+        )))
     }
 
     fun getAudit(ctx: Context) {
@@ -167,6 +177,27 @@ class RecoveryHandler(
         val limit = ctx.queryParam("limit")?.toIntOrNull() ?: 200
         val entries = auditLog.listForSession(id, limit)
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("entries" to entries)))
+    }
+
+    fun getDryRun(ctx: Context) {
+        val id = ctx.pathParam("id")
+        val session = store.byId(id)
+        if (session == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "NOT_FOUND")))
+            return
+        }
+        val userId = ctx.attribute<String>("userId")!!
+        val isAdmin = ctx.attribute<Boolean>("isSystemAdmin") == true
+        if (session.userId != userId && !isAdmin) {
+            ctx.status(403).contentType("application/json").result(gson.toJson(mapOf("code" to "FORBIDDEN")))
+            return
+        }
+        val detail = store.getDryRunDetail(id)
+        if (detail == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "DRY_RUN_NOT_FOUND")))
+            return
+        }
+        ctx.status(200).contentType("application/json").result(gson.toJson(detail))
     }
 
     fun history(ctx: Context) {
@@ -246,6 +277,67 @@ class RecoveryHandler(
         val session = store.byId(id)
         if (session != null) eventBus.emitProgress(session)
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
+    }
+
+    /**
+     * HR-6: Per-file audit logging. Agent reports restored/deleted files in batches (max 100 per call).
+     * Each file entry gets a RECOVERY_FILE_RESTORED or RECOVERY_FILE_DELETED audit record.
+     */
+    fun agentFilesReport(ctx: Context) {
+        val id = ctx.pathParam("id")
+        val session = store.byId(id)
+        if (session == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "NOT_FOUND")))
+            return
+        }
+        if (session.state != RecoveryState.AGENT_RESTORING) {
+            ctx.status(400).contentType("application/json")
+                .result(gson.toJson(mapOf("code" to "INVALID_STATE", "currentState" to session.state.name)))
+            return
+        }
+
+        val body = gson.fromJson(ctx.body(), Map::class.java)
+        @Suppress("UNCHECKED_CAST")
+        val files = (body["files"] as? List<Map<String, Any?>>) ?: emptyList()
+
+        if (files.size > MAX_FILES_PER_BATCH) {
+            ctx.status(400).contentType("application/json")
+                .result(gson.toJson(mapOf("code" to "BATCH_TOO_LARGE", "max" to MAX_FILES_PER_BATCH)))
+            return
+        }
+
+        var restoredCount = 0
+        var deletedCount = 0
+        var totalBytes = 0L
+
+        for (file in files) {
+            val path = file["path"] as? String ?: continue
+            val size = (file["size"] as? Number)?.toLong() ?: 0L
+            val action = (file["action"] as? String) ?: "restored"
+
+            when (action) {
+                "restored" -> {
+                    auditLog.log(id, "RECOVERY_FILE_RESTORED", "path=$path, size=$size")
+                    restoredCount++
+                    totalBytes += size
+                }
+                "deleted" -> {
+                    auditLog.log(id, "RECOVERY_FILE_DELETED", "path=$path")
+                    deletedCount++
+                }
+            }
+        }
+
+        store.incrementProgress(id, restoredCount, deletedCount, totalBytes)
+        val updated = store.byId(id)
+        if (updated != null) eventBus.emitProgress(updated)
+
+        ctx.status(200).contentType("application/json").result(gson.toJson(mapOf(
+            "ok" to true,
+            "processed" to files.size,
+            "restored" to restoredCount,
+            "deleted" to deletedCount,
+        )))
     }
 
     fun agentComplete(ctx: Context) {

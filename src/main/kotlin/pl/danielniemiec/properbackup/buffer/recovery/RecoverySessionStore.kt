@@ -317,4 +317,35 @@ class RecoverySessionStore(private val db: Database) {
         userConfirmedViaIp = rs.getString("user_confirmed_via_ip"),
         userConfirmedViaUserAgent = rs.getString("user_confirmed_via_user_agent"),
     )
+
+    fun getDryRunDetail(sessionId: String): Map<String, Any?>? {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """SELECT files_to_restore_count, files_to_restore_size,
+                          files_to_delete_count, files_to_delete_size,
+                          files_unchanged_count, critical_files_protected_count,
+                          sample_files_to_restore, sample_files_to_delete,
+                          estimated_duration_seconds, computed_at
+                   FROM recovery_dry_run WHERE recovery_session_id = ?
+                   ORDER BY computed_at DESC LIMIT 1""",
+            ).use { ps ->
+                ps.setString(1, sessionId)
+                ps.executeQuery().use { rs ->
+                    if (!rs.next()) return null
+                    return mapOf(
+                        "filesToRestore" to rs.getInt("files_to_restore_count"),
+                        "filesToRestoreBytes" to rs.getLong("files_to_restore_size"),
+                        "filesToDelete" to rs.getInt("files_to_delete_count"),
+                        "filesToDeleteBytes" to rs.getLong("files_to_delete_size"),
+                        "filesUnchanged" to rs.getInt("files_unchanged_count"),
+                        "criticalFilesProtected" to rs.getInt("critical_files_protected_count"),
+                        "sampleFilesToRestore" to (rs.getString("sample_files_to_restore")?.split("\n")?.filter { it.isNotBlank() } ?: emptyList()),
+                        "sampleFilesToDelete" to (rs.getString("sample_files_to_delete")?.split("\n")?.filter { it.isNotBlank() } ?: emptyList()),
+                        "estimatedDurationSeconds" to rs.getInt("estimated_duration_seconds").let { if (rs.wasNull()) null else it },
+                        "computedAt" to rs.getTimestamp("computed_at").toInstant().toString(),
+                    )
+                }
+            }
+        }
+    }
 }

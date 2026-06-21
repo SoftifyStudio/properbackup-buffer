@@ -554,11 +554,13 @@ fun main(args: Array<String>) {
     app.post("/recovery/{id}/confirm", recoveryHandler::confirmRecovery)
     app.post("/recovery/{id}/cancel", recoveryHandler::cancelRecovery)
     app.get("/recovery/{id}/audit", recoveryHandler::getAudit)
+    app.get("/recovery/{id}/dry_run", recoveryHandler::getDryRun)
 
     // Recovery Agent endpoints
     app.get("/agent/recovery/poll", recoveryHandler::agentPoll)
     app.post("/agent/recovery/{id}/dry_run_result", recoveryHandler::agentDryRunResult)
     app.post("/agent/recovery/{id}/progress", recoveryHandler::agentProgress)
+    app.post("/agent/recovery/{id}/files_report", recoveryHandler::agentFilesReport)
     app.post("/agent/recovery/{id}/complete", recoveryHandler::agentComplete)
 
     // RecoveryGuard: block write actions during active recovery (return 423 Locked)
