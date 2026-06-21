@@ -16,7 +16,7 @@ import jakarta.mail.internet.MimeMessage
  * Sends email notifications for ProperBackup alerts.
  * Uses SMTP (Jakarta/JavaMail). Falls back to logging if SMTP not configured.
  */
-class EmailNotifier(
+open class EmailNotifier(
     private val smtpHost: String?,
     private val smtpPort: Int,
     private val smtpUser: String?,
@@ -25,7 +25,7 @@ class EmailNotifier(
 ) {
     private val configured: Boolean = !smtpHost.isNullOrBlank()
 
-    fun sendAgentOfflineAlert(to: String, serverName: String, serverId: String, lastSeen: Instant) {
+    open fun sendAgentOfflineAlert(to: String, serverName: String, serverId: String, lastSeen: Instant) {
         val lastSeenStr = DateTimeFormatter
             .ofPattern("yyyy-MM-dd HH:mm:ss z")
             .withZone(ZoneId.of("Europe/Warsaw"))
