@@ -243,6 +243,21 @@ class RecoveryHandler(
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
     }
 
+    fun agentStarted(ctx: Context) {
+        val id = ctx.pathParam("id")
+        val session = store.byId(id)
+        if (session == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "NOT_FOUND")))
+            return
+        }
+        if (session.state == RecoveryState.READY) {
+            val updated = store.transition(id, RecoveryState.READY, RecoveryState.AGENT_RESTORING)
+            auditLog.log(id, "RECOVERY_AGENT_STARTED")
+            eventBus.emitStateChange(updated)
+        }
+        ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true, "state" to (store.byId(id)?.state?.name ?: "UNKNOWN"))))
+    }
+
     fun agentComplete(ctx: Context) {
         val id = ctx.pathParam("id")
         val body = gson.fromJson(ctx.body(), Map::class.java)
@@ -253,8 +268,17 @@ class RecoveryHandler(
             return
         }
 
+        // Auto-transition READY → AGENT_RESTORING if agent reports directly
+        val currentState = if (session.state == RecoveryState.READY) {
+            store.transition(id, RecoveryState.READY, RecoveryState.AGENT_RESTORING)
+            auditLog.log(id, "RECOVERY_AGENT_STARTED")
+            RecoveryState.AGENT_RESTORING
+        } else {
+            session.state
+        }
+
         if (success) {
-            val afterVerify = store.transition(id, session.state, RecoveryState.VERIFYING)
+            val afterVerify = store.transition(id, currentState, RecoveryState.VERIFYING)
             auditLog.log(id, "RECOVERY_AGENT_COMPLETED")
             eventBus.emitStateChange(afterVerify)
 
