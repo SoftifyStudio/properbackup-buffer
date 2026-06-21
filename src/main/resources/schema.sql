@@ -308,3 +308,93 @@ CREATE TABLE IF NOT EXISTS recovery_audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_recovery_audit_session ON recovery_audit_log(recovery_session_id, created_at);
+
+-- ============================================================================
+-- Agent Health Monitoring (WEB-PANEL session)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_health_status (
+  server_id    VARCHAR(36) PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+  status       VARCHAR(16) NOT NULL DEFAULT 'ONLINE',
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  checked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Notification preferences per user
+CREATE TABLE IF NOT EXISTS notification_settings (
+  user_id       VARCHAR(36) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  email_enabled BOOLEAN     NOT NULL DEFAULT FALSE,
+  email_address VARCHAR(255),
+  sms_enabled   BOOLEAN     NOT NULL DEFAULT FALSE,
+  sms_number    VARCHAR(32),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Alert history (dedup: don't spam same alert within 10 min)
+CREATE TABLE IF NOT EXISTS alert_history (
+  id          BIGSERIAL PRIMARY KEY,
+  server_id   VARCHAR(36) NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  alert_type  VARCHAR(64) NOT NULL,
+  sent_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_server_type ON alert_history(server_id, alert_type, sent_at DESC);
+
+-- Backup scheduling config per server
+CREATE TABLE IF NOT EXISTS backup_schedule (
+  server_id        VARCHAR(36) PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+  interval_minutes INT         NOT NULL DEFAULT 5,
+  io_throttle_mbps INT,
+  window_start     TIME,
+  window_end       TIME,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================================
+-- BACKUP-CORE: pack sha256 integrity column
+-- ============================================================================
+ALTER TABLE buffer_pack ADD COLUMN IF NOT EXISTS pack_sha256 CHAR(64);
+ALTER TABLE buffer_pack ADD COLUMN IF NOT EXISTS storage_backend VARCHAR(16) NOT NULL DEFAULT 'local';
+
+-- ============================================================================
+-- BACKUP-CORE: daily storage usage per user (cost/quota monitoring)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_storage_daily (
+  user_id      VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day          DATE         NOT NULL,
+  used_bytes   BIGINT       NOT NULL DEFAULT 0,
+  pack_count   INT          NOT NULL DEFAULT 0,
+  recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usd_user_day ON user_storage_daily(user_id, day DESC);
+
+-- ============================================================================
+-- BACKUP-CORE: storage spike alerts (>50GB/1h per user -> soft block)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS storage_spike_alert (
+  id           BIGSERIAL PRIMARY KEY,
+  user_id      VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  bytes_in_window BIGINT    NOT NULL,
+  window_start TIMESTAMPTZ  NOT NULL,
+  window_end   TIMESTAMPTZ  NOT NULL,
+  action_taken VARCHAR(32)  NOT NULL DEFAULT 'soft_block',
+  created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ssa_user ON storage_spike_alert(user_id, created_at DESC);
+
+-- ============================================================================
+-- BACKUP-CORE: inbox idempotency (HR-8)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS inbox_idempotency (
+  idempotency_key VARCHAR(64) NOT NULL,
+  server_id       VARCHAR(36) NOT NULL,
+  response_status INT         NOT NULL,
+  response_body   TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (idempotency_key, server_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbox_idem_created ON inbox_idempotency(created_at);

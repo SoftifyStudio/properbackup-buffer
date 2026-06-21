@@ -7,7 +7,7 @@ import java.time.Instant
 import java.util.Optional
 import java.util.UUID
 
-class ServerStore(private val db: Database) {
+open class ServerStore(private val db: Database) {
 
     fun listForUser(userId: String): List<Server> {
         db.getConnection().use { conn ->
@@ -25,7 +25,7 @@ class ServerStore(private val db: Database) {
         }
     }
 
-    fun listAll(): List<Server> {
+    open fun listAll(): List<Server> {
         db.getConnection().use { conn ->
             conn.prepareStatement(
                 "SELECT s.id, s.name, s.user_id, u.email AS owner_email, s.activated_at, s.last_seen_at " +
