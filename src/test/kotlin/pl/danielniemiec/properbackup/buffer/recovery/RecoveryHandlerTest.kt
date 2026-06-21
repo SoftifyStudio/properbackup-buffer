@@ -612,6 +612,77 @@ class RecoveryHandlerTest {
         }
     }
 
+    @Test
+    fun `POST recovery start returns 409 CONFLICT when another session is AGENT_RESTORING (HR-2)`() {
+        JavalinTest.test(createApp()) { _, client ->
+            val sessionId = createReadySession(client)
+
+            // Poll → transitions to AGENT_RESTORING
+            client.request("/agent/recovery/poll") {
+                it.header("X-Server-Id", "server-1").get()
+            }
+
+            // Try to start second recovery on same server → 409
+            val resp = client.request("/recovery/start") {
+                it.post(jsonBody(mapOf("server_id" to "server-1", "target_snapshot_id" to snapshotId)))
+            }
+            assertEquals(409, resp.code)
+            val body = gson.fromJson(resp.body?.string(), Map::class.java)
+            assertEquals("RECOVERY_ALREADY_ACTIVE", body["code"])
+            assertEquals(sessionId, body["sessionId"])
+            assertEquals("AGENT_RESTORING", body["state"])
+        }
+    }
+
+    @Test
+    fun `agentPoll creates PRE_RECOVERY snapshot visible after DONE (HR-5)`() {
+        JavalinTest.test(createApp()) { _, client ->
+            val sessionId = createReadySession(client)
+
+            // Poll → AGENT_RESTORING (creates PRE_RECOVERY snapshot)
+            val pollResp = client.request("/agent/recovery/poll") {
+                it.header("X-Server-Id", "server-1").get()
+            }
+            val pollBody = gson.fromJson(pollResp.body?.string(), Map::class.java)
+            @Suppress("UNCHECKED_CAST")
+            val cmds = pollBody["commands"] as List<Map<String, Any?>>
+            assertTrue(cmds.isNotEmpty())
+            val preSnapshotId = cmds[0]["preRecoverySnapshotId"]
+            assertNotNull(preSnapshotId, "preRecoverySnapshotId should be set in execute command")
+
+            // Verify session has preRecoverySnapshotId
+            val sessionResp = client.request("/recovery/$sessionId") {
+                it.get()
+            }
+            val session = gson.fromJson(sessionResp.body?.string(), Map::class.java)
+            assertNotNull(session["preRecoverySnapshotId"], "session should have preRecoverySnapshotId after AGENT_RESTORING")
+
+            // Complete recovery
+            client.request("/agent/recovery/$sessionId/complete") {
+                it.post(jsonBody(mapOf("success" to true, "verification" to "OK")))
+            }
+
+            // Verify session is DONE and still has preRecoverySnapshotId
+            val doneResp = client.request("/recovery/$sessionId") {
+                it.get()
+            }
+            val doneSession = gson.fromJson(doneResp.body?.string(), Map::class.java)
+            assertEquals("DONE", doneSession["state"])
+            assertNotNull(doneSession["preRecoverySnapshotId"], "preRecoverySnapshotId should persist after DONE")
+
+            // Verify audit has RECOVERY_PRE_SNAPSHOT_CREATED
+            val auditResp = client.request("/recovery/$sessionId/audit") {
+                it.get()
+            }
+            val audit = gson.fromJson(auditResp.body?.string(), Map::class.java)
+            @Suppress("UNCHECKED_CAST")
+            val entries = audit["entries"] as List<Map<String, Any?>>
+            val preSnapshotEntry = entries.find { it["action"] == "RECOVERY_PRE_SNAPSHOT_CREATED" }
+            assertNotNull(preSnapshotEntry, "audit should contain RECOVERY_PRE_SNAPSHOT_CREATED")
+            assertTrue(preSnapshotEntry!!["detail"].toString().contains("snapshotId="))
+        }
+    }
+
     private fun createReadySession(client: io.javalin.testtools.HttpClient): String {
         val createResp = client.request("/recovery/start") {
             it.post(jsonBody(mapOf("server_id" to "server-1", "target_snapshot_id" to snapshotId)))

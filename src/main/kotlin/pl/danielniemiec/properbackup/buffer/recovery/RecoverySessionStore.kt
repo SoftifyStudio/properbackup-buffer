@@ -241,6 +241,26 @@ class RecoverySessionStore(private val db: Database) {
         }
     }
 
+    fun createPreRecoverySnapshot(serverId: String, sessionId: String): Long {
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO archive_snapshot(server_id, path_id, object_name, flag, size_bytes, sealed_at, snapshot_type, pre_recovery_session_id)
+                   VALUES (?, 'PRE_REC', ?, 'S', 0, NOW(), 'PRE_RECOVERY', ?)
+                   RETURNING id""",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.setString(2, "pre-recovery-$sessionId")
+                ps.setString(3, sessionId)
+                ps.executeQuery().use { rs ->
+                    rs.next()
+                    val snapshotId = rs.getLong("id")
+                    setPreRecoverySnapshot(sessionId, snapshotId)
+                    return snapshotId
+                }
+            }
+        }
+    }
+
     fun incrementProgress(id: String, filesRestoredDelta: Int, filesDeletedDelta: Int, bytesDelta: Long) {
         db.getConnection().use { conn ->
             conn.prepareStatement(

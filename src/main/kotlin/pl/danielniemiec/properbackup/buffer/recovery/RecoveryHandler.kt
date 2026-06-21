@@ -236,6 +236,8 @@ class RecoveryHandler(
                 "targetSnapshotId" to session.targetSnapshotId,
             ))
             RecoveryState.READY -> {
+                val snapshotId = store.createPreRecoverySnapshot(session.serverId, session.id)
+                auditLog.log(session.id, "RECOVERY_PRE_SNAPSHOT_CREATED", "snapshotId=$snapshotId")
                 val updated = store.transition(session.id, RecoveryState.READY, RecoveryState.AGENT_RESTORING)
                 auditLog.log(session.id, "RECOVERY_AGENT_STARTED", "trigger=agent_poll")
                 eventBus.emitStateChange(updated)
@@ -243,6 +245,7 @@ class RecoveryHandler(
                     "command" to "execute",
                     "sessionId" to session.id,
                     "targetSnapshotId" to session.targetSnapshotId,
+                    "preRecoverySnapshotId" to snapshotId,
                 ))
             }
             else -> {}
