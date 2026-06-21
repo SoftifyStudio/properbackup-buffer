@@ -204,11 +204,16 @@ class RecoveryHandler(
                 "sessionId" to session.id,
                 "targetSnapshotId" to session.targetSnapshotId,
             ))
-            RecoveryState.READY -> commands.add(mapOf(
-                "command" to "execute",
-                "sessionId" to session.id,
-                "targetSnapshotId" to session.targetSnapshotId,
-            ))
+            RecoveryState.READY -> {
+                val updated = store.transition(session.id, RecoveryState.READY, RecoveryState.AGENT_RESTORING)
+                auditLog.log(session.id, "RECOVERY_AGENT_STARTED", "trigger=agent_poll")
+                eventBus.emitStateChange(updated)
+                commands.add(mapOf(
+                    "command" to "execute",
+                    "sessionId" to session.id,
+                    "targetSnapshotId" to session.targetSnapshotId,
+                ))
+            }
             else -> {}
         }
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("commands" to commands)))
