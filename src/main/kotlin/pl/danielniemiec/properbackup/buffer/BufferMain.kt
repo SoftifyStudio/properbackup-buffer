@@ -44,6 +44,9 @@ import pl.danielniemiec.properbackup.buffer.server.ServerStore
 import pl.danielniemiec.properbackup.buffer.sse.SseEventBus
 import pl.danielniemiec.properbackup.buffer.store.LocalObjectStore
 import pl.danielniemiec.properbackup.buffer.monitoring.AgentMetricsStore
+import pl.danielniemiec.properbackup.buffer.monitoring.AgentHealthMonitor
+import pl.danielniemiec.properbackup.buffer.notifications.EmailNotifier
+import pl.danielniemiec.properbackup.buffer.notifications.NotificationHandler
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryAuditLog
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryEventBus
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryGuard
@@ -52,6 +55,10 @@ import pl.danielniemiec.properbackup.buffer.recovery.RecoverySessionStore
 import pl.danielniemiec.properbackup.buffer.recovery.DryRunComputer
 import pl.danielniemiec.properbackup.buffer.recovery.PreRecoverySnapshotCreator
 import pl.danielniemiec.properbackup.buffer.recovery.RecoveryActiveException
+import pl.danielniemiec.properbackup.buffer.flush.ForceFlushCron
+import pl.danielniemiec.properbackup.buffer.storage.LocalFsStorageClient
+import pl.danielniemiec.properbackup.buffer.storage.StorageClient
+import pl.danielniemiec.properbackup.buffer.storage.StorageUsageMonitor
 import pl.danielniemiec.properbackup.buffer.store.ObjectReadFacade
 import java.nio.file.Path
 import java.time.Instant
@@ -111,7 +118,9 @@ fun main(args: Array<String>) {
     val swiftRemote = swiftClientFromEnv(storageDir)
     val storageQuotaGuard = StorageQuotaGuard(db, userStore)
     val packBufferDir = Path.of(System.getenv().getOrDefault("PROPERBACKUP_PACK_BUFFER_DIR", "/tmp/properbackup/pack-buffer"))
-    val packBuffer = PackBuffer(packBufferDir, db, swiftRemote)
+    val localStoragePath = System.getenv().getOrDefault("PROPERBACKUP_LOCAL_STORAGE_DIR", "/mnt/storage")
+    val localStorageClient: StorageClient = LocalFsStorageClient(Path.of(localStoragePath))
+    val packBuffer = PackBuffer(packBufferDir, db, swiftRemote, localStorageClient)
 
     val sealer = ChunkSealer(chunkStorage, objectStore, db, swiftRemote, archiveSnapshotStore, storageQuotaGuard, sseBus)
     sealer.setPackBuffer(packBuffer)
@@ -169,9 +178,19 @@ fun main(args: Array<String>) {
         preRecoverySnapshotCreator, recoveryAuditLog, recoveryEventBus,
     )
 
+    val forceFlushCron = ForceFlushCron(packBuffer, packBufferDir)
+    val storageUsageMonitor = StorageUsageMonitor(db)
+
+    val emailNotifier = EmailNotifier.fromEnv()
+    val agentHealthMonitor = AgentHealthMonitor(db, serverStore, emailNotifier)
+    val notificationHandler = NotificationHandler(db)
+
     flusher.start()
     packBuffer.start()
+    forceFlushCron.start()
+    storageUsageMonitor.start()
     trialNotifier.start()
+    agentHealthMonitor.start()
 
     val app = Javalin.create { cfg ->
         cfg.http.maxRequestSize = 100L * 1024 * 1024
@@ -418,6 +437,114 @@ fun main(args: Array<String>) {
     app.post("/servers/{id}/backup-config", serverHandler::addBackupPath)
     app.delete("/servers/{id}/backup-config", serverHandler::removeBackupPath)
 
+    // Backup schedule endpoints
+    app.get("/servers/{id}/backup-schedule") { ctx ->
+        val serverId = ctx.pathParam("id")
+        val userId = ctx.attribute<String>("userId")!!
+        val isAdmin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
+        val server = serverStore.findById(serverId)
+        if (!server.isPresent || (!isAdmin && server.get().userId != userId)) {
+            ctx.status(404).result("Not found")
+            return@get
+        }
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT interval_minutes, io_throttle_mbps, window_start, window_end, updated_at FROM backup_schedule WHERE server_id = ?",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) {
+                        ctx.contentType("application/json").result(Gson().toJson(mapOf(
+                            "intervalMinutes" to rs.getInt("interval_minutes"),
+                            "ioThrottleMbps" to rs.getObject("io_throttle_mbps"),
+                            "windowStart" to rs.getObject("window_start")?.toString(),
+                            "windowEnd" to rs.getObject("window_end")?.toString(),
+                            "updatedAt" to rs.getTimestamp("updated_at")?.toInstant()?.toString(),
+                        )))
+                    } else {
+                        ctx.contentType("application/json").result(Gson().toJson(mapOf(
+                            "intervalMinutes" to 5,
+                            "ioThrottleMbps" to null,
+                            "windowStart" to null,
+                            "windowEnd" to null,
+                            "updatedAt" to null,
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    app.post("/servers/{id}/backup-schedule") { ctx ->
+        val serverId = ctx.pathParam("id")
+        val userId = ctx.attribute<String>("userId")!!
+        val isAdmin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
+        val server = serverStore.findById(serverId)
+        if (!server.isPresent || (!isAdmin && server.get().userId != userId)) {
+            ctx.status(404).result("Not found")
+            return@post
+        }
+        val body = Gson().fromJson(ctx.body(), Map::class.java)
+        val intervalMin = (body["intervalMinutes"] as? Number)?.toInt()?.coerceIn(1, 1440) ?: 5
+        val ioThrottle = (body["ioThrottleMbps"] as? Number)?.toInt()
+        val windowStart = (body["windowStart"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+        val windowEnd = (body["windowEnd"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO backup_schedule (server_id, interval_minutes, io_throttle_mbps, window_start, window_end, updated_at)
+                   VALUES (?, ?, ?, ?::time, ?::time, NOW())
+                   ON CONFLICT (server_id) DO UPDATE SET
+                     interval_minutes = EXCLUDED.interval_minutes,
+                     io_throttle_mbps = EXCLUDED.io_throttle_mbps,
+                     window_start = EXCLUDED.window_start,
+                     window_end = EXCLUDED.window_end,
+                     updated_at = NOW()""",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.setInt(2, intervalMin)
+                if (ioThrottle == null) ps.setNull(3, java.sql.Types.INTEGER) else ps.setInt(3, ioThrottle)
+                if (windowStart == null) ps.setNull(4, java.sql.Types.VARCHAR) else ps.setString(4, windowStart)
+                if (windowEnd == null) ps.setNull(5, java.sql.Types.VARCHAR) else ps.setString(5, windowEnd)
+                ps.executeUpdate()
+            }
+        }
+        ctx.status(200).result("ok")
+    }
+
+    // Agent health monitoring endpoints
+    app.before("/monitoring/*", jwtFilter)
+    app.get("/monitoring/servers") { ctx ->
+        val userId = ctx.attribute<String>("userId")!!
+        val isAdmin = java.lang.Boolean.TRUE == ctx.attribute<Boolean>("isSystemAdmin")
+        val servers = if (isAdmin) {
+            serverStore.listAll()
+        } else {
+            serverStore.listForUser(userId)
+        }
+        val now = Instant.now()
+        val health = servers.map { srv ->
+            val lastSeen = try { Instant.parse(srv.lastSeen) } catch (_: Exception) { now }
+            val elapsed = java.time.Duration.between(lastSeen, now)
+            val status = when {
+                elapsed > AgentHealthMonitor.OFFLINE_THRESHOLD -> "OFFLINE"
+                elapsed > AgentHealthMonitor.WARNING_THRESHOLD -> "WARNING"
+                else -> "ONLINE"
+            }
+            linkedMapOf(
+                "serverId" to srv.id,
+                "serverName" to srv.name,
+                "status" to status,
+                "lastSeenAt" to srv.lastSeen,
+                "ownerEmail" to srv.ownerEmail,
+            )
+        }
+        ctx.contentType("application/json").result(Gson().toJson(mapOf("servers" to health)))
+    }
+
+    // Notification settings
+    app.before("/notifications/*", jwtFilter)
+    app.get("/notifications/settings", notificationHandler::getSettings)
+    app.post("/notifications/settings", notificationHandler::updateSettings)
+
     // Recovery Session endpoints (user-facing-recovery-spec.md Section B)
     app.before("/recovery/*", jwtFilter)
     app.before("/recovery", jwtFilter)
@@ -427,11 +554,14 @@ fun main(args: Array<String>) {
     app.post("/recovery/{id}/confirm", recoveryHandler::confirmRecovery)
     app.post("/recovery/{id}/cancel", recoveryHandler::cancelRecovery)
     app.get("/recovery/{id}/audit", recoveryHandler::getAudit)
+    app.get("/recovery/{id}/dry_run", recoveryHandler::getDryRun)
 
     // Recovery Agent endpoints
     app.get("/agent/recovery/poll", recoveryHandler::agentPoll)
+    app.post("/agent/recovery/{id}/started", recoveryHandler::agentStarted)
     app.post("/agent/recovery/{id}/dry_run_result", recoveryHandler::agentDryRunResult)
     app.post("/agent/recovery/{id}/progress", recoveryHandler::agentProgress)
+    app.post("/agent/recovery/{id}/files_report", recoveryHandler::agentFilesReport)
     app.post("/agent/recovery/{id}/complete", recoveryHandler::agentComplete)
 
     // RecoveryGuard: block write actions during active recovery (return 423 Locked)
@@ -526,8 +656,11 @@ fun main(args: Array<String>) {
 
     Runtime.getRuntime().addShutdownHook(
         Thread {
+            agentHealthMonitor.stop()
             flusher.stop()
             packBuffer.stop()
+            forceFlushCron.stop()
+            storageUsageMonitor.stop()
             app.stop()
             db.close()
         },
