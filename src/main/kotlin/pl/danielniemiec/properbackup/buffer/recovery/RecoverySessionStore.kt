@@ -130,6 +130,10 @@ class RecoverySessionStore(private val db: Database) {
                 setClauses.add("cancellation_reason = ?")
                 params.add(meta["reason"] as? String)
             }
+            if (from == RecoveryState.AGENT_RESTORING && to == RecoveryState.VERIFYING) {
+                setClauses.add("agent_completed_at = ?")
+                params.add(Timestamp.from(now))
+            }
             if (to == RecoveryState.AWAITING_USER_CONFIRM) {
                 val ip = meta["ip"] as? String
                 val ua = meta["user_agent"] as? String
