@@ -270,6 +270,36 @@ class RecoveryHandler(
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
     }
 
+    fun agentStarted(ctx: Context) {
+        val id = ctx.pathParam("id")
+        val session = store.byId(id)
+        if (session == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "NOT_FOUND")))
+            return
+        }
+        when (session.state) {
+            RecoveryState.READY -> {
+                val snapshotId = store.createPreRecoverySnapshot(session.serverId, session.id)
+                auditLog.log(session.id, "RECOVERY_PRE_SNAPSHOT_CREATED", "snapshotId=$snapshotId")
+                val updated = store.transition(session.id, RecoveryState.READY, RecoveryState.AGENT_RESTORING)
+                auditLog.log(session.id, "RECOVERY_AGENT_STARTED", "trigger=agent_started_endpoint")
+                eventBus.emitStateChange(updated)
+                ctx.status(200).contentType("application/json").result(gson.toJson(mapOf(
+                    "ok" to true, "state" to "AGENT_RESTORING", "preRecoverySnapshotId" to snapshotId,
+                )))
+            }
+            RecoveryState.AGENT_RESTORING -> {
+                ctx.status(200).contentType("application/json").result(gson.toJson(mapOf(
+                    "ok" to true, "state" to "AGENT_RESTORING", "preRecoverySnapshotId" to session.preRecoverySnapshotId,
+                )))
+            }
+            else -> {
+                ctx.status(400).contentType("application/json")
+                    .result(gson.toJson(mapOf("code" to "INVALID_STATE", "currentState" to session.state.name)))
+            }
+        }
+    }
+
     fun agentProgress(ctx: Context) {
         val id = ctx.pathParam("id")
         val body = gson.fromJson(ctx.body(), Map::class.java)
