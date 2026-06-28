@@ -227,6 +227,37 @@ class RecoverySessionStore(private val db: Database) {
         }
     }
 
+    /**
+     * Records a PRE_RECOVERY snapshot row for the current on-disk state and
+     * returns its generated id. Linked to the recovery session so it can be
+     * used as the rollback point (HR-5).
+     */
+    fun createPreRecoverySnapshot(serverId: String, sessionId: String, totalBytes: Long): Long {
+        val now = Instant.now()
+        val objectName = "prerecovery-$sessionId"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(
+                """INSERT INTO archive_snapshot
+                   (server_id, path_id, object_name, flag, size_bytes, sealed_at, snapshot_type, pre_recovery_session_id)
+                   VALUES (?, ?, ?, 'P', ?, ?, 'PRE_RECOVERY', ?)
+                   ON CONFLICT (server_id, object_name)
+                   DO UPDATE SET size_bytes = EXCLUDED.size_bytes, sealed_at = EXCLUDED.sealed_at
+                   RETURNING id""",
+            ).use { ps ->
+                ps.setString(1, serverId)
+                ps.setString(2, "PRERCVRY")
+                ps.setString(3, objectName)
+                ps.setLong(4, totalBytes)
+                ps.setTimestamp(5, Timestamp.from(now))
+                ps.setString(6, sessionId)
+                ps.executeQuery().use { rs ->
+                    rs.next()
+                    return rs.getLong("id")
+                }
+            }
+        }
+    }
+
     fun setPreRecoverySnapshot(id: String, snapshotId: Long) {
         db.getConnection().use { conn ->
             conn.prepareStatement("UPDATE recovery_session SET pre_recovery_snapshot_id = ? WHERE id = ?").use { ps ->

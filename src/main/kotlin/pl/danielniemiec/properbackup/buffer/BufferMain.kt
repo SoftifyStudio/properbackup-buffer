@@ -431,6 +431,8 @@ fun main(args: Array<String>) {
     // Recovery Agent endpoints
     app.get("/agent/recovery/poll", recoveryHandler::agentPoll)
     app.post("/agent/recovery/{id}/dry_run_result", recoveryHandler::agentDryRunResult)
+    app.post("/agent/recovery/{id}/pre_snapshot", recoveryHandler::agentPreSnapshot)
+    app.post("/agent/recovery/{id}/started", recoveryHandler::agentStarted)
     app.post("/agent/recovery/{id}/progress", recoveryHandler::agentProgress)
     app.post("/agent/recovery/{id}/complete", recoveryHandler::agentComplete)
 
