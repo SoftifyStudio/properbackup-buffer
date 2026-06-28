@@ -199,12 +199,17 @@ class RecoveryHandler(
         }
         val commands = mutableListOf<Map<String, Any?>>()
         when (session.state) {
-            RecoveryState.REQUESTED -> commands.add(mapOf(
+            // PLANNING is the state right after the dry-run was requested
+            // (startRecovery transitions REQUESTED -> PLANNING synchronously),
+            // so the polling agent must still be handed the dry_run command here.
+            RecoveryState.REQUESTED, RecoveryState.PLANNING -> commands.add(mapOf(
                 "command" to "dry_run",
                 "sessionId" to session.id,
                 "targetSnapshotId" to session.targetSnapshotId,
             ))
-            RecoveryState.READY -> commands.add(mapOf(
+            // AGENT_RESTORING lets a resumed/re-polling agent pick the execute
+            // command back up (HR-7) without losing the in-flight restore.
+            RecoveryState.READY, RecoveryState.AGENT_RESTORING -> commands.add(mapOf(
                 "command" to "execute",
                 "sessionId" to session.id,
                 "targetSnapshotId" to session.targetSnapshotId,
@@ -228,6 +233,43 @@ class RecoveryHandler(
             criticalProtected = (body["critical_protected"] as? Number)?.toInt() ?: 0,
             estimatedDurationSec = (body["estimated_duration_seconds"] as? Number)?.toInt(),
         )
+        ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
+    }
+
+    /**
+     * HR-5: the agent uploads a manifest of the current on-disk state BEFORE it
+     * starts restoring, so we can roll back if the restore goes wrong. We record
+     * it as a PRE_RECOVERY archive_snapshot linked to the session and return the
+     * generated snapshot id back to the agent.
+     */
+    fun agentPreSnapshot(ctx: Context) {
+        val id = ctx.pathParam("id")
+        val session = store.byId(id)
+        if (session == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "NOT_FOUND")))
+            return
+        }
+        val body = gson.fromJson(ctx.body(), Map::class.java)
+        val totalBytes = (body["total_bytes"] as? Number)?.toLong() ?: 0L
+        val snapshotId = store.createPreRecoverySnapshot(session.serverId, id, totalBytes)
+        preSnapshot.receivePreRecoverySnapshotId(id, snapshotId)
+        ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("snapshot_id" to snapshotId)))
+    }
+
+    fun agentStarted(ctx: Context) {
+        val id = ctx.pathParam("id")
+        val session = store.byId(id)
+        if (session == null) {
+            ctx.status(404).contentType("application/json").result(gson.toJson(mapOf("code" to "NOT_FOUND")))
+            return
+        }
+        // Idempotent: only the READY -> AGENT_RESTORING edge is legal; a resumed
+        // agent (HR-7) re-announcing while already restoring is a no-op.
+        if (session.state == RecoveryState.READY) {
+            val updated = store.transition(id, RecoveryState.READY, RecoveryState.AGENT_RESTORING)
+            auditLog.log(id, "RECOVERY_AGENT_STARTED")
+            eventBus.emitStateChange(updated)
+        }
         ctx.status(200).contentType("application/json").result(gson.toJson(mapOf("ok" to true)))
     }
 

@@ -68,7 +68,7 @@ class ArchiveSnapshotStore(private val db: Database) {
     fun listRecent(serverId: String, pathId: String?, limit: Int): List<Map<String, Any?>> {
         val lim = limit.coerceIn(1, 5000)
         val sql = StringBuilder(
-            "SELECT path_id, object_name, flag, size_bytes, sealed_at FROM archive_snapshot WHERE server_id = ? ",
+            "SELECT id, path_id, object_name, flag, size_bytes, sealed_at FROM archive_snapshot WHERE server_id = ? ",
         )
         if (!pathId.isNullOrBlank()) sql.append("AND path_id = ? ")
         sql.append("ORDER BY sealed_at DESC LIMIT ?")
@@ -83,6 +83,7 @@ class ArchiveSnapshotStore(private val db: Database) {
                     while (rs.next()) {
                         out.add(
                             linkedMapOf(
+                                "id" to rs.getLong("id"),
                                 "pathId" to rs.getString("path_id"),
                                 "objectName" to rs.getString("object_name"),
                                 "flag" to rs.getString("flag"),
